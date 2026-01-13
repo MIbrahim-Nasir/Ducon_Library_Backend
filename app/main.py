@@ -19,6 +19,14 @@ def read_root(request: Request):
 
     return {"item_count": request.app.state.collection.count() }
 
+@app.get("/searchtext")
+def search_text(request: Request, query: str):
+    embedding = app.state.model.get_embedding(query)
+    results = db.retrieve(app.state.collection, embedding)
+
+    return {"results": results}
+
+
 @app.post("/model")
 def test_model(request: str):
     embedding = app.state.model.get_embedding(request)
