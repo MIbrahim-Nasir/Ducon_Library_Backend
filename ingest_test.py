@@ -1,5 +1,9 @@
 import app.db as db
-from app.ml import EmbeddingModel
+from app.ml import MultimodalEmbeddingModel, TextEmbeddingModel
+import os
+from pathlib import Path
+from PIL import Image
+import json
 
 DUMMY_DATA = [
     {
@@ -49,33 +53,75 @@ DUMMY_DATA = [
     }
 ]
 
-collection = db.get_db_collection()
-model = EmbeddingModel()
+with open(r"data\ducon_library_images.json", "r", encoding="utf-8") as file:
+    DATA = json.load(file)
+
+image_collection = db.get_db_collection("image_store")
+text_collection = db.get_db_collection("text_store")
+
+clip_model = MultimodalEmbeddingModel()
+text_model = TextEmbeddingModel()
 
 # 1. Initialize lists
-ids = []
-documents = []
-metadatas = []
-embeddings = []
 
-for item in DUMMY_DATA:
-    text_content = item["description"]
-    embeddings.append(model.get_embedding(text_content))
-    ids.append(item["id"])
-    documents.append(text_content)
-    meta = item.copy()
-    meta["tags"] = ", ".join(meta["tags"])
-    meta["related"] = ", ".join(meta["related"])
-    del meta["id"]
-    metadatas.append(meta)
 
-print(f"Inserting {len(ids)} items into ChromaDB...")
+def ingest_text():
+    ids = []
+    documents = []
+    metadatas = []
+    embeddings = []
 
-collection.add(
-    ids=ids,
-    embeddings=embeddings,
-    metadatas=metadatas,
-    documents=documents
-)
+    for item in DATA:
+        text_content = item["overall_description"]
+        embeddings.append(text_model.get_embedding(text_content))
+        filename = item["project"]+"part"+f"{item["part"]}.png"
+        ids.append(filename)
+        documents.append(text_content)
+        # meta = item.copy()
+        # meta["tags"] = ", ".join(meta["tags"])
+        # meta["related"] = ", ".join(meta["related"])
+        # del meta["id"]
+        # metadatas.append(meta)
 
-print("Success! Data Ingested")
+    print(f"Inserting {len(ids)} items into ChromaDB...")
+
+    text_collection.add(
+        ids=ids,
+        embeddings=embeddings,
+        documents=documents
+    )
+
+    print("Success! Text Data Ingested")
+
+def ingest_images(img_folder: str):
+    ids = []
+    embeddings = []
+
+    folder = Path(img_folder)
+
+    for file in folder.iterdir():
+        if file.is_file() and file.suffix.lower() in [".png", ".jpg", ".jpeg"]:
+            try:
+                img = Image.open(file)
+
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+
+                image_embedding = clip_model.get_image_embedding(img)
+            except Exception as e:
+                print(f"Skipping {file.name}: {e}")
+
+            ids.append(file.name)
+            embeddings.append(image_embedding)
+
+    image_collection.add(
+        ids=ids,
+        embeddings=embeddings
+    )
+            
+            
+            
+
+if __name__ == "__main__":
+    # ingest_images(r"C:\Users\design\Documents\Code\Projects\Ducon_Library\database")
+    ingest_text()

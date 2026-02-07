@@ -1,37 +1,94 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File, Form
 from contextlib import asynccontextmanager
 from . import db
-from app.ml import EmbeddingModel
-
+from app.ml import TextEmbeddingModel, MultimodalEmbeddingModel
+import io
+from PIL import Image
+from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.collection = db.get_db_collection()
-    app.state.model = EmbeddingModel()
+    app.state.text_collection = db.get_db_collection("text_store")
+    app.state.image_collection = db.get_db_collection("image_store")
+
+    app.state.text_model = TextEmbeddingModel()
+    app.state.image_model = MultimodalEmbeddingModel()
+
     yield
 
 app = FastAPI(lifespan=lifespan)
 
-@app.get("/")
-def read_root(request: Request):
-    col = request.app.state.collection
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, replace "*" with ["http://localhost:3000"]
+    allow_credentials=True,
+    allow_methods=["*"], # Allow GET, POST, OPTIONS, etc.
+    allow_headers=["*"],
+)
 
-    return {"item_count": request.app.state.collection.count() }
+# @app.get("/")
+# def read_root(request: Request):
+#     col = request.app.state.collection
 
-@app.get("/searchtext")
-def search_text(request: Request, query: str):
-    embedding = app.state.model.get_embedding(query)
-    results = db.retrieve(app.state.collection, embedding)
+#     return {"item_count": request.app.state.collection.count() }
 
-    return {"results": results}
+def search_by_text(app, query: str, limit: int):
+    embedding = app.state.text_model.get_embedding(query)
+    results = db.retrieve(app.state.text_collection, embedding, limit)
+    return results["ids"]
 
+def search_by_image_text(app, query: str, limit: int):
+    embedding = app.state.image_model.get_text_embedding(query)
+    results = db.retrieve(app.state.image_collection, embedding, limit)
+    return results["ids"]
 
-@app.post("/model")
-def test_model(request: str):
-    embedding = app.state.model.get_embedding(request)
+async def search_by_image(app, image_file: UploadFile, limit: int):
+    image_data = image_file.file.read()
+    image_obj = Image.open(io.BytesIO(image_data))
+    embedding = app.state.image_model.get_image_embedding(image_obj)
+    results = db.retrieve(app.state.image_collection, embedding, limit)
+    return results["ids"]
 
-    return {"embedding": embedding}
+@app.post("/search")
+async def search(query: Optional[str]= Form(None), file: Optional[UploadFile] = File(None), limit: int = 5):
+    results = {}
+    if query:
+        text_result = search_by_text(app, query=query, limit=limit)
+        if text_result:
+            results["text_result"] = text_result
+        image_text_result = search_by_image_text(app, query=query, limit=limit)
+        if image_text_result:
+            results["image_text_result"] = image_text_result
+
+    if file:
+        image_result = await search_by_image(app, image_file=file, limit=limit)
+        if image_result:
+            results["image_result"] = image_result
+
+    return results
+
+# @app.get("/searchtext")
+# def search_text(request: Request, query: str, limit: int = 5):
+#     embedding = app.state.text_model.get_embedding(query)
+#     results = db.retrieve(app.state.collection, embedding, limit)
+
+#     return {"results": results["ids"]}
+
+# @app.post("/search/image")
+# async def search_image(file: UploadFile = File(...), limit: int = 5):
+#     image_data = await file.read()
+#     image_obj = Image.open(io.BytesIO(image_data))
+#     embedding = app.state.image_model.get_image_embedding(image_obj)
+#     results = db.retrieve(app.state.image_collection, embedding, limit)
+#     return {"results": results["ids"]}
+
+# @app.get("/search/image-text")
+# async def search_image_text(request: Request, query: str, limit: int = 5):
+#     embedding = app.state.image_model.get_text_embedding(query)
+#     results = db.retrieve(app.state.image_collection, embedding, limit)
+#     return {"results": results["ids"]}
 
 def main():
     print("Hello from ducon-library-backend!")
