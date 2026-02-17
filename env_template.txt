@@ -1,0 +1,2 @@
+DESCRIPTIONS_DATA = path to ducon_library_images.json
+IMAGES_FOLDER = path to images folder
