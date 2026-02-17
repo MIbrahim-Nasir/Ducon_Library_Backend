@@ -4,6 +4,11 @@ import os
 from pathlib import Path
 from PIL import Image
 import json
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DESCRIPTIONS_DATA = os.getenv("DESCRIPTIONS_DATA")
 
 DUMMY_DATA = [
     {
@@ -53,7 +58,7 @@ DUMMY_DATA = [
     }
 ]
 
-with open(r"data\ducon_library_images.json", "r", encoding="utf-8") as file:
+with open(DESCRIPTIONS_DATA, "r", encoding="utf-8") as file:
     DATA = json.load(file)
 
 image_collection = db.get_db_collection("image_store")
@@ -74,7 +79,7 @@ def ingest_text():
     for item in DATA:
         text_content = item["overall_description"]
         embeddings.append(text_model.get_embedding(text_content))
-        filename = item["project"]+"part"+f"{item["part"]}.png"
+        filename = item["project"]+"-part"+f"{item["part"]}.png"
         ids.append(filename)
         documents.append(text_content)
         # meta = item.copy()
@@ -114,14 +119,16 @@ def ingest_images(img_folder: str):
             ids.append(file.name)
             embeddings.append(image_embedding)
 
+            print(f"Embedded Image {file.name}")
+
     image_collection.add(
         ids=ids,
         embeddings=embeddings
-    )
-            
-            
-            
+    )        
 
 if __name__ == "__main__":
-    # ingest_images(r"C:\Users\design\Documents\Code\Projects\Ducon_Library\database")
+    load_dotenv()
+    IMAGES_FOLDER = os.getenv("IMAGES_FOLDER")
+
+    ingest_images(IMAGES_FOLDER)
     ingest_text()

@@ -6,6 +6,9 @@ import io
 from PIL import Image
 from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
+from . import gemini
+from pathlib import Path
+from fastapi.staticfiles import StaticFiles
 
 
 @asynccontextmanager
@@ -27,6 +30,9 @@ app.add_middleware(
     allow_methods=["*"], # Allow GET, POST, OPTIONS, etc.
     allow_headers=["*"],
 )
+
+app.mount("/output_folder", StaticFiles(directory="app/output_folder"), name="generations")
+
 
 # @app.get("/")
 # def read_root(request: Request):
@@ -69,26 +75,30 @@ async def search(query: Optional[str]= Form(None), file: Optional[UploadFile] = 
 
     return results
 
-# @app.get("/searchtext")
-# def search_text(request: Request, query: str, limit: int = 5):
-#     embedding = app.state.text_model.get_embedding(query)
-#     results = db.retrieve(app.state.collection, embedding, limit)
+# @app.post("/autogenerate-images")
+# async def auto_generate_images(ducon_images: list[str] = Form(None), user_images: list[UploadFile] = File(None), prompt: str=None):
+#     generations = []
+#     if ducon_images is None or user_images is None:
+#         return {"error": "Missing required parameters"}, 400
+    
+#     if prompt is None:
+#         prompt = """
+#                 the image 1 is our company project design image of outdoor living area. take features such as the flooring, pavers, outdoor furniture, planters etc. take those features only and do not take non-outdoor features such as buildings, cars, walls, etc which are not our work. and then apply those feautures to the image 2 of the user's image in a logical and aesthetic manner. do not change the fixed features like buildings and existing structures.
+#                 """
 
-#     return {"results": results["ids"]}
+#     for filename in ducon_images:
+#         ducon_image_path = Path(__file__).parent / "data" / "images" / filename   
+#         ducon_image = Image.open(ducon_image_path)
+#         for upload_file in user_images:
+#             image_data = await upload_file.read()
+#             user_image = Image.open(io.BytesIO(image_data))
 
-# @app.post("/search/image")
-# async def search_image(file: UploadFile = File(...), limit: int = 5):
-#     image_data = await file.read()
-#     image_obj = Image.open(io.BytesIO(image_data))
-#     embedding = app.state.image_model.get_image_embedding(image_obj)
-#     results = db.retrieve(app.state.image_collection, embedding, limit)
-#     return {"results": results["ids"]}
+#             generation = gemini.combine_images(filename, ducon_image, user_image, prompt=prompt)
 
-# @app.get("/search/image-text")
-# async def search_image_text(request: Request, query: str, limit: int = 5):
-#     embedding = app.state.image_model.get_text_embedding(query)
-#     results = db.retrieve(app.state.image_collection, embedding, limit)
-#     return {"results": results["ids"]}
+#             generations.append(f"http://localhost:8000/outputs/{generation}")
+
+#     return generations
+
 
 def main():
     print("Hello from ducon-library-backend!")
