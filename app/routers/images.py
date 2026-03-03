@@ -1,33 +1,41 @@
 import json
 import os
-from functools import lru_cache
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
 
 router = APIRouter(prefix="/images", tags=["images"])
 
-# Path to the metadata JSON file maintained by the admin.
-# This file already contains full image URLs pointing to the VPS.
 METADATA_PATH = Path(
     os.getenv("METADATA_PATH", "data/images/metadata.json")
 )
+CACHE_TTL = int(os.getenv("METADATA_CACHE_TTL", str(60 * 60 * 24)))  # default 1 day in seconds
+
+_cache: list[dict] | None = None
+_cache_loaded_at: float = 0.0
 
 
-@lru_cache(maxsize=1)
 def _load_metadata() -> list[dict]:
+    global _cache, _cache_loaded_at
+
+    if _cache is not None and (time.time() - _cache_loaded_at) < CACHE_TTL:
+        return _cache
+
     if not METADATA_PATH.exists():
         raise FileNotFoundError(f"metadata.json not found at {METADATA_PATH}")
+
     with open(METADATA_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        _cache = json.load(f)
+    _cache_loaded_at = time.time()
+    return _cache
 
 
 @router.get("/metadata")
 async def get_metadata():
     """
     Serves the public image metadata file as-is.
-    Called once when the frontend loads.
-    Returns the full list with all fields and image URLs as built by the admin.
+    Cached in memory, reloaded from disk at most once per METADATA_CACHE_TTL seconds (default 1 day).
     """
     try:
         return _load_metadata()

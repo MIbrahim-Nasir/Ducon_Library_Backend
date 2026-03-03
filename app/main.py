@@ -5,6 +5,7 @@ from app.ml import TextEmbeddingModel, MultimodalEmbeddingModel
 import io
 from PIL import Image
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from typing import Optional
 from . import gemini
 from pathlib import Path
@@ -40,6 +41,9 @@ app.include_router(auth_router)
 app.include_router(bookmarks_router)
 app.include_router(generations_router)
 app.include_router(images_router)
+
+# Serve public library images statically
+app.mount("/public/images", StaticFiles(directory="data/images"), name="public_images")
 
 app.add_middleware(
     CORSMiddleware,

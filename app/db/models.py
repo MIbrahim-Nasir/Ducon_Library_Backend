@@ -11,7 +11,6 @@ class Image(Base):
     name = Column(String, nullable=True)
     filename = Column(String, nullable=False, unique=True)
     url = Column(String, nullable=False, unique=True)
-    theme = Column(String, nullable=True)
     uploaded_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
 
     bookmarks = relationship("Bookmark", back_populates="image", cascade="all, delete")

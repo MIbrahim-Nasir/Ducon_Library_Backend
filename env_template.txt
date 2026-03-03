@@ -4,3 +4,5 @@ DATABASE_URL = postgresql+asyncpg://user:password@localhost/Ducon_Library
 JWT_SECRET_KEY = ducon_industries_fzco_jwt_key
 GOOGLE_CLIENT_ID = your-google-oauth-client-id.apps.googleusercontent.com
 METADATA_PATH = data/images/metadata.json
+IMAGES_BASE_URL = https://your-vps-domain.com/images
+METADATA_CACHE_TTL = 86400
