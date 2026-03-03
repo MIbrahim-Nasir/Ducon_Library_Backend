@@ -12,6 +12,7 @@ load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 PROJECT_ID = os.getenv("PROJECT_ID")
 LOCATION = os.getenv("LOCATION")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 MODEL_ID = "gemini-3-pro-image-preview"
 
@@ -21,13 +22,13 @@ _client = None
 def get_gemini_client():
     global _client
     if _client is None:
-        _client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+        _client = genai.Client(api_key=GOOGLE_API_KEY)
     return _client
 
-# image1 = Image.open("output_folder/generation.png")
-# image2 = Image.open("output_folder/4x60+slate-kh T2. Bump.jpg")
+# image1 = Image.open("outputs/generation.png")
+# image2 = Image.open("outputs/4x60+slate-kh T2. Bump.jpg")
 
-def generate_image(image1, image2, prompt=None):
+def generate_image(prompt=None):
     client = get_gemini_client()
     if prompt is None or prompt == "":
         print("no prompt given")
@@ -35,13 +36,13 @@ def generate_image(image1, image2, prompt=None):
     else:
         response = client.models.generate_content(
         model=MODEL_ID,
-        contents=(image1, image2, prompt),
+        contents=(prompt),
         config=GenerateContentConfig(
                 response_modalities=[Modality.TEXT, Modality.IMAGE],
             ),
         )
 
-        save_image(response=response)
+        save_image("test.png", response=response)
 
 def combine_images(filename, image1: Image.Image, image2: Image.Image, prompt=None, ):
     client = get_gemini_client()
@@ -68,11 +69,11 @@ def save_image(filename, response):
         elif part.inline_data:
             image = Image.open(BytesIO((part.inline_data.data)))
             # Ensure the output directory exists
-            output_dir = "output_folder"
+            output_dir = "outputs"
             os.makedirs(output_dir, exist_ok=True)
             path = os.path.join(output_dir, filename)
             image.save(path)
-            return path
+            return filename
 
 def list_available_models():
     client = get_gemini_client()
@@ -83,4 +84,4 @@ def list_available_models():
 
 
 if __name__ == "__main__":
-    generate_image("add image 2 on the left half of image 1")
+    generate_image("generate the last image again")

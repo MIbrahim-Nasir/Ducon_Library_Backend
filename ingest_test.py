@@ -1,4 +1,4 @@
-import app.db as db
+import app.chromadb as chromadb
 from app.ml import MultimodalEmbeddingModel, TextEmbeddingModel
 import os
 from pathlib import Path
@@ -61,8 +61,8 @@ DUMMY_DATA = [
 with open(DESCRIPTIONS_DATA, "r", encoding="utf-8") as file:
     DATA = json.load(file)
 
-image_collection = db.get_db_collection("image_store")
-text_collection = db.get_db_collection("text_store")
+image_collection = chromadb.get_db_collection("image_store")
+text_collection = chromadb.get_db_collection("text_store")
 
 clip_model = MultimodalEmbeddingModel()
 text_model = TextEmbeddingModel()
