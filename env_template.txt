@@ -1,2 +1,6 @@
 DESCRIPTIONS_DATA = path to ducon_library_images.json
 IMAGES_FOLDER = path to images folder
+DATABASE_URL = postgresql+asyncpg://user:password@localhost/Ducon_Library
+JWT_SECRET_KEY = ducon_industries_fzco_jwt_key
+GOOGLE_CLIENT_ID = your-google-oauth-client-id.apps.googleusercontent.com
+METADATA_PATH = data/images/metadata.json

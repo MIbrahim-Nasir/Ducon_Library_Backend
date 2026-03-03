@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, UploadFile, File, Form
+from fastapi import FastAPI, Request, UploadFile, File, Form, Depends, HTTPException
 from contextlib import asynccontextmanager
 from . import chromadb
 from app.ml import TextEmbeddingModel, MultimodalEmbeddingModel
@@ -8,8 +8,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from typing import Optional
 from . import gemini
 from pathlib import Path
-from fastapi.staticfiles import StaticFiles
 import uuid
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from app.routers.auth import router as auth_router
+from app.routers.bookmarks import router as bookmarks_router
+from app.routers.generations import router as generations_router
+from app.routers.images import router as images_router
+from app.db.database import get_db
+from app.db.models import Generation, Image as DBImage
+from app.auth import get_current_user
 
 
 @asynccontextmanager
@@ -24,6 +36,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+app.include_router(auth_router)
+app.include_router(bookmarks_router)
+app.include_router(generations_router)
+app.include_router(images_router)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], # In production, replace "*" with ["http://localhost:3000"]
@@ -32,7 +49,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/outputs", StaticFiles(directory="outputs"), name="generations")
 
 
 # @app.get("/")
@@ -77,34 +93,60 @@ async def search(query: Optional[str]= Form(None), file: Optional[UploadFile] = 
     return results
 
 @app.post("/autogenerate-images")
-async def auto_generate_images(ducon_images: list[str] = Form(None), user_images: list[UploadFile] = File(None), prompt: str=None):
-    generations = []
-    if ducon_images is None or user_images is None:
-        return {"error": "Missing required parameters"}, 400
-    
+async def auto_generate_images(
+    image_id: int = Form(...),
+    user_image: UploadFile = File(...),
+    prompt: str = Form(None),
+    current_user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # Resolve ducon image from DB
+    result = await db.execute(select(DBImage).where(DBImage.id == image_id))
+    ducon_db_image = result.scalar_one_or_none()
+    if not ducon_db_image:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    ducon_image_path = Path(__file__).parent.parent / "data" / "images" / ducon_db_image.filename
+    if not ducon_image_path.exists():
+        raise HTTPException(status_code=404, detail=f"Image file '{ducon_db_image.filename}' not found on server")
+
     if prompt is None:
         prompt = """
                 the image 1 is our company project design image of outdoor living area. take features such as the flooring, pavers, outdoor furniture, planters etc. take those features only and do not take non-outdoor features such as buildings, cars, walls, etc which are not our work. and then apply those feautures to the image 2 of the user's image in a logical and aesthetic manner. do not change the fixed features like buildings and existing structures.
                 """
 
-    for filename in ducon_images:
-        ducon_image_path = Path(__file__).parent.parent / "data" / "images" / filename   
-        ducon_image = Image.open(ducon_image_path)
-        for upload_file in user_images:
-            image_data = await upload_file.read()
-            await upload_file.seek(0)
-            # DEBUG LOGS
-            # print(f"Upload filename: {upload_file.filename}")
-            # print(f"Content type: {upload_file.content_type}")
-            # print(f"Data length: {len(image_data)}")
+    ducon_image = Image.open(ducon_image_path)
+    image_data = await user_image.read()
+    user_img = Image.open(io.BytesIO(image_data))
 
-            user_image = Image.open(io.BytesIO(image_data))
+    generation_filename = f"{ducon_db_image.filename}_{uuid.uuid4()}.png"
+    user_subfolder = str(current_user.id)
 
-            generation = gemini.combine_images(f"{filename}_{uuid.uuid4()}.png", ducon_image, user_image, prompt=prompt)
+    gemini.combine_images(
+        generation_filename,
+        ducon_image,
+        user_img,
+        prompt=prompt,
+        subfolder=user_subfolder,
+    )
 
-            generations.append(f"http://localhost:8000/outputs/{generation}")
+    generation_url = f"/generations/{current_user.id}/{generation_filename}"
+    db_generation = Generation(
+        user_id=current_user.id,
+        generation_name=generation_filename,
+        url=generation_url,
+        ducon_image_id=ducon_db_image.id,
+    )
+    db.add(db_generation)
+    await db.flush()  # populate db_generation.id from DB
+    await db.commit()
 
-    return generations
+    return {
+        "id": db_generation.id,
+        "generation_name": generation_filename,
+        "url": generation_url,
+        "ducon_image_id": ducon_db_image.id,
+    }
 
 
 def main():

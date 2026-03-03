@@ -44,7 +44,7 @@ def generate_image(prompt=None):
 
         save_image("test.png", response=response)
 
-def combine_images(filename, image1: Image.Image, image2: Image.Image, prompt=None, ):
+def combine_images(filename, image1: Image.Image, image2: Image.Image, prompt=None, subfolder: str = None):
     client = get_gemini_client()
     if prompt is None or prompt == "":
         print("no prompt given")
@@ -58,18 +58,16 @@ def combine_images(filename, image1: Image.Image, image2: Image.Image, prompt=No
             ),
         )
 
-        image_path = save_image(filename, response=response, )
+        image_path = save_image(filename, response=response, subfolder=subfolder)
         return image_path
 
-def save_image(filename, response):
-    
+def save_image(filename, response, subfolder: str = None):
     for part in response.candidates[0].content.parts:
         if part.text:
             print(part.text)
         elif part.inline_data:
             image = Image.open(BytesIO((part.inline_data.data)))
-            # Ensure the output directory exists
-            output_dir = "outputs"
+            output_dir = os.path.join("outputs", subfolder) if subfolder else "outputs"
             os.makedirs(output_dir, exist_ok=True)
             path = os.path.join(output_dir, filename)
             image.save(path)
