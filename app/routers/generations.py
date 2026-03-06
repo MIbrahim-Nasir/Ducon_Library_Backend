@@ -1,8 +1,5 @@
-import os
-from pathlib import Path
-
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -10,16 +7,16 @@ from app.db.database import get_db
 from app.db.models import Generation, User
 from app.db.schema import GenerationResponse
 from app.auth import get_current_user
+from app import storage
 
 router = APIRouter(prefix="/generations", tags=["generations"])
 
-# Base directory where all generation images are stored
-OUTPUTS_DIR = Path("outputs")
 
-
-def _generation_path(user_id: int, filename: str) -> Path:
-    """Resolve the file path for a user's generation image."""
-    return OUTPUTS_DIR / str(user_id) / filename
+def _to_response(gen: Generation) -> GenerationResponse:
+    """Build a GenerationResponse with a fresh signed_url injected."""
+    data = GenerationResponse.model_validate(gen)
+    data.signed_url = storage.get_generation_url(gen.id, gen.url)
+    return data
 
 
 @router.get("", response_model=list[GenerationResponse])
@@ -28,10 +25,11 @@ async def list_generations(
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        select(Generation).where(Generation.user_id == current_user.id)
+        select(Generation)
+        .where(Generation.user_id == current_user.id)
         .order_by(Generation.generated_at.desc())
     )
-    return result.scalars().all()
+    return [_to_response(g) for g in result.scalars().all()]
 
 
 @router.get("/{generation_id}/image")
@@ -40,7 +38,10 @@ async def get_generation_image(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Serve a private generation image. Only the owning user can access it."""
+    """
+    Cloud mode: 302 redirect to a fresh presigned R2 URL.
+    Local mode: serve the file directly via FileResponse.
+    """
     result = await db.execute(
         select(Generation).where(
             Generation.id == generation_id,
@@ -51,12 +52,14 @@ async def get_generation_image(
     if not generation:
         raise HTTPException(status_code=404, detail="Generation not found")
 
-    # generation.url stores the relative filename, e.g. "someimage_uuid.png"
-    file_path = _generation_path(current_user.id, generation.generation_name)
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Image file not found on server")
-
-    return FileResponse(file_path, media_type="image/png")
+    if storage.CLOUD_STORAGE:
+        signed_url = storage.get_generation_url(generation.id, generation.url)
+        return RedirectResponse(url=signed_url, status_code=302)
+    else:
+        file_path = storage.serve_local_path(generation.url)
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="Image file not found on server")
+        return FileResponse(file_path, media_type="image/png")
 
 
 @router.delete("/{generation_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -75,10 +78,7 @@ async def delete_generation(
     if not generation:
         raise HTTPException(status_code=404, detail="Generation not found")
 
-    # Delete file from disk
-    file_path = _generation_path(current_user.id, generation.generation_name)
-    if file_path.exists():
-        os.remove(file_path)
+    storage.delete_generation(generation.url)
 
     await db.delete(generation)
     await db.commit()

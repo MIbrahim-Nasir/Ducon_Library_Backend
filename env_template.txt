@@ -6,3 +6,16 @@ GOOGLE_CLIENT_ID = your-google-oauth-client-id.apps.googleusercontent.com
 METADATA_PATH = data/images/metadata.json
 IMAGES_BASE_URL = https://your-vps-domain.com/images
 METADATA_CACHE_TTL = 86400
+
+# Cloudflare R2
+R2_ENDPOINT_URL = https://<account-id>.r2.cloudflarestorage.com
+R2_ACCESS_KEY_ID = your-r2-access-key-id
+R2_SECRET_ACCESS_KEY = your-r2-secret-access-key
+R2_PUBLIC_BUCKET = ducon-public
+R2_PUBLIC_BASE_URL = https://pub-xxxx.r2.dev
+R2_KEY_PREFIX = images
+R2_PRIVATE_BUCKET = ducon-private
+PRESIGNED_URL_EXPIRY = 3600
+USE_CLOUD_STORAGE = false
+OUTPUT_METADATA_PATH = data/images/metadata.r2.json
+SKIP_EXISTING = true

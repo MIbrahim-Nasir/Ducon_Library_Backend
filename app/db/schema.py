@@ -59,7 +59,8 @@ class GenerationCreate(BaseModel):
 class GenerationResponse(BaseModel):
     id: int
     generation_name: str
-    url: str
+    url: str              # R2 object key, e.g. "generations/1/file.png"
+    signed_url: Optional[str] = None  # freshly generated presigned GET URL
     generated_at: datetime
     user_id: int
     ducon_image_id: Optional[int] = None

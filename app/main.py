@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from typing import Optional
 from . import gemini
+from . import storage
 from pathlib import Path
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -126,6 +127,7 @@ async def auto_generate_images(
     generation_filename = f"{ducon_db_image.filename}_{uuid.uuid4()}.png"
     user_subfolder = str(current_user.id)
 
+    # Gemini generates the image to outputs/{user_id}/{filename}
     gemini.combine_images(
         generation_filename,
         ducon_image,
@@ -134,21 +136,27 @@ async def auto_generate_images(
         subfolder=user_subfolder,
     )
 
-    generation_url = f"/generations/{current_user.id}/{generation_filename}"
+    # Save to cloud (R2) or keep on local disk — storage module decides
+    stored_key = storage.save_generation(current_user.id, generation_filename)
+
+    # Persist to DB
     db_generation = Generation(
         user_id=current_user.id,
         generation_name=generation_filename,
-        url=generation_url,
+        url=stored_key,
         ducon_image_id=ducon_db_image.id,
     )
     db.add(db_generation)
-    await db.flush()  # populate db_generation.id from DB
+    await db.flush()
     await db.commit()
 
+    # get_generation_url returns presigned URL (cloud) or API endpoint (local)
+    signed_url = storage.get_generation_url(db_generation.id, stored_key)
     return {
         "id": db_generation.id,
         "generation_name": generation_filename,
-        "url": generation_url,
+        "url": stored_key,
+        "signed_url": signed_url,
         "ducon_image_id": ducon_db_image.id,
     }
 
