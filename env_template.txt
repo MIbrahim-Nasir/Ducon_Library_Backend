@@ -19,3 +19,17 @@ PRESIGNED_URL_EXPIRY = 3600
 USE_CLOUD_STORAGE = false
 OUTPUT_METADATA_PATH = data/images/metadata.r2.json
 SKIP_EXISTING = true
+
+# Embedding model profile
+# legacy: text=all-MiniLM-L6-v2, multimodal=clip-ViT-L-14
+# modern: text=intfloat/e5-base-v2, multimodal=google/siglip2-so400m-patch14-384
+EMBEDDING_PROFILE = legacy
+
+# Optional overrides
+TEXT_MODEL_NAME =
+MULTIMODAL_MODEL_NAME =
+GEMINI_EMBEDDING_MODEL = gemini-embedding-2-preview
+MODEL_DEVICE = auto
+TEXT_COLLECTION_BASE = text_store
+IMAGE_COLLECTION_BASE = image_store
+FUSED_COLLECTION_BASE = fused_store
