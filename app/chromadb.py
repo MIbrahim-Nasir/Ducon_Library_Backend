@@ -18,7 +18,8 @@ def get_db_collection(name: str):
 def retrieve(collection: chromadb.Collection,   query_embedding: list[float], n_results: int = 5):
     results = collection.query(
         query_embeddings=[query_embedding],
-        n_results=n_results
+        n_results=n_results,
+        include=["metadatas", "distances"]
     )
 
     return results
