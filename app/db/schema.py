@@ -1,5 +1,6 @@
 from pydantic import BaseModel, EmailStr
 from datetime import datetime
+from fastapi import UploadFile
 
 class UserCreate(BaseModel):
     name: str
@@ -17,24 +18,23 @@ class UserResponse(BaseModel):
         from_attributes = True
 
 class Bookmark(BaseModel):
-    ducon_image_id: int
+    image_id: int
 
 class BookmarkResponse(BaseModel):
     id: int
-    ducon_image_name: int
+    image_id: int
     user_id: int
 
     class Config:
         from_attributes = True
 
 
-class Generation(BaseModel):
-    ducon_image_name: str
-
 class GenerationResponse(BaseModel):
+    id: int
     generation_name: str
+    url: str
     generated_at: datetime
-    user_id: int
+    
 
     class Config:
         from_attributes = True

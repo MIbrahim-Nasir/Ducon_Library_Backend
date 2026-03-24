@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request, UploadFile, File, Form
+from fastapi.responses import FileResponse
 from contextlib import asynccontextmanager
 from . import chromadb
 from app.ml import TextEmbeddingModel, MultimodalEmbeddingModel
@@ -10,10 +11,14 @@ from . import gemini
 from pathlib import Path
 from fastapi.staticfiles import StaticFiles
 import uuid
+from dotenv import load_dotenv
+import os
+import json
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    load_dotenv()
     app.state.text_collection = chromadb.get_db_collection("text_store")
     app.state.image_collection = chromadb.get_db_collection("image_store")
 
@@ -57,6 +62,12 @@ async def search_by_image(app, image_file: UploadFile, limit: int):
     embedding = app.state.image_model.get_image_embedding(image_obj)
     results = chromadb.retrieve(app.state.image_collection, embedding, limit)
     return results["ids"]
+
+@app.get("/images/metadata")
+async def get_metadata():
+    metadata_path = os.getenv("METADATA")
+    with open(metadata_path, 'r') as metadata:
+        return json.load(metadata)
 
 @app.post("/search")
 async def search(query: Optional[str]= Form(None), file: Optional[UploadFile] = File(None), limit: int = 5):

@@ -4,6 +4,7 @@ from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.sql import func
 
 
+
 class User(Base):
     __tablename__ = "users"
 
@@ -21,10 +22,10 @@ class Bookmark(Base):
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    bookmark_name = Column(String, nullable=True)
+    image_id = Column(BigInteger, ForeignKey("images.id", ondelete="CASCADE"), nullable=True)
 
-    __tabelargs__ = (
-        UniqueConstraint(user_id, bookmark_name, name="uq_user_bookmark")
+    __table_args__ = (
+        UniqueConstraint(user_id, image_id, name="uq_user_bookmark")
     )
     
 
@@ -34,6 +35,16 @@ class Generation(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     generation_name = Column(String, nullable=True)
+    url = Column(String, nullable=False, unique=True) 
     generated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
-    ducon_image_name = Column(String, nullable=False)
+    ducon_image_id = Column(BigInteger, ForeignKey("images.id" ,ondelete="SET NULL"))
+
+class Image(Base):
+    __tablename__ = "images"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    name = Column(String)
+    filename = Column(String, nullable=False)
+    url = Column(String, nullable=False, unique=True)
+    uploaded_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
 

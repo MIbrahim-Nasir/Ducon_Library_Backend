@@ -8,7 +8,7 @@ data/
 outputs/
 *outputs/
 */output_folder
-
+*secret*
 # C extensions
 *.so
 
