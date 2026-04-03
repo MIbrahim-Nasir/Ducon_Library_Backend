@@ -9,10 +9,16 @@ class UserCreate(BaseModel):
     email: EmailStr
     password: str
     user_consent: bool = False
+    marketing_consent: bool = False
+    phone_number: Optional[str] = None
+    whatsapp_sms_consent: bool = False
 
 class GoogleAuthToken(BaseModel):
     token: str                     # Google ID token from the frontend
     user_consent: bool = False
+    marketing_consent: bool = False
+    phone_number: Optional[str] = None
+    whatsapp_sms_consent: bool = False
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -27,12 +33,26 @@ class TokenData(BaseModel):
 
 
 # ── User ──────────────────────────────────────────────
+class ConsentUpdate(BaseModel):
+    user_consent: Optional[bool] = None
+    marketing_consent: Optional[bool] = None
+
+class ProfileUpdate(BaseModel):
+    name: Optional[str] = None
+    phone_number: Optional[str] = None
+    whatsapp_sms_consent: Optional[bool] = None
+    marketing_consent: Optional[bool] = None
+    user_consent: Optional[bool] = None
+
 class UserResponse(BaseModel):
     id: int
     name: str
     email: str
     role: str
     user_consent: bool
+    marketing_consent: bool
+    phone_number: Optional[str] = None
+    whatsapp_sms_consent: bool
     created_at: datetime
 
     class Config:

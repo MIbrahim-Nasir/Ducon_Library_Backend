@@ -4,7 +4,7 @@ from sqlalchemy import select
 
 from app.db.database import get_db
 from app.db.models import User
-from app.db.schema import UserCreate, UserLogin, Token, UserResponse, GoogleAuthToken
+from app.db.schema import UserCreate, UserLogin, Token, UserResponse, GoogleAuthToken, ConsentUpdate, ProfileUpdate
 from app.auth import (
     hash_password, verify_password, create_access_token,
     get_current_user, verify_google_token,
@@ -32,6 +32,9 @@ async def signup(payload: UserCreate, db: AsyncSession = Depends(get_db)):
         email=payload.email,
         password_hash=hash_password(payload.password),
         user_consent=payload.user_consent,
+        marketing_consent=payload.marketing_consent,
+        phone_number=payload.phone_number,
+        whatsapp_sms_consent=payload.whatsapp_sms_consent,
     )
     db.add(user)
     await db.commit()
@@ -97,6 +100,9 @@ async def google_auth(payload: GoogleAuthToken, db: AsyncSession = Depends(get_d
                 google_id=google_id,
                 password_hash=None,
                 user_consent=payload.user_consent,
+                marketing_consent=payload.marketing_consent,
+                phone_number=payload.phone_number,
+                whatsapp_sms_consent=payload.whatsapp_sms_consent,
             )
             db.add(user)
             await db.commit()
@@ -109,3 +115,82 @@ async def google_auth(payload: GoogleAuthToken, db: AsyncSession = Depends(get_d
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@router.get("/role")
+async def get_role(current_user: User = Depends(get_current_user)):
+    """Returns the role of the currently authenticated user."""
+    return {"role": current_user.role}
+
+
+@router.get("/user_consent")
+async def get_user_consent(current_user: User = Depends(get_current_user)):
+    """Returns consent status for the currently authenticated user."""
+    return {
+        "user_consent": current_user.user_consent,
+        "marketing_consent": current_user.marketing_consent,
+    }
+
+
+@router.patch("/user_consent", response_model=UserResponse)
+async def accept_all_consent(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Accepts all consent — sets both user_consent and marketing_consent to True."""
+    current_user.user_consent = True
+    current_user.marketing_consent = True
+    db.add(current_user)
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user
+
+
+@router.put("/user_consent", response_model=UserResponse)
+async def update_consent(
+    payload: ConsentUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Updates user_consent and/or marketing_consent to any explicit value."""
+    if payload.user_consent is not None:
+        current_user.user_consent = payload.user_consent
+    if payload.marketing_consent is not None:
+        current_user.marketing_consent = payload.marketing_consent
+    db.add(current_user)
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user
+
+
+@router.put("/profile", response_model=UserResponse)
+async def update_profile(
+    payload: ProfileUpdate,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Updates any combination of profile fields. Only provided fields are changed."""
+    if payload.name is not None:
+        current_user.name = payload.name
+    if payload.phone_number is not None:
+        current_user.phone_number = payload.phone_number
+    if payload.whatsapp_sms_consent is not None:
+        current_user.whatsapp_sms_consent = payload.whatsapp_sms_consent
+    if payload.marketing_consent is not None:
+        current_user.marketing_consent = payload.marketing_consent
+    if payload.user_consent is not None:
+        current_user.user_consent = payload.user_consent
+    db.add(current_user)
+    await db.commit()
+    await db.refresh(current_user)
+    return current_user
+
+
+@router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_account(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Permanently deletes the currently authenticated user's account."""
+    await db.delete(current_user)
+    await db.commit()

@@ -27,6 +27,9 @@ class User(Base):
     role = Column(String, nullable=False, server_default='customer')
     google_id = Column(String, unique=True, nullable=True)
     user_consent = Column(Boolean, nullable=False, server_default='false')
+    marketing_consent = Column(Boolean, nullable=False, server_default='false')
+    phone_number = Column(String, nullable=True)
+    whatsapp_sms_consent = Column(Boolean, nullable=False, server_default='false')
     created_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
 
     bookmarks = relationship("Bookmark", back_populates="user", cascade="all, delete")

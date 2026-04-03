@@ -6,8 +6,16 @@ CREATE TABLE users (
   role varchar NOT NULL DEFAULT 'customer',
   google_id varchar UNIQUE,
   user_consent boolean NOT NULL DEFAULT FALSE,
-  created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL 
+  marketing_consent boolean NOT NULL DEFAULT FALSE,
+  phone_number varchar,
+  whatsapp_sms_consent boolean NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
 );
+
+-- ALTER queries for existing tables:
+-- ALTER TABLE users ADD COLUMN marketing_consent boolean NOT NULL DEFAULT FALSE;
+-- ALTER TABLE users ADD COLUMN phone_number varchar;
+-- ALTER TABLE users ADD COLUMN whatsapp_sms_consent boolean NOT NULL DEFAULT FALSE;
 
 CREATE TABLE images (
 	id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY NOT NULL,
