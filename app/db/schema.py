@@ -1,6 +1,8 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator, model_validator
 from datetime import datetime
 from typing import Optional
+
+from app.validators import validate_email_domain, validate_uae_phone
 
 
 # ── Auth ──────────────────────────────────────────────
@@ -13,12 +15,40 @@ class UserCreate(BaseModel):
     phone_number: Optional[str] = None
     whatsapp_sms_consent: bool = False
 
+    @field_validator("email", mode="after")
+    @classmethod
+    def email_trusted_domain(cls, v: str) -> str:
+        return validate_email_domain(v)
+
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def phone_uae(cls, v):
+        if v is None or v == "":
+            return None
+        return validate_uae_phone(v)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError("Name cannot be empty.")
+        return v.strip()
+
+
 class GoogleAuthToken(BaseModel):
     token: str                     # Google ID token from the frontend
     user_consent: bool = False
     marketing_consent: bool = False
     phone_number: Optional[str] = None
     whatsapp_sms_consent: bool = False
+
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def phone_uae(cls, v):
+        if v is None or v == "":
+            return None
+        return validate_uae_phone(v)
+
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -43,6 +73,20 @@ class ProfileUpdate(BaseModel):
     whatsapp_sms_consent: Optional[bool] = None
     marketing_consent: Optional[bool] = None
     user_consent: Optional[bool] = None
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def name_not_empty(cls, v):
+        if v is not None and not str(v).strip():
+            raise ValueError("Name cannot be empty.")
+        return v.strip() if v else v
+
+    @field_validator("phone_number", mode="before")
+    @classmethod
+    def phone_uae(cls, v):
+        if v is None or v == "":
+            return None
+        return validate_uae_phone(v)
 
 class UserResponse(BaseModel):
     id: int

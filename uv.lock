@@ -604,6 +604,7 @@ dependencies = [
     { name = "google-auth" },
     { name = "passlib", extra = ["bcrypt"] },
     { name = "pathlib" },
+    { name = "phonenumbers" },
     { name = "pillow" },
     { name = "pillow-heif" },
     { name = "pydantic", extra = ["email"] },
@@ -626,6 +627,7 @@ requires-dist = [
     { name = "google-auth", specifier = ">=2.48.0" },
     { name = "passlib", extras = ["bcrypt"], specifier = ">=1.7.4" },
     { name = "pathlib", specifier = ">=1.0.1" },
+    { name = "phonenumbers", specifier = ">=9.0.29" },
     { name = "pillow", specifier = ">=12.1.0" },
     { name = "pillow-heif", specifier = ">=1.3.0" },
     { name = "pydantic", extras = ["email"], specifier = ">=2.12.5" },
@@ -1902,6 +1904,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ac/aa/9b065a76b9af472437a0059f77e8f962fe350438b927cb80184c32f075eb/pathlib-1.0.1.tar.gz", hash = "sha256:6940718dfc3eff4258203ad5021090933e5c04707d5ca8cc9e73c94a7894ea9f", size = 49298, upload-time = "2014-09-03T15:41:57.18Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/78/f9/690a8600b93c332de3ab4a344a4ac34f00c8f104917061f779db6a918ed6/pathlib-1.0.1-py3-none-any.whl", hash = "sha256:f35f95ab8b0f59e6d354090350b44a80a80635d22efdedfa84c7ad1cf0a74147", size = 14363, upload-time = "2022-05-04T13:37:20.585Z" },
+]
+
+[[package]]
+name = "phonenumbers"
+version = "9.0.29"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c2/c3/5b544d133241d649317c0ef456df4705cddb3968d31b5f64ec34e98925aa/phonenumbers-9.0.29.tar.gz", hash = "sha256:66455e5c5ca4197aca5a4217d0dc82717a22038292cfa322d5d5e7c46934a214", size = 2300063, upload-time = "2026-04-25T05:35:37.574Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cf/65/d932a84540a2d188c5d0dc3a80d7063820588bbc310cc59b4fe48619be9e/phonenumbers-9.0.29-py2.py3-none-any.whl", hash = "sha256:0eb26e0c578aa2d56428330d5b4a0a07dac9a452c4387bf76a76a88b1e839ab7", size = 2586805, upload-time = "2026-04-25T05:35:34.081Z" },
 ]
 
 [[package]]

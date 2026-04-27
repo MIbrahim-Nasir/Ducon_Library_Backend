@@ -23,6 +23,7 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 
 # ── Password helpers ───────────────────────────────────
@@ -60,6 +61,24 @@ def verify_google_token(token: str) -> dict:
 
 
 # ── Current user dependency ────────────────────────────
+async def get_optional_user(
+    token: Optional[str] = Depends(oauth2_scheme_optional),
+    db: AsyncSession = Depends(get_db),
+) -> Optional[User]:
+    """Returns the authenticated User if a valid Bearer token is present, None otherwise."""
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            return None
+        result = await db.execute(select(User).where(User.id == int(user_id)))
+        return result.scalar_one_or_none()
+    except JWTError:
+        return None
+
+
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
     db: AsyncSession = Depends(get_db),

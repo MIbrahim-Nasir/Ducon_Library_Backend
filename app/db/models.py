@@ -1,5 +1,5 @@
 from app.db.database import Base
-from sqlalchemy import Column, BigInteger, String, Boolean, TIMESTAMP, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, BigInteger, Integer, String, Boolean, TIMESTAMP, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -63,4 +63,51 @@ class Generation(Base):
 
     user = relationship("User", back_populates="generations")
     ducon_image = relationship("Image", back_populates="generations")
+
+
+# ── Guest tables (kept fully separate from authenticated user tables) ──────────
+
+class GuestSession(Base):
+    """Tracks a guest browser session and its generation usage for rate limiting."""
+    __tablename__ = "guest_sessions"
+
+    id               = Column(BigInteger, primary_key=True, autoincrement=True)
+    session_id       = Column(String, nullable=False, unique=True, index=True)  # UUID from X-Guest-Session-Id
+    ip_hash          = Column(String, nullable=True)                            # SHA-256 of client IP (non-reversible)
+    generation_count = Column(Integer, nullable=False, server_default='0')
+    created_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    last_used_at     = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+
+    generations = relationship("GuestGeneration", back_populates="guest_session",
+                               foreign_keys="GuestGeneration.guest_session_id", passive_deletes=True)
+
+
+class GuestGeneration(Base):
+    """AI generation created by a guest. Expires 48 h after creation unless claimed."""
+    __tablename__ = "guest_generations"
+
+    id              = Column(BigInteger, primary_key=True, autoincrement=True)
+    guest_session_id = Column(String, ForeignKey("guest_sessions.session_id", ondelete="SET NULL"), nullable=True)
+    generation_name = Column(String, nullable=False)
+    url             = Column(String, nullable=False, unique=True)   # R2 key or local path
+    ducon_image_id  = Column(BigInteger, ForeignKey("images.id", ondelete="SET NULL"), nullable=True)
+    generated_at    = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    expires_at      = Column(TIMESTAMP(timezone=True), nullable=True)  # NULL once claimed → permanent
+    user_id         = Column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)  # set on claim
+
+    guest_session = relationship("GuestSession", back_populates="generations",
+                                 foreign_keys=[guest_session_id])
+    ducon_image   = relationship("Image", foreign_keys=[ducon_image_id])
+    user          = relationship("User", foreign_keys=[user_id])
+
+
+class GuestConsentAudit(Base):
+    """Append-only audit log for guest AI generation consent events. No raw PII stored."""
+    __tablename__ = "guest_consent_audit"
+
+    id              = Column(BigInteger, primary_key=True, autoincrement=True)
+    session_id_hash = Column(String, nullable=False)   # SHA-256 of session_id
+    ip_hash         = Column(String, nullable=True)    # SHA-256 of IP
+    event           = Column(String, nullable=False)   # e.g. "ai_generation_guest_consent"
+    logged_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
 

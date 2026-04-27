@@ -128,3 +128,85 @@ def get_generation_url(generation_id: int, stored_key: str) -> str:
 def serve_local_path(stored_key: str) -> Path:
     """Local mode only — returns the absolute Path for FastAPI FileResponse."""
     return _local_path(stored_key)
+
+
+# ── Guest generation storage ───────────────────────────────────────────────────
+
+def save_guest_generation(session_id: str, filename: str) -> str:
+    """
+    After Gemini saves outputs/guests/{session_id}/{filename}:
+      Cloud → upload to R2 under guests/{session_id}/{filename}, delete local temp file.
+      Local → file stays on disk as-is.
+    Returns the key to store in GuestGeneration.url.
+    """
+    key   = f"guests/{session_id}/{filename}"
+    local = _OUTPUTS_DIR / "guests" / session_id / filename
+
+    if CLOUD_STORAGE:
+        with open(local, "rb") as f:
+            _r2().put_object(
+                Bucket=_R2_PRIVATE_BUCKET,
+                Key=key,
+                Body=f,
+                ContentType="image/png",
+            )
+        try:
+            local.unlink()
+        except OSError:
+            pass
+
+    return key
+
+
+def get_guest_generation_url(generation_id: int, stored_key: str) -> str:
+    """
+    URL the frontend uses to display a guest generation.
+      Cloud: presigned R2 GET URL valid for PRESIGNED_URL_EXPIRY seconds.
+      Local: /guest/generations/{id}/image
+    """
+    if CLOUD_STORAGE:
+        return _r2().generate_presigned_url(
+            "get_object",
+            Params={"Bucket": _R2_PRIVATE_BUCKET, "Key": stored_key},
+            ExpiresIn=_PRESIGNED_URL_EXPIRY,
+        )
+    return f"/guest/generations/{generation_id}/image"
+
+
+def move_guest_to_user(session_id: str, filename: str, user_id: int) -> str:
+    """
+    Moves a guest generation file into the authenticated user's permanent storage.
+    R2: copy-then-delete (R2 has no native rename/move).
+    Local: filesystem rename.
+    Returns the new permanent key stored in Generation.url.
+    """
+    guest_key = f"guests/{session_id}/{filename}"
+    user_key  = f"generations/{user_id}/{filename}"
+
+    if CLOUD_STORAGE:
+        _r2().copy_object(
+            Bucket=_R2_PRIVATE_BUCKET,
+            CopySource={"Bucket": _R2_PRIVATE_BUCKET, "Key": guest_key},
+            Key=user_key,
+        )
+        _r2().delete_object(Bucket=_R2_PRIVATE_BUCKET, Key=guest_key)
+    else:
+        src = _OUTPUTS_DIR / "guests" / session_id / filename
+        dst = _OUTPUTS_DIR / str(user_id) / filename
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if src.exists():
+            src.rename(dst)
+
+    return user_key
+
+
+def delete_guest_generation(stored_key: str) -> None:
+    """Delete a guest generation from R2 or local disk."""
+    if CLOUD_STORAGE:
+        _r2().delete_object(Bucket=_R2_PRIVATE_BUCKET, Key=stored_key)
+    else:
+        parts = stored_key.split("/", 2)   # ["guests", session_id, filename]
+        if len(parts) == 3:
+            path = _OUTPUTS_DIR / "guests" / parts[1] / parts[2]
+            if path.exists():
+                path.unlink()
