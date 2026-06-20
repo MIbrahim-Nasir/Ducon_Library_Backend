@@ -1,0 +1,387 @@
+"""
+Real-time conversational AI — WebSocket bridge router.
+
+Endpoint
+--------
+  GET /ws/voice
+
+  Query parameters:
+    token  (optional) — JWT access token for authenticated users.
+           Pass as ?token=<jwt> because browsers cannot set the
+           Authorization header on WebSocket connections.
+
+  Session lifetime
+  ----------------
+  Each WebSocket connection maps to exactly one fresh Gemini Live session.
+  There is no history from a previous conversation — closing the browser tab
+  / voice modal and reopening it always starts clean.
+
+  Within a single connection, the backend transparently handles:
+    • The Gemini ~10-minute WSS connection limit (reconnects with a
+      server-issued resumption handle, context preserved).
+    • Transient keepalive drops (reconnect with exponential back-off).
+
+  Session resumption handles are kept entirely server-side and are never
+  sent to the client.  This guarantees history isolation between sessions.
+
+Inbound messages from the client (JSON)
+----------------------------------------
+  { "type": "audio_chunk",      "data": "<base64 PCM 16-bit 16 kHz>" }
+  { "type": "text",             "data": "<user text message>" }
+  { "type": "audio_stream_end" }   # microphone paused / muted
+  { "type": "ping"             }   # keep-alive (backend responds with pong)
+  { "type": "tool_pause",
+    "call_id": "<id from tool_call>",
+    "name":    "<function name>" }  # sent immediately for human-input tools (e.g. UploadImage)
+                                    # cancels the 30s auto-timeout; tool_result still follows
+  { "type": "tool_result",
+    "call_id": "<id from tool_call>",
+    "name":    "<function name>",
+    "result":  { ... },             # JSON result from window.__duconAPI.<name>()
+    "error":   "<msg>"   }          # omit result and include error on failure
+
+Outbound messages to the client (JSON)
+----------------------------------------
+  { "type": "connected"        }   # Gemini session ready (also sent on internal reconnect)
+  { "type": "reconnecting",     "message": "Reconnecting in 1s…" }
+  { "type": "audio_chunk",      "data": "<base64 PCM 24 kHz>",
+                                 "mime_type": "audio/pcm;rate=24000" }
+  { "type": "input_transcript", "data": "<what Gemini heard>" }
+  { "type": "output_transcript","data": "<what Gemini is saying>" }
+  { "type": "turn_complete"    }
+  { "type": "interrupted"      }   # user barged in; flush your audio queue
+  { "type": "go_away",          "time_left_ms": 60000 }   # informational
+  { "type": "tool_call",
+    "call_id": "<opaque id>",
+    "name":    "<function name>",
+    "args":    { ... }  }           # see ★ Tool call protocol below
+  { "type": "error",            "message": "<description>" }
+  { "type": "pong"             }
+
+★ Tool call protocol (frontend must follow this exactly)
+---------------------------------------------------------
+Audio ordering explained
+~~~~~~~~~~~~~~~~~~~~~~~~
+The model's narration audio (PCM chunks) and the tool_call event are SEPARATE
+WebSocket messages from the backend.  The audio always arrives first; the
+tool_call event arrives after the last audio chunk for that narration.  The
+output_transcript events you may see arriving after tool_call are just the
+delayed text transcription of audio that was already sent — they are for
+captions only and do not affect ordering.
+
+Correct frontend behaviour on receiving a "tool_call" event
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Run audio playback and tool execution CONCURRENTLY, not sequentially:
+
+  1. START PLAYING THE AUDIO BUFFER immediately (the narration audio is
+     already queued — let it play through without blocking).
+  2. START EXECUTING the tool at the same time.
+     Do NOT pause or hold the audio queue while the tool runs.
+     Do NOT wait for the tool to finish before playing audio.
+
+  Exception — UI-opening tools (UploadImage, show_*):
+     Wait for the audio buffer to drain *before* opening the modal/panel,
+     so the user hears "I'm opening the upload window" before it appears.
+     Execute the tool immediately after audio drains (do not delay further).
+
+  Summary by tool:
+    get_selected_image, AISearch, KeywordSearch, get_image
+        → execute immediately, audio plays in parallel.
+    show_user_uploaded_images, show_image_generations, show_bookmarks
+        → wait for audio drain, then open panel, send tool_result.
+    UploadImage
+        → wait for audio drain, open file picker, send tool_pause to
+          backend (cancels the 30 s auto-timeout), send tool_result
+          when user completes upload.
+    generate_multi_image
+        → execute immediately (no tool_pause needed, backend has no
+          timeout for this tool), send tool_result when Promise resolves.
+
+  On error: send tool_result with "error" set and no "result" field.
+
+Error codes
+-----------
+  4001  Token provided but invalid or expired
+  4003  Internal error starting Gemini session
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import uuid
+from typing import Optional
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
+from jose import JWTError, jwt
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from app.db.database import get_db
+from app.db.models import User
+from app.live_session import GeminiLiveSession, LiveEvent, LiveEventType, _dbg
+from app.auth import SECRET_KEY, ALGORITHM
+
+router = APIRouter(tags=["voice"])
+logger = logging.getLogger(__name__)
+
+
+# ── Auth helper ───────────────────────────────────────────────────────────────
+
+async def _resolve_user(token: Optional[str], db: AsyncSession) -> Optional[User]:
+    """Decode an optional JWT and return the User row (or None for guests)."""
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            return None
+        result = await db.execute(select(User).where(User.id == int(user_id)))
+        return result.scalar_one_or_none()
+    except (JWTError, ValueError):
+        return None
+
+
+# ── WebSocket endpoint ─────────────────────────────────────────────────────────
+
+@router.websocket("/ws/voice")
+async def voice_ws(
+    websocket: WebSocket,
+    token: Optional[str] = Query(default=None, description="JWT access token"),
+):
+    """
+    Bidirectional WebSocket bridge between the client and Gemini Live API.
+
+    Every connection starts a fresh Gemini session — no history is carried
+    over from previous conversations.  Session resumption handles are managed
+    internally by the backend to survive the ~10-minute WSS limit.
+    """
+    await websocket.accept()
+    session_id = str(uuid.uuid4())
+
+    # ── Resolve user (best-effort — reject only if token is explicitly wrong) ─
+    user: Optional[User] = None
+    if token:
+        async for db in get_db():
+            user = await _resolve_user(token, db)
+            if user is None:
+                await websocket.close(code=4001, reason="Invalid or expired token")
+                logger.warning("Voice WS rejected — invalid token (session %s)", session_id)
+                return
+            break  # single DB iteration
+
+    user_id = user.id if user else None
+    user_label = f"user={user_id}" if user_id else "guest"
+    logger.info("Voice WS connected — %s session=%s", user_label, session_id)
+
+    # ── Create a fresh Gemini Live session — no handle, no prior history ──────
+    gemini_session = GeminiLiveSession(user_id=user_id)
+    event_queue: asyncio.Queue[LiveEvent] = asyncio.Queue()
+
+    try:
+        await gemini_session.start(event_queue)
+    except Exception as exc:
+        logger.exception("Failed to start Gemini Live session — %s", user_label)
+        await _send_json(websocket, {"type": "error", "message": str(exc)})
+        await websocket.close(code=4003, reason="Gemini session start failed")
+        return
+
+    # ── Run both relay tasks concurrently ─────────────────────────────────────
+    # Note: the initial "connected" event is delivered via the queue relay below,
+    # keeping a single code path for both the first connect and reconnects.
+    client_to_gemini_task = asyncio.create_task(
+        _relay_client_to_gemini(websocket, gemini_session, session_id),
+        name=f"client→gemini-{session_id[:8]}",
+    )
+    gemini_to_client_task = asyncio.create_task(
+        _relay_gemini_to_client(websocket, event_queue, session_id),
+        name=f"gemini→client-{session_id[:8]}",
+    )
+
+    try:
+        # Wait until either direction finishes (disconnect, error, or GoAway)
+        done, pending = await asyncio.wait(
+            {client_to_gemini_task, gemini_to_client_task},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+    finally:
+        await gemini_session.close()
+        logger.info("Voice WS disconnected — %s session=%s", user_label, session_id)
+
+
+# ── Relay: client → Gemini ────────────────────────────────────────────────────
+
+async def _relay_client_to_gemini(
+    ws: WebSocket,
+    session: GeminiLiveSession,
+    session_id: str,
+) -> None:
+    """
+    Read JSON messages from the client WebSocket and dispatch to the Gemini
+    session.  Returns (and causes the parent task to cancel the sibling) when
+    the WebSocket disconnects or receives an unrecognised / malformed message.
+    """
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                logger.warning("Voice WS non-JSON message ignored — session=%s", session_id)
+                continue
+
+            msg_type = msg.get("type", "")
+
+            if msg_type == "audio_chunk":
+                data = msg.get("data")
+                if data:
+                    mime = msg.get("mime_type", "audio/pcm;rate=16000")
+                    logger.debug(
+                        "→ Gemini audio chunk len=%d — session=%s",
+                        len(data), session_id,
+                    )
+                    await session.send_audio(data, mime_type=mime)
+
+            elif msg_type == "text":
+                data = msg.get("data", "").strip()
+                if data:
+                    logger.info(
+                        "→ Gemini text: %r — session=%s", data[:80], session_id
+                    )
+                    _dbg(f"[FRONT ▶ TEXT ] \"{data[:120]}\"")
+                    await session.send_text(data)
+
+            elif msg_type == "audio_stream_end":
+                logger.info("→ Gemini audio_stream_end — session=%s", session_id)
+                _dbg(f"[FRONT ▶ END  ] audio_stream_end")
+
+                await session.send_audio_stream_end()
+
+            elif msg_type == "tool_pause":
+                call_id = msg.get("call_id", "")
+                name    = msg.get("name", "")
+                logger.info(
+                    "← Frontend tool_pause: %s call_id=%s (timeout cancelled) — session=%s",
+                    name, call_id, session_id,
+                )
+                _dbg(f"[FRONT ▶ PAUSE] {name}  call_id={call_id}")
+                session.cancel_tool_timeout(call_id)
+
+            elif msg_type == "tool_result":
+                call_id = msg.get("call_id", "")
+                name    = msg.get("name", "")
+                result  = msg.get("result")   # may be None if error
+                error   = msg.get("error")    # str or None
+                logger.info(
+                    "← Frontend tool_result: %s call_id=%s error=%s — session=%s",
+                    name, call_id, bool(error), session_id,
+                )
+                # Show raw result keys + any id/name values so we can trace
+                # whether critical IDs (needed for generation tools) are present.
+                if result is not None:
+                    if isinstance(result, dict):
+                        id_val   = result.get("id")
+                        name_val = result.get("name") or result.get("filename")
+                        keys     = list(result.keys())
+                        _dbg(f"[FRONT ▶ TRES ] {name}  error={bool(error)}"
+                             f"  id={id_val}  name={name_val!r}  keys={keys}")
+                    elif isinstance(result, list):
+                        _dbg(f"[FRONT ▶ TRES ] {name}  error={bool(error)}"
+                             f"  list[{len(result)}] items")
+                    else:
+                        _dbg(f"[FRONT ▶ TRES ] {name}  error={bool(error)}"
+                             f"  result={repr(result)[:80]}")
+                else:
+                    _dbg(f"[FRONT ▶ TRES ] {name}  error={error!r}  result=None")
+                await session.submit_tool_result(
+                    call_id=call_id,
+                    name=name,
+                    result=result,
+                    error=error,
+                )
+
+            elif msg_type == "ping":
+                await _send_json(ws, {"type": "pong"})
+
+            else:
+                logger.debug(
+                    "Voice WS unknown message type %r — session=%s", msg_type, session_id
+                )
+
+    except WebSocketDisconnect:
+        logger.info("Voice WS client disconnected — session=%s", session_id)
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Voice WS client relay error — session=%s", session_id)
+
+
+# ── Relay: Gemini → client ────────────────────────────────────────────────────
+
+async def _relay_gemini_to_client(
+    ws: WebSocket,
+    event_queue: asyncio.Queue[LiveEvent],
+    session_id: str,
+) -> None:
+    """
+    Drain the LiveEvent queue and forward each event as JSON to the client.
+    Returns when the WebSocket is no longer writable or an error event arrives.
+    """
+    try:
+        while True:
+            event: LiveEvent = await event_queue.get()
+            payload = event.to_dict()
+
+            # Log tool calls explicitly so we can confirm the event reaches
+            # the relay and is about to be pushed to the frontend.
+            if event.type == LiveEventType.TOOL_CALL:
+                logger.info(
+                    "→ Frontend TOOL_CALL: %s call_id=%s args=%s — session=%s",
+                    event.name, event.call_id, list((event.args or {}).keys()),
+                    session_id,
+                )
+
+            try:
+                await _send_json(ws, payload)
+            except (WebSocketDisconnect, RuntimeError) as exc:
+                # WebSocket closed or in a terminal state — stop relaying.
+                logger.info(
+                    "Voice WS write failed (client gone): %s — session=%s",
+                    exc, session_id,
+                )
+                return
+            except Exception:
+                # Unexpected error (e.g. JSON serialisation) — log it clearly
+                # and keep the relay alive so other events still reach the client.
+                logger.exception(
+                    "Voice WS send error (event_type=%s) — session=%s",
+                    payload.get("type"), session_id,
+                )
+                continue
+
+            # Fatal error — close the WebSocket.
+            # RECONNECTING is informational; the session runner will restore
+            # itself, so we keep the WebSocket open.
+            if event.type == LiveEventType.ERROR:
+                await ws.close(code=1011, reason=event.message or "Gemini error")
+                return
+
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("Voice WS Gemini relay error — session=%s", session_id)
+
+
+# ── Utility ────────────────────────────────────────────────────────────────────
+
+async def _send_json(ws: WebSocket, payload: dict) -> None:
+    """Serialise payload and send as a text frame."""
+    await ws.send_text(json.dumps(payload, ensure_ascii=False))

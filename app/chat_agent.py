@@ -1,0 +1,890 @@
+"""
+Ducon Designer Chat Agent
+=========================
+Stateful multimodal chat agent using the Gemini Interactions API.
+
+Features
+--------
+- Multi-turn conversation with server-managed history (previous_interaction_id)
+- Streaming text/thinking via SSE
+- Multimodal input (text + images via Gemini Files API)
+- Frontend tool calling (same tools as the voice agent)
+- Long-running tasks (AI generation, quotation)
+
+Architecture
+------------
+Each user turn is one HTTP request → SSE stream. When the model requests a
+tool call, the stream ends with a `tool_call` event and the current
+`interaction_id`.  The frontend executes the tool and submits the result to
+POST /chat/tool_result, which opens a new SSE stream for the model's response.
+Multi-turn tool chains (sequential calls) work naturally through this mechanism.
+
+Streaming SSE event types (emitted to frontend)
+-----------------------------------------------
+  {"type": "text_delta",    "text": "..."}         → incremental response text
+  {"type": "thinking_delta","text": "..."}         → model reasoning (if enabled)
+  {"type": "tool_call",     "id":"...","name":"...","args":{...}}  → execute this
+  {"type": "done",          "interaction_id": "..."} → turn complete; save this ID
+  {"type": "error",         "message": "..."}       → something went wrong
+"""
+from __future__ import annotations
+
+import io
+import json
+import logging
+import os
+import tempfile
+from typing import AsyncGenerator, Optional
+
+from google import genai
+
+logger = logging.getLogger(__name__)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.5-flash")
+CHAT_THINKING_LEVEL = os.getenv("CHAT_THINKING_LEVEL", "low")
+# Set CHAT_STREAM to "false" to disable streaming (useful for debugging).
+CHAT_STREAM: bool = os.getenv("CHAT_STREAM", "true").lower() not in ("0", "false", "no")
+_LIVE_DEBUG: bool = os.getenv("LIVE_DEBUG", "").lower() in ("1", "true", "yes")
+
+
+def _dbg(*args) -> None:
+    if _LIVE_DEBUG:
+        print(*args)
+
+
+def _summarize_input_parts(parts: list) -> list[dict]:
+    summary: list[dict] = []
+    for part in parts:
+        if isinstance(part, str):
+            summary.append({"type": "text", "chars": len(part), "preview": part[:240]})
+        elif isinstance(part, dict):
+            ptype = part.get("type")
+            if ptype == "text":
+                text = part.get("text", "")
+                summary.append({"type": "text", "chars": len(text), "preview": text[:240]})
+            elif ptype in ("image", "audio", "video", "document"):
+                summary.append({
+                    "type": ptype,
+                    "uri": part.get("uri"),
+                    "mime_type": part.get("mime_type"),
+                })
+            elif ptype == "function_result":
+                result = part.get("result")
+                summary.append({
+                    "type": "function_result",
+                    "name": part.get("name"),
+                    "call_id": part.get("call_id"),
+                    "result_chars": len(json.dumps(result, ensure_ascii=False)) if result is not None else 0,
+                })
+            else:
+                summary.append({"type": ptype or "dict", "keys": list(part.keys())})
+        else:
+            summary.append({"type": type(part).__name__})
+    return summary
+
+
+def _event_usage(event) -> dict | None:
+    metadata = getattr(event, "metadata", None)
+    if not metadata:
+        return None
+    if hasattr(metadata, "model_dump"):
+        data = metadata.model_dump(exclude_none=True)
+    elif isinstance(metadata, dict):
+        data = metadata
+    else:
+        return None
+    return data.get("total_usage") or data.get("usage")
+
+
+def _interaction_usage(interaction) -> dict | None:
+    usage = getattr(interaction, "usage", None)
+    if usage is None:
+        return None
+    return usage.model_dump(exclude_none=True) if hasattr(usage, "model_dump") else usage
+
+# ── Gemini client (shared singleton) ─────────────────────────────────────────
+
+_client: Optional[genai.Client] = None
+
+
+def get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        _client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+    return _client
+
+
+# ── System instruction ────────────────────────────────────────────────────────
+
+CHAT_SYSTEM_INSTRUCTION = os.getenv("CHAT_SYSTEM_INSTRUCTION") or """
+You are the Ducon AI Designer — a multimodal design assistant built into the
+Ducon Library, a web platform by Ducon, a UAE-based premium outdoor living
+construction and design company.
+
+Ducon specialises in luxury outdoor spaces: pools, terraces, pergolas,
+landscaping, outdoor kitchens, and complete villa exteriors. The Ducon Library
+is the company's visual project catalog: a searchable collection of real
+completed projects and design images, organised by class, theme, level,
+project, and tags. Users can browse this catalog, bookmark items, upload photos
+of their own space, and use AI to visualise how Ducon designs would look there.
+
+The user is chatting with you inside the Ducon Library web app. You can see
+any images they attach to their messages.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PERSONALITY & STYLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+- Warm, knowledgeable, and design-focused.
+- Respond in the same language the user writes in.
+- Use markdown for structure when helpful (headings, bullet points, bold).
+- Be concise but complete. Don't over-explain.
+- When the user attaches an image of their space, acknowledge it and offer
+  specific design observations before proposing next steps.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT YOU CAN DO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Answer questions about Ducon, its products, projects, and outdoor design ideas.
+2. Search and filter the Ducon catalog, then open actual image references when
+   visual understanding is needed.
+3. Act as a design partner: propose layouts, products, materials, mood, lighting,
+   and practical refinements for the client's space.
+4. Design on the client's image using the multi-image generation tool. You can
+   work from the user's suggestions, or design independently when they ask you to.
+5. Run long-running tasks such as image generation and quotation analysis. Set
+   expectations clearly, then wait for the result and summarize it naturally.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOOL USE GUIDELINES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Search:
+- Use AISearch for any catalog search — descriptions, project names, product
+  types, themes, materials, or keywords. It handles all query types.
+- For AISearch, set show_user=true when the user asked to browse, see, show, or
+  explore results in the UI. Set show_user=false when gathering references for
+  your own design workflow.
+- Many UI tools accept show_user (boolean). Use true when the user should see
+  the result (search modal, image viewer, uploads panel). Use false for internal
+  agent work (background search, reference gathering, autonomous design steps).
+- AISearch returns CatalogImage records: {id, name, filename, class, theme,
+  project, tags, url, _type:"catalog_image"}. Treat these as search records:
+  IDs, image names/references, descriptions, tags, URLs, and metadata. Do not
+  assume you have visually inspected the actual image pixels from AISearch alone.
+- When you need proper visual understanding of a search result, call get_image
+  with the selected result's ID/name to open and retrieve the actual image
+  reference before describing visual details or using it as a design reference.
+- Use KeywordSearch when the user wants the catalog grid filtered immediately by
+  exact filters such as class, theme, level, project, tags, or tag logic.
+
+Designing on the client's image:
+- Use start_designer_job for autonomous design runs where you should analyze the
+  client image, explore references, generate, evaluate, and retry if needed.
+- Use generate_multi_image only for quick/direct generations where the user has
+  already chosen the references and wants a single preview now.
+- If the user attaches/uploads a client image and says "design this" without
+  instructions, ask one short clarifying question: "Do you have any style ideas,
+  or should I design it on my own?" If they want you to decide, proceed as the
+  designer and create a tasteful Ducon concept yourself.
+- If a client upload_id is already known from a chat attachment or UploadImage,
+  use it directly in generate_multi_image as a user-upload source. If no upload
+  is available, call UploadImage first.
+- Before generating, collect only the necessary constraints: target area,
+  preferred style/mood, must-keep elements, budget/level if relevant. If the user
+  asks you to decide, do not over-question them.
+- For long-running design work, say briefly that you are starting a design run,
+  call start_designer_job, and then report progress from the returned job events.
+
+generate_multi_image can:
+- Apply a specific product/texture from one catalog image to their space.
+- Combine multiple Ducon elements into a single scene.
+- Refine a previous generation (use 'gen:ID' as source).
+- Use a mood board or inspiration alongside a catalog reference.
+Workflow:
+1. Identify all images needed (catalog IDs, uploads, previous generations).
+2. For user photos needed but not yet uploaded or attached, call UploadImage first.
+3. Craft a precise prompt — reference each image by its label and position.
+   Example: "Apply the Ducon marble coping (image 1) to the pool edge visible
+   in the user space (image 2). Preserve all other existing elements."
+4. Call generate_multi_image with the ordered images list and prompt.
+5. After generation, offer get_quotation if measurements would be useful.
+
+Quotation / measurements:
+- Only call get_quotation after a generation has been completed this session.
+- Before calling, ask if the user knows any real dimensions of their space —
+  pass them as reference_measurements for higher accuracy.
+- After receiving the result, summarise the key figures naturally: total area,
+  notable products, any caveats.
+
+Tool behaviour:
+- Always tell the user what you are doing before calling a tool.
+  ("Let me search for that..." / "Opening the upload window now...")
+- After a tool returns, acknowledge and interpret the result for the user.
+- If a tool fails, explain briefly and offer an alternative approach.
+- Never mention tool names — use plain language.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESTRICTIONS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Only respond to topics related to Ducon, outdoor design, and this platform.
+Politely decline any other requests.
+""".strip()
+
+
+# ── Tool declarations (Interactions API format) ───────────────────────────────
+# Format: flat list of {"type":"function","name":...,"description":...,"parameters":...}
+
+CHAT_TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "name": "AISearch",
+        "description": (
+            "Semantic visual search of the Ducon project catalog. "
+            "Use for any catalog search — natural-language descriptions, specific project "
+            "names, product types, themes, tags, or any keyword the user mentions. "
+            "Returns Array<CatalogImage>, where each item has {id, name, filename, class, "
+            "theme, project, tags, url, _type:'catalog_image'}. It opens the AI search modal "
+            "and resolves when results are set. Treat results as records/metadata, not visual "
+            "inspection of pixels. If you need to understand or reference the actual image, "
+            "call get_image with the chosen result ID/name/object."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query — describe what to find",
+                },
+                "show_user": {
+                    "type": "boolean",
+                    "description": (
+                        "True when the user should see the AI search results UI. "
+                        "False when searching only for internal reference gathering."
+                    ),
+                },
+                "presentation": {
+                    "type": "string",
+                    "enum": ["show_user", "internal"],
+                    "description": "Legacy alias for show_user. Prefer show_user boolean.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "KeywordSearch",
+        "description": (
+            "Apply exact filters to the Ducon catalog grid immediately. Use when the user asks "
+            "to filter/browse by class, theme, level, project, tags, or tag logic rather than "
+            "asking for semantic design discovery. Returns void."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Keyword text to apply to the catalog grid.",
+                },
+                "opts": {
+                    "type": "object",
+                    "description": "Optional exact catalog filters.",
+                    "properties": {
+                        "class": {"type": "string"},
+                        "theme": {"type": "string"},
+                        "level": {"type": "string"},
+                        "project": {"type": "string"},
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "tagLogic": {
+                            "type": "string",
+                            "enum": ["and", "or"],
+                            "description": "How multiple tags should be combined.",
+                        },
+                    },
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_selected_image",
+        "description": (
+            "Returns the currently open/selected image, or null. Usually returns CatalogImage. "
+            "Call this proactively when the user refers to 'this image', 'this design', "
+            "'something like this', or implies they are looking at something. "
+            "Do not ask the user which image they mean until you have tried this first."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "get_image",
+        "description": (
+            "Open an image in the Image Viewer and return it. Resolves catalog images, AI "
+            "generations, and user uploads in priority order. Use after AISearch when you need "
+            "proper visual understanding or a concrete design/product reference. Returns "
+            "CatalogImage | UploadImage | AIGeneration."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "Image reference: numeric ID, name/filename, generation ref, upload ref, or JSON object with id.",
+                },
+                "show_user": {
+                    "type": "boolean",
+                    "description": "True to open the image viewer for the user. False when fetching for internal analysis only.",
+                },
+            },
+            "required": ["ref"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "show_user_uploaded_images",
+        "description": "Open the Uploads panel in the sidebar showing the user's previously uploaded photos.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "show_image_generations",
+        "description": "Open the AI Generations panel in the sidebar showing completed design previews.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "show_bookmarks",
+        "description": "Open the Bookmarks panel in the sidebar showing items the user has saved.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "open_sidebar",
+        "description": (
+            "Open the sidebar workspace panel. Returns {status:'open'}. "
+            "Use when the user asks to open the sidebar or wants to access their workspace."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "open_ai_generations",
+        "description": (
+            "Open the AI Generations panel in the sidebar and return the list of the user's "
+            "AI-generated designs. Returns Array<{id, generation_name, url, ducon_image_id}>. "
+            "Use when the user asks to see, browse, or access their generated images. "
+            "After generate_multi_image you can call this to show the user their result "
+            "in context with past generations."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "open_catalog",
+        "description": (
+            "Navigate to the main catalog view and scroll so the category tabs and design grid "
+            "are visible at the top of the screen. Returns {status:'open'}. "
+            "Use when the user wants to browse, explore, or scroll through the full catalog."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "UploadImage",
+        "description": (
+            "Opens the file picker so the user can upload a photo of their space. "
+            "Resolves with {id, name, filename, _isUpload:true, _type:'user_upload'} once the "
+            "user confirms. Pass id or the full object as a user upload source in "
+            "generate_multi_image. Use when no upload_id is available from a chat attachment."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "type": "function",
+        "name": "start_designer_job",
+        "description": (
+            "Start a long-running autonomous Ducon design job. Use when the user provides a "
+            "client space image and wants the designer to explore ideas, search multiple Ducon "
+            "references, generate one or more candidates, visually evaluate them, and return the "
+            "best result. This is preferred for requests like 'design this', 'make my terrace look "
+            "good', 'try a few ideas', or any task that may need multiple searches/generations. "
+            "The frontend must resolve user_upload_image to an actual File and call POST "
+            "/designer/jobs. Returns {job_id, status, events_url}; progress arrives from the job "
+            "events stream."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "User's design goal or suggestions. If the user gave no instructions, "
+                        "summarize that the designer should choose an appropriate Ducon concept."
+                    ),
+                },
+                "user_upload_image": {
+                    "type": "string",
+                    "description": (
+                        "Upload id/source for the client's space image. Use an upload id from chat "
+                        "attachment or UploadImage result. If unknown, call UploadImage first."
+                    ),
+                },
+                "model": {
+                    "type": "string",
+                    "enum": ["flash", "pro"],
+                    "description": "Image generation model for attempts. Default: flash.",
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": ["1:1", "4:3", "3:4", "16:9", "9:16"],
+                    "description": "Output aspect ratio. Default: 16:9.",
+                },
+                "show_user": {
+                    "type": "boolean",
+                    "description": "Usually false — autonomous design runs in the chat timeline, not separate UI.",
+                },
+            },
+            "required": ["prompt", "user_upload_image"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "generate_multi_image",
+        "description": (
+            "Generate a new design image by compositing multiple source images with a custom prompt. "
+            "Use this for both simple single-reference generations and advanced multi-image tasks. "
+            "It accepts any combination of images in any order with individual labels — ideal for: "
+            "(1) applying a specific Ducon product/texture to a user's space; "
+            "(2) combining multiple Ducon references into one scene; "
+            "(3) using a previous generation as a starting point for refinement; "
+            "(4) applying a mood-board or inspiration image alongside a catalog reference. "
+            "\n\n"
+            "SOURCE CONVENTIONS (passed back to the frontend for resolution):\n"
+            "  - Catalog image  → numeric ID string, e.g. '42'\n"
+            "  - Catalog by name → image filename/name, e.g. 'marble_pool_coping'\n"
+            "  - Previous generation → 'gen:123' where 123 is the generation id\n"
+            "  - User upload → upload id string/number from UploadImage or chat attachment, or 'upload' to ask frontend to open picker\n"
+            "  - Direct URL → full https:// URL\n"
+            "\n\n"
+            "MODEL LIMITS: max 10 images total. "
+            "Use model='pro' (default) for high quality; model='flash' for faster iterations."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": (
+                        "Full task description. Reference images by their label and position, e.g. "
+                        "'Apply the Ducon marble coping (image 1) to the pool edge in the user space (image 2). "
+                        "Match the existing tile colour. Photorealistic, golden-hour lighting.' "
+                        "Put specific instructions here — be explicit about what changes and what stays the same."
+                    ),
+                },
+                "images": {
+                    "type": "array",
+                    "description": "Ordered list of images. Max 10. Order matters — prompt references them by position.",
+                    "maxItems": 10,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "source": {
+                                "type": "string",
+                                "description": (
+                                    "Image source: catalog ID ('42'), catalog name ('marble_coping'), "
+                                    "generation reference ('gen:123'), upload id from UploadImage/chat attachment, "
+                                    "'upload' to open picker, or URL."
+                                ),
+                            },
+                            "label": {
+                                "type": "string",
+                                "description": (
+                                    "Short descriptive label shown before this image in the prompt context, "
+                                    "e.g. 'Ducon marble coping', 'user terrace', 'mood board'. "
+                                    "Match the wording you use in the prompt."
+                                ),
+                            },
+                        },
+                        "required": ["source", "label"],
+                    },
+                },
+                "model": {
+                    "type": "string",
+                    "enum": ["pro", "flash"],
+                    "description": (
+                        "'pro' (default) = Gemini 3 Pro Image — highest quality, slower. "
+                        "'flash' = Gemini 3.1 Flash Image — faster iterations, good quality."
+                    ),
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "enum": ["1:1", "4:3", "3:4", "16:9", "9:16"],
+                    "description": "Output aspect ratio. Defaults to the model's native ratio if omitted.",
+                },
+                "show_user": {
+                    "type": "boolean",
+                    "description": "False for internal agent generations. True only if the user explicitly asked to see generation UI.",
+                },
+            },
+            "required": ["prompt", "images"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_quotation",
+        "description": (
+            "Requests a Gemini AI quotation analysis for an AI-generated visualisation. "
+            "Opens the Quotation modal, lets the user confirm their original space photo "
+            "(if not pre-supplied), then returns a full area-measurement and fixed-items breakdown. "
+            "Call this after generate_multi_image when the user asks for measurements, a material "
+            "list, or a cost estimate. Pass generationRef from the generation result. "
+            "If the user already uploaded a photo this session, pass it as userImageRef. "
+            "If the user provides any known room dimensions, pass them as referenceMeasurements. "
+            "Returns void after opening the quotation modal."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "generationRef": {
+                    "type": "string",
+                    "description": "Generation reference: id, name, or JSON object string.",
+                },
+                "userImageRef": {
+                    "type": "object",
+                    "description": "Optional. User's original space photo upload object.",
+                    "properties": {
+                        "id":              {"type": "integer"},
+                        "name":            {"type": "string"},
+                        "filename":        {"type": "string"},
+                        "_isUpload":       {"type": "boolean"},
+                        "_type":           {"type": "string"},
+                    },
+                },
+                "referenceMeasurements": {
+                    "type": "string",
+                    "description": (
+                        "Optional. Known real-world dimensions, "
+                        "e.g. 'Terrace is 8 m wide and 12 m deep. Pool is 4×8 m.'"
+                    ),
+                },
+            },
+            "required": ["generationRef"],
+        },
+    },
+]
+
+
+# ── File upload helper ────────────────────────────────────────────────────────
+
+async def upload_file_to_gemini(
+    file_bytes: bytes,
+    filename: str,
+    mime_type: str,
+) -> dict:
+    """
+    Upload a file to the Gemini Files API and return its URI and mime_type.
+
+    The Files API URI is temporary (TTL ~48 h) and only usable by the same
+    project key.  It is never stored persistently.
+
+    Returns:
+        {"uri": str, "mime_type": str}
+    """
+    client = get_client()
+
+    # The SDK's async files.upload expects a path or file-like object.
+    with tempfile.NamedTemporaryFile(
+        suffix=_suffix_from_mime(mime_type), delete=False
+    ) as tmp:
+        tmp.write(file_bytes)
+        tmp_path = tmp.name
+
+    try:
+        uploaded = await client.aio.files.upload(
+            file=tmp_path,
+            config={"mime_type": mime_type, "display_name": filename},
+        )
+        return {"uri": uploaded.uri, "mime_type": uploaded.mime_type}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _suffix_from_mime(mime_type: str) -> str:
+    mapping = {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "image/heic": ".heic",
+        "image/heif": ".heif",
+        "video/mp4": ".mp4",
+        "audio/mpeg": ".mp3",
+        "audio/wav": ".wav",
+        "application/pdf": ".pdf",
+    }
+    return mapping.get(mime_type, ".bin")
+
+
+# ── SSE helpers ───────────────────────────────────────────────────────────────
+
+def _sse(payload: dict) -> str:
+    """Format a dict as a single SSE message."""
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _sse_error(message: str) -> str:
+    return _sse({"type": "error", "message": message})
+
+
+# ── Core streaming generator ──────────────────────────────────────────────────
+
+async def stream_chat(
+    input_parts: list,
+    previous_interaction_id: Optional[str] = None,
+) -> AsyncGenerator[str, None]:
+    """
+    Async generator that runs one chat turn and yields SSE-formatted strings.
+
+    Handles:
+    - Text deltas streamed incrementally
+    - Thinking indicators (model reasons via thought_signature — no visible text,
+      but we emit a generic indicator so the frontend can show a spinner)
+    - Tool call steps collected and emitted as tool_call events
+    - Interaction ID tracked and emitted in the final `done` event
+    - Error handling: emits an error event and returns cleanly
+
+    Args:
+        input_parts:              Gemini input parts — text, image, function_result.
+        previous_interaction_id:  Chain to the previous turn for multi-turn history.
+
+    Current SDK event types (google-genai >= 2.0 / Interactions steps schema):
+        interaction.created       → event.interaction.id
+        interaction.status_update → event.interaction_id
+        step.start                → event.step.type ("thought"|"model_output"|"function_call")
+        step.delta                → event.delta.type ("text"|"thought_signature"|"arguments_delta")
+        step.stop                 → event.index
+        interaction.completed     → event.interaction.id, event.interaction.status
+    """
+    client = get_client()
+
+    generation_config: dict = {}
+    if CHAT_THINKING_LEVEL and CHAT_THINKING_LEVEL.lower() not in ("none", ""):
+        generation_config["thinking_level"] = CHAT_THINKING_LEVEL
+
+    interaction_id: Optional[str] = None
+    tool_calls: list[dict] = []
+    emitted_tool_call_ids: set[str] = set()
+
+    try:
+        _dbg(
+            "[CHAT ▶ REQUEST]",
+            {
+                "model": CHAT_MODEL,
+                "stream": CHAT_STREAM,
+                "thinking_level": CHAT_THINKING_LEVEL,
+                "previous_interaction_id": previous_interaction_id,
+                "input_parts": _summarize_input_parts(input_parts),
+                "tools": [tool.get("name") for tool in CHAT_TOOLS],
+                "context": (
+                    "Interactions API history is server-managed via previous_interaction_id; "
+                    "this backend does not manually summarize chat context."
+                ),
+            },
+        )
+        if CHAT_STREAM:
+            # Track function call steps as they stream in, keyed by step index.
+            fc_by_index: dict[int, dict] = {}
+            thinking_started = False
+
+            stream = await client.aio.interactions.create(
+                model=CHAT_MODEL,
+                system_instruction=CHAT_SYSTEM_INSTRUCTION,
+                input=input_parts,
+                tools=CHAT_TOOLS,
+                previous_interaction_id=previous_interaction_id,
+                generation_config=generation_config or None,
+                stream=True,
+            )
+
+            async for event in stream:
+                etype = getattr(event, "event_type", None)
+                usage = _event_usage(event)
+                if usage:
+                    _dbg("[CHAT ◀ USAGE]", usage)
+                else:
+                    _dbg("[CHAT ◀ EVENT]", etype, {"index": getattr(event, "index", None)})
+
+                # ── Grab interaction ID as early as possible ────────────────
+                if not interaction_id:
+                    _ia = getattr(event, "interaction", None)
+                    if _ia:
+                        interaction_id = getattr(_ia, "id", None)
+                    if not interaction_id:
+                        interaction_id = getattr(event, "interaction_id", None)
+
+                # ── step.start — track which index is which step type ───────
+                if etype == "step.start":
+                    step  = getattr(event, "step", None)
+                    index = getattr(event, "index", None)
+                    stype = getattr(step, "type", None) if step else None
+
+                    if stype == "thought" and not thinking_started:
+                        _dbg("[CHAT ◀ THOUGHT]", {"index": index, "note": "thought step started"})
+                        # Emit a one-shot indicator so the frontend can show "thinking…"
+                        thinking_started = True
+                        yield _sse({"type": "thinking_delta", "text": ""})
+
+                    elif stype == "function_call":
+                        # Initialise accumulator. The function call metadata is
+                        # available on step.start; arguments may arrive as JSON
+                        # string chunks in following arguments_delta events.
+                        fc_by_index[index] = {
+                            "id":        getattr(step, "id", None),
+                            "name":      getattr(step, "name", None),
+                            "args":      getattr(step, "arguments", {}) or {},
+                            "args_text": "",
+                        }
+                        _dbg("[CHAT ◀ TOOL START]", fc_by_index[index])
+
+                # ── step.delta — text output or streamed function args ──────
+                elif etype == "step.delta":
+                    delta = getattr(event, "delta", None)
+                    index = getattr(event, "index", None)
+                    if delta:
+                        dtype = getattr(delta, "type", None)
+
+                        if dtype == "text":
+                            text = getattr(delta, "text", None)
+                            if text:
+                                _dbg("[CHAT ◀ TEXT]", repr(text[:240]))
+                                yield _sse({"type": "text_delta", "text": text})
+
+                        elif dtype == "arguments_delta":
+                            fc = fc_by_index.get(index)
+                            if fc is None:
+                                fc = {"id": None, "name": None, "args": {}, "args_text": ""}
+                                fc_by_index[index] = fc
+                            fc["args_text"] += getattr(delta, "arguments", "") or ""
+                            _dbg("[CHAT ◀ TOOL ARGS Δ]", {"index": index, "delta": getattr(delta, "arguments", "")})
+
+                # ── step.stop — function call is fully received ─────────────
+                elif etype == "step.stop":
+                    index = getattr(event, "index", None)
+                    fc = fc_by_index.pop(index, None)
+                    if fc and fc.get("name"):
+                        if fc.get("args_text"):
+                            try:
+                                fc["args"] = json.loads(fc["args_text"])
+                            except json.JSONDecodeError:
+                                logger.warning(
+                                    "Failed to parse streamed function args for %s: %r",
+                                    fc.get("name"), fc.get("args_text"),
+                                )
+                        fc.pop("args_text", None)
+                        call_id = fc.get("id") or f"{fc.get('name')}:{index}"
+                        fc["id"] = call_id
+                        _dbg("[CHAT ◀ TOOL CALL]", fc)
+                        emitted_tool_call_ids.add(str(call_id))
+                        yield _sse({
+                            "type": "tool_call",
+                            "id":   call_id,
+                            "name": fc["name"],
+                            "args": fc["args"],
+                        })
+
+                # ── interaction.completed — final status ────────────────────
+                elif etype == "interaction.completed":
+                    _ia = getattr(event, "interaction", None)
+                    if _ia:
+                        interaction_id = getattr(_ia, "id", interaction_id)
+                        _dbg(
+                            "[CHAT ◀ COMPLETE]",
+                            {
+                                "interaction_id": interaction_id,
+                                "status": getattr(_ia, "status", None),
+                                "usage": _interaction_usage(_ia),
+                            },
+                        )
+
+        else:
+            # ── Non-streaming mode ──────────────────────────────────────────
+            interaction = await client.aio.interactions.create(
+                model=CHAT_MODEL,
+                system_instruction=CHAT_SYSTEM_INSTRUCTION,
+                input=input_parts,
+                tools=CHAT_TOOLS,
+                previous_interaction_id=previous_interaction_id,
+                generation_config=generation_config or None,
+            )
+            interaction_id = getattr(interaction, "id", None)
+            _dbg(
+                "[CHAT ◀ RESPONSE]",
+                {
+                    "interaction_id": interaction_id,
+                    "status": getattr(interaction, "status", None),
+                    "usage": _interaction_usage(interaction),
+                },
+            )
+
+            # New Interactions schema returns a typed steps timeline.
+            for step in (getattr(interaction, "steps", None) or []):
+                stype = getattr(step, "type", None)
+                if stype == "model_output":
+                    for content in (getattr(step, "content", None) or []):
+                        if getattr(content, "type", None) == "text":
+                            text = getattr(content, "text", None)
+                            if text:
+                                yield _sse({"type": "text_delta", "text": text})
+                elif stype == "function_call":
+                    call_id = getattr(step, "id", None) or f"{getattr(step, 'name', 'tool')}:{len(emitted_tool_call_ids)}"
+                    tc = {
+                        "id":   call_id,
+                        "name": getattr(step, "name", None),
+                        "args": getattr(step, "arguments", {}) or {},
+                    }
+                    _dbg("[CHAT ◀ TOOL CALL]", tc)
+                    emitted_tool_call_ids.add(str(call_id))
+                    yield _sse({
+                        "type": "tool_call",
+                        "id":   call_id,
+                        "name": tc["name"],
+                        "args": tc["args"],
+                    })
+
+    except Exception as exc:
+        logger.exception("Chat agent error during interaction")
+        _dbg("[CHAT ✖ ERROR]", repr(exc))
+        yield _sse_error(str(exc))
+        return
+
+    # ── Emit any calls not already emitted in timeline order ──────────────────
+    for tc in tool_calls:
+        call_id = tc.get("id") or f"{tc.get('name') or 'tool'}:{len(emitted_tool_call_ids)}"
+        tc["id"] = call_id
+        marker = str(call_id)
+        if marker in emitted_tool_call_ids:
+            continue
+        _dbg("[CHAT ▶ SSE TOOL]", tc)
+        yield _sse({
+            "type": "tool_call",
+            "id":   call_id,
+            "name": tc["name"],
+            "args": tc["args"],
+        })
+
+    # ── Done — always emitted last ────────────────────────────────────────────
+    _dbg("[CHAT ▶ DONE]", {"interaction_id": interaction_id})
+    yield _sse({"type": "done", "interaction_id": interaction_id})

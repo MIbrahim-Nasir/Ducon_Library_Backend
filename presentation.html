@@ -1,0 +1,985 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ducon Backend — What We Built</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700;900&family=Inter:wght@300;400;500;600&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --stone:  #1c1810;
+    --sand:   #c9a96e;
+    --cream:  #faf6ee;
+    --rust:   #c45c35;
+    --moss:   #4a6040;
+    --sky:    #3d6080;
+    --warm:   #f0e8d8;
+    --muted:  #7a7060;
+    --accent: #d4874a;
+    --gold:   #e8c060;
+    --green:  #5a8050;
+    --red:    #c04840;
+    --white:  #ffffff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Inter', sans-serif;
+    background: #0e0b07;
+    color: var(--cream);
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  /* ── DECK ── */
+  .deck { width: 100%; height: 100vh; position: relative; }
+  .slide {
+    position: absolute; inset: 0;
+    opacity: 0; pointer-events: none;
+    transition: opacity 0.5s ease;
+    overflow: hidden;
+  }
+  .slide.active { opacity: 1; pointer-events: all; }
+
+  /* ── NAV ── */
+  .progress {
+    position: fixed; top: 0; left: 0; height: 3px;
+    background: linear-gradient(90deg, var(--rust), var(--sand), var(--gold));
+    transition: width 0.4s ease; z-index: 200;
+  }
+  .nav {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: center; gap: 12px; z-index: 100;
+    background: rgba(14,11,7,0.92); backdrop-filter: blur(20px);
+    border: 1px solid rgba(201,169,110,0.2); border-radius: 50px;
+    padding: 8px 20px; box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+  }
+  .nav button {
+    background: none; border: none; color: var(--sand); font-size: 18px;
+    cursor: pointer; padding: 2px 8px; border-radius: 50%;
+    transition: background 0.2s;
+  }
+  .nav button:hover { background: rgba(201,169,110,0.15); }
+  .dots { display: flex; gap: 5px; align-items: center; }
+  .dot {
+    width: 5px; height: 5px; border-radius: 50%;
+    background: rgba(122,112,96,0.5); cursor: pointer; transition: all 0.3s;
+  }
+  .dot.active { background: var(--sand); width: 18px; border-radius: 3px; }
+  .nav-count {
+    font-family: 'Space Mono', monospace; font-size: 10px;
+    color: var(--muted); min-width: 32px; text-align: right;
+  }
+
+  /* ══════════════════════════════════════
+     SLIDE 1 — COVER
+  ══════════════════════════════════════ */
+  .s1 {
+    background: linear-gradient(145deg, #120f08 0%, #1e1810 50%, #160f08 100%);
+    display: flex; flex-direction: column;
+    justify-content: center; align-items: center; text-align: center;
+  }
+  .s1-bg {
+    position: absolute; inset: 0; pointer-events: none;
+    background:
+      radial-gradient(ellipse 60% 50% at 70% 30%, rgba(201,169,110,0.08) 0%, transparent 55%),
+      radial-gradient(ellipse 45% 55% at 30% 70%, rgba(196,92,53,0.06) 0%, transparent 55%);
+  }
+  .s1-lines {
+    position: absolute; inset: 0;
+    background-image: linear-gradient(rgba(201,169,110,0.03) 1px, transparent 1px),
+                      linear-gradient(90deg, rgba(201,169,110,0.03) 1px, transparent 1px);
+    background-size: 80px 80px;
+  }
+  .s1-tag {
+    font-family: 'Space Mono', monospace; font-size: 10px;
+    letter-spacing: 3px; text-transform: uppercase;
+    color: var(--sand); opacity: 0.7;
+    border: 1px solid rgba(201,169,110,0.25); border-radius: 50px;
+    padding: 6px 18px; margin-bottom: 32px; position: relative;
+  }
+  .s1 h1 {
+    font-family: 'Playfair Display', serif;
+    font-size: clamp(52px, 7vw, 96px); font-weight: 900;
+    line-height: 1.0; color: var(--cream); position: relative;
+  }
+  .s1 h1 em { color: var(--sand); font-style: normal; display: block; }
+  .s1-tagline {
+    font-size: 16px; color: rgba(250,246,238,0.55);
+    margin-top: 20px; font-weight: 300; position: relative;
+    max-width: 480px;
+  }
+  .s1-pills {
+    display: flex; gap: 10px; margin-top: 40px;
+    flex-wrap: wrap; justify-content: center; position: relative;
+  }
+  .s1-pill {
+    display: flex; align-items: center; gap: 6px;
+    background: rgba(201,169,110,0.06); border: 1px solid rgba(201,169,110,0.18);
+    border-radius: 50px; padding: 6px 14px; font-size: 12px; color: var(--sand);
+  }
+
+  /* ══════════════════════════════════════
+     SLIDE 2 — WHAT DOES IT DO
+  ══════════════════════════════════════ */
+  .s2 {
+    background: #f8f4ec; color: var(--stone);
+    display: flex; flex-direction: column;
+    padding: 56px 72px;
+  }
+  .dark-tag {
+    font-family: 'Space Mono', monospace; font-size: 9px;
+    letter-spacing: 3px; text-transform: uppercase; color: var(--rust);
+    margin-bottom: 10px;
+  }
+  .s2 h2 {
+    font-family: 'Playfair Display', serif;
+    font-size: clamp(32px, 4vw, 52px); font-weight: 700;
+    color: var(--stone); margin-bottom: 8px; line-height: 1.1;
+  }
+  .s2-sub { font-size: 14px; color: var(--muted); margin-bottom: 36px; }
+  .feature-cards {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; flex: 1;
+  }
+  .fc {
+    background: white; border-radius: 16px;
+    padding: 28px 24px; display: flex; flex-direction: column;
+    box-shadow: 0 2px 20px rgba(0,0,0,0.06);
+    border: 1px solid rgba(0,0,0,0.05);
+    transition: transform 0.2s, box-shadow 0.2s;
+  }
+  .fc:hover { transform: translateY(-3px); box-shadow: 0 8px 32px rgba(0,0,0,0.1); }
+  .fc-icon { font-size: 40px; margin-bottom: 16px; }
+  .fc-title { font-family: 'Playfair Display', serif; font-size: 20px; font-weight: 700; color: var(--stone); margin-bottom: 8px; }
+  .fc-desc { font-size: 13px; color: #5a5045; line-height: 1.7; flex: 1; }
+  .fc-tech { font-family: 'Space Mono', monospace; font-size: 9px; color: var(--muted); margin-top: 14px; padding-top: 12px; border-top: 1px solid #f0ebe0; }
+
+  /* ══════════════════════════════════════
+     SLIDE 3 — USER JOURNEY
+  ══════════════════════════════════════ */
+  .s3 {
+    background: #13110c;
+    display: flex; flex-direction: column; padding: 52px 64px;
+  }
+  .s3 h2 {
+    font-family: 'Playfair Display', serif;
+    font-size: clamp(28px, 3.5vw, 48px); color: var(--cream);
+    margin-bottom: 6px;
+  }
+  .s3-sub { font-size: 13px; color: var(--muted); margin-bottom: 36px; }
+  .journey { display: flex; align-items: stretch; gap: 0; flex: 1; }
+  .jstep {
+    flex: 1; display: flex; flex-direction: column; align-items: center;
+    text-align: center; padding: 0 12px;
+    position: relative;
+  }
+  .jstep::after {
+    content: '→'; position: absolute; right: -14px; top: 60px;
+    font-size: 22px; color: rgba(201,169,110,0.3);
+  }
+  .jstep:last-child::after { display: none; }
+  .jstep-bubble {
+    width: 90px; height: 90px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 38px; margin-bottom: 18px; flex-shrink: 0;
+  }
+  .jb1 { background: rgba(61,96,128,0.3);  border: 2px solid rgba(61,96,128,0.5); }
+  .jb2 { background: rgba(74,96,64,0.3);   border: 2px solid rgba(74,96,64,0.5); }
+  .jb3 { background: rgba(212,135,74,0.2); border: 2px solid rgba(212,135,74,0.4); }
+  .jb4 { background: rgba(196,92,53,0.25); border: 2px solid rgba(196,92,53,0.45); }
+  .jb5 { background: rgba(201,169,110,0.2); border: 2px solid rgba(201,169,110,0.4); }
+  .jstep-title { font-size: 14px; font-weight: 600; color: var(--cream); margin-bottom: 8px; }
+  .jstep-desc  { font-size: 11.5px; color: var(--muted); line-height: 1.65; }
+  .jstep-note  { font-family: 'Space Mono', monospace; font-size: 8.5px; color: var(--accent); margin-top: 10px; }
+
+  /* ══════════════════════════════════════
+     SLIDE 4 — AI MAGIC (simplified)
+  ══════════════════════════════════════ */
+  .s4 {
+    background: #f5f0e6; color: var(--stone);
+    display: flex; gap: 0;
+  }
+  .s4-left {
+    width: 42%; padding: 56px 52px;
+    display: flex; flex-direction: column; justify-content: center;
+    background: var(--stone); color: var(--cream);
+  }
+  .s4-left h2 {
+    font-family: 'Playfair Display', serif;
+    font-size: clamp(28px, 3.5vw, 46px); margin-bottom: 14px; line-height: 1.1;
+  }
+  .s4-left h2 em { color: var(--sand); font-style: normal; }
+  .s4-left p { font-size: 13px; color: rgba(250,246,238,0.65); line-height: 1.75; margin-bottom: 20px; }
+  .ai-models { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+  .ai-model {
+    padding: 12px 16px; border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.08);
+    display: flex; align-items: center; gap: 12px;
+  }
+  .am1 { background: rgba(61,96,128,0.25); }
+  .am2 { background: rgba(196,92,53,0.2);  }
+  .am3 { background: rgba(201,169,110,0.1); }
+  .ai-model-icon { font-size: 22px; flex-shrink: 0; }
+  .ai-model-name { font-size: 11px; font-weight: 600; color: var(--cream); }
+  .ai-model-role { font-size: 10px; color: var(--muted); margin-top: 1px; }
+
+  .s4-right {
+    flex: 1; padding: 48px 44px;
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  .s4-right h3 {
+    font-family: 'Playfair Display', serif; font-size: 22px;
+    color: var(--stone); margin-bottom: 24px;
+  }
+  .pipeline-vis { display: flex; flex-direction: column; gap: 0; }
+  .pv-step {
+    display: flex; align-items: flex-start; gap: 16px; padding: 16px 0;
+    border-bottom: 1px solid rgba(0,0,0,0.06);
+  }
+  .pv-step:last-child { border-bottom: none; }
+  .pv-num {
+    width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Space Mono', monospace; font-size: 11px; font-weight: 700;
+    background: var(--stone); color: var(--sand);
+  }
+  .pv-title { font-size: 13px; font-weight: 600; color: var(--stone); margin-bottom: 3px; }
+  .pv-desc  { font-size: 11.5px; color: #5a5045; line-height: 1.6; }
+  .pv-badge {
+    display: inline-block; font-family: 'Space Mono', monospace; font-size: 8px;
+    padding: 2px 7px; border-radius: 3px; margin-top: 5px;
+    background: rgba(201,169,110,0.15); color: var(--rust);
+  }
+
+  /* ══════════════════════════════════════
+     SLIDE 5 — BEFORE VS AFTER
+  ══════════════════════════════════════ */
+  .s5 {
+    background: #121009;
+    display: flex; flex-direction: column; padding: 52px 64px;
+  }
+  .s5 h2 {
+    font-family: 'Playfair Display', serif;
+    font-size: clamp(28px, 3.5vw, 48px); color: var(--cream); margin-bottom: 6px;
+  }
+  .s5-sub { font-size: 13px; color: var(--muted); margin-bottom: 30px; }
+  .bva-grid { display: flex; flex-direction: column; gap: 14px; flex: 1; }
+  .bva-row { display: grid; grid-template-columns: 1fr 40px 1fr; gap: 0; align-items: center; }
+  .bva-before {
+    padding: 14px 18px; border-radius: 10px 0 0 10px;
+    background: rgba(192,72,64,0.1); border: 1px solid rgba(192,72,64,0.2);
+    border-right: none;
+  }
+  .bva-arrow {
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(255,255,255,0.04); font-size: 16px; color: var(--sand);
+    height: 100%; border-top: 1px solid rgba(255,255,255,0.05);
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .bva-after {
+    padding: 14px 18px; border-radius: 0 10px 10px 0;
+    background: rgba(90,128,80,0.12); border: 1px solid rgba(90,128,80,0.25);
+    border-left: none;
+  }
+  .bva-label { font-size: 8px; font-family: 'Space Mono', monospace; letter-spacing: 1.5px; text-transform: uppercase; margin-bottom: 4px; }
+  .bva-before .bva-label { color: #e87a6a; }
+  .bva-after  .bva-label { color: #7ab87a; }
+  .bva-text { font-size: 12.5px; color: var(--cream); line-height: 1.5; }
+  .bva-sub  { font-size: 10.5px; color: var(--muted); margin-top: 3px; }
+
+  /* ══════════════════════════════════════
+     SLIDE 6 — METRICS (charts)
+  ══════════════════════════════════════ */
+  .s6 {
+    background: #f7f2e8; color: var(--stone);
+    display: flex; flex-direction: column; padding: 52px 64px;
+  }
+  .s6 h2 {
+    font-family: 'Playfair Display', serif;
+    font-size: clamp(28px, 3.5vw, 48px); color: var(--stone); margin-bottom: 6px;
+  }
+  .s6-sub { font-size: 13px; color: var(--muted); margin-bottom: 28px; }
+  .metrics-layout { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; flex: 1; }
+  .metric-card {
+    background: white; border-radius: 16px; padding: 24px;
+    box-shadow: 0 2px 20px rgba(0,0,0,0.06);
+    border: 1px solid rgba(0,0,0,0.05);
+    display: flex; flex-direction: column;
+  }
+  .mc-label { font-size: 10px; font-family: 'Space Mono', monospace; color: var(--muted); letter-spacing: 1px; text-transform: uppercase; margin-bottom: 8px; }
+  .mc-val   { font-family: 'Playfair Display', serif; font-size: 56px; font-weight: 900; line-height: 1; }
+  .mc-desc  { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
+  .mc-val.c-rust  { color: var(--rust); }
+  .mc-val.c-moss  { color: var(--moss); }
+  .mc-val.c-sand  { color: var(--accent); }
+  .chart-card {
+    background: white; border-radius: 16px; padding: 22px;
+    box-shadow: 0 2px 20px rgba(0,0,0,0.06);
+    border: 1px solid rgba(0,0,0,0.05);
+    grid-column: span 2;
+    display: flex; flex-direction: column;
+  }
+  .cc-title { font-size: 13px; font-weight: 600; color: var(--stone); margin-bottom: 14px; }
+  .chart-wrap { flex: 1; position: relative; min-height: 0; }
+
+  /* ══════════════════════════════════════
+     SLIDE 7 — HOW USERS FIND IMAGES
+  ══════════════════════════════════════ */
+  .s7 {
+    background: #0e0c08;
+    display: flex; gap: 0;
+  }
+  .s7-left {
+    width: 40%; padding: 56px 52px;
+    background: rgba(201,169,110,0.04);
+    border-right: 1px solid rgba(201,169,110,0.1);
+    display: flex; flex-direction: column; justify-content: center;
+  }
+  .s7-left h2 {
+    font-family: 'Playfair Display', serif;
+    font-size: clamp(26px, 3vw, 42px); color: var(--cream); margin-bottom: 14px; line-height: 1.1;
+  }
+  .s7-left p { font-size: 13px; color: var(--muted); line-height: 1.75; margin-bottom: 20px; }
+  .search-types { display: flex; flex-direction: column; gap: 12px; }
+  .stype {
+    padding: 14px 16px; border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.07);
+    display: flex; align-items: flex-start; gap: 12px;
+    transition: border-color 0.2s;
+  }
+  .stype:hover { border-color: rgba(201,169,110,0.25); }
+  .st1 { background: rgba(61,96,128,0.15); }
+  .st2 { background: rgba(74,96,64,0.15);  }
+  .st3 { background: rgba(212,135,74,0.1); }
+  .stype-icon  { font-size: 24px; flex-shrink: 0; }
+  .stype-title { font-size: 13px; font-weight: 600; color: var(--cream); margin-bottom: 3px; }
+  .stype-desc  { font-size: 11px; color: var(--muted); line-height: 1.55; }
+
+  .s7-right {
+    flex: 1; padding: 52px 48px;
+    display: flex; flex-direction: column; justify-content: center;
+    align-items: center;
+  }
+  .s7-right h3 {
+    font-family: 'Playfair Display', serif;
+    font-size: 20px; color: var(--cream); margin-bottom: 24px;
+    align-self: flex-start;
+  }
+  .search-diagram {
+    width: 100%; display: flex; flex-direction: column; gap: 16px;
+    align-items: center;
+  }
+  .sd-top {
+    display: flex; gap: 12px; width: 100%; justify-content: center;
+  }
+  .sd-input {
+    flex: 1; max-width: 200px; padding: 14px 16px; border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.05); text-align: center;
+    font-size: 11.5px; color: var(--cream);
+  }
+  .sd-input-icon { font-size: 22px; margin-bottom: 6px; }
+  .sd-or { display: flex; align-items: center; font-size: 10px; color: var(--muted); }
+  .sd-arrow { font-size: 22px; color: rgba(201,169,110,0.4); }
+  .sd-engine {
+    padding: 18px 24px; border-radius: 12px; text-align: center;
+    background: rgba(201,169,110,0.08); border: 1px solid rgba(201,169,110,0.2);
+    width: 80%;
+  }
+  .sd-engine-icon { font-size: 28px; margin-bottom: 6px; }
+  .sd-engine-label { font-size: 12px; font-weight: 600; color: var(--sand); }
+  .sd-engine-sub { font-size: 10px; color: var(--muted); margin-top: 3px; }
+  .sd-results { display: flex; gap: 8px; width: 100%; justify-content: center; }
+  .sd-result {
+    flex: 1; max-width: 100px; height: 64px; border-radius: 8px;
+    background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px;
+  }
+
+  /* ══════════════════════════════════════
+     SLIDE 8 — WHAT'S UNDER THE HOOD
+  ══════════════════════════════════════ */
+  .s8 {
+    background: #f6f1e6; color: var(--stone);
+    display: flex; flex-direction: column; padding: 52px 64px;
+  }
+  .s8 h2 {
+    font-family: 'Playfair Display', serif;
+    font-size: clamp(28px, 3.5vw, 48px); color: var(--stone); margin-bottom: 6px;
+  }
+  .s8-sub { font-size: 13px; color: var(--muted); margin-bottom: 28px; }
+  .tech-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; flex: 1; }
+  .tech-card {
+    background: white; border-radius: 14px; padding: 22px 18px;
+    box-shadow: 0 2px 16px rgba(0,0,0,0.05);
+    border: 1px solid rgba(0,0,0,0.05);
+    display: flex; flex-direction: column; align-items: center; text-align: center;
+    transition: transform 0.2s;
+  }
+  .tech-card:hover { transform: translateY(-2px); }
+  .tech-logo { font-size: 40px; margin-bottom: 12px; }
+  .tech-name { font-size: 14px; font-weight: 600; color: var(--stone); margin-bottom: 4px; }
+  .tech-role { font-size: 11.5px; color: #6a6050; line-height: 1.5; margin-bottom: 8px; flex: 1; }
+  .tech-analogy {
+    font-size: 10px; color: var(--rust); font-style: italic;
+    padding: 6px 10px; background: rgba(196,92,53,0.07);
+    border-radius: 6px; line-height: 1.5;
+  }
+
+  /* ══════════════════════════════════════
+     SLIDE 9 — SUMMARY
+  ══════════════════════════════════════ */
+  .s9 {
+    background: linear-gradient(145deg, #120f08 0%, #1e1810 100%);
+    display: flex; flex-direction: column;
+    padding: 52px 64px; position: relative; overflow: hidden;
+  }
+  .s9-glow {
+    position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(ellipse 55% 60% at 85% 50%, rgba(201,169,110,0.07) 0%, transparent 55%);
+  }
+  .s9 h2 {
+    font-family: 'Playfair Display', serif;
+    font-size: clamp(28px, 3.5vw, 48px); color: var(--cream);
+    margin-bottom: 28px; position: relative;
+  }
+  .big-metrics {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+    margin-bottom: 24px; position: relative;
+  }
+  .bm {
+    padding: 22px 18px; border-radius: 12px; text-align: center;
+    border: 1px solid rgba(201,169,110,0.15);
+    background: rgba(201,169,110,0.04);
+  }
+  .bm-val {
+    font-family: 'Playfair Display', serif;
+    font-size: 52px; font-weight: 900; color: var(--sand); line-height: 1;
+  }
+  .bm-label { font-size: 10px; color: var(--muted); margin-top: 5px; letter-spacing: 0.5px; }
+
+  .wins { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; position: relative; }
+  .win {
+    padding: 16px; border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.06);
+    background: rgba(255,255,255,0.025);
+    display: flex; align-items: flex-start; gap: 10px;
+  }
+  .win-icon  { font-size: 18px; flex-shrink: 0; }
+  .win-title { font-size: 12px; font-weight: 600; color: var(--cream); margin-bottom: 2px; }
+  .win-desc  { font-size: 10.5px; color: var(--muted); line-height: 1.5; }
+</style>
+</head>
+<body>
+<div class="progress" id="progress"></div>
+
+<div class="deck">
+
+  <!-- ══ SLIDE 1: COVER ══ -->
+  <div class="slide s1 active">
+    <div class="s1-bg"></div>
+    <div class="s1-lines"></div>
+    <div class="s1-tag">Ducon · Backend Platform · 2026</div>
+    <h1>We Built the<br><em>Engine</em> Behind<br>the App</h1>
+    <p class="s1-tagline">The invisible system that lets customers browse, search, bookmark, and generate AI design visualisations — from any device, any time.</p>
+    <div class="s1-pills">
+      <div class="s1-pill">🔍 Smart Search</div>
+      <div class="s1-pill">🎨 AI Image Generation</div>
+      <div class="s1-pill">👤 User Accounts</div>
+      <div class="s1-pill">☁️ Cloud Storage</div>
+      <div class="s1-pill">📱 Mobile-Ready</div>
+    </div>
+  </div>
+
+  <!-- ══ SLIDE 2: WHAT DOES IT DO ══ -->
+  <div class="slide s2">
+    <div class="dark-tag">01 — Overview</div>
+    <h2>What Did We Build?</h2>
+    <p class="s2-sub">The complete backend system powering the Ducon app — everything the customer never sees but always depends on.</p>
+    <div class="feature-cards">
+      <div class="fc">
+        <div class="fc-icon">👤</div>
+        <div class="fc-title">User Accounts</div>
+        <div class="fc-desc">Customers sign up with email or tap "Sign in with Google" — one click and they're in. Their bookmarks, generated images, and preferences are saved and accessible across every device they use.</div>
+        <div class="fc-tech">Email + Google OAuth · JWT Sessions · Profile Management</div>
+      </div>
+      <div class="fc">
+        <div class="fc-icon">🔍</div>
+        <div class="fc-title">Intelligent Image Search</div>
+        <div class="fc-desc">Customers don't need to know the exact product name. They can type "warm stone patio" or upload a photo of their backyard — the system finds visually and conceptually matching products from the catalogue.</div>
+        <div class="fc-tech">Gemini AI Embeddings · ChromaDB Vector Search · 3 Search Modes</div>
+      </div>
+      <div class="fc">
+        <div class="fc-icon">🎨</div>
+        <div class="fc-title">AI Design Visualisation</div>
+        <div class="fc-desc">The standout feature. A customer uploads a photo of their outdoor space, picks a Ducon product or project, and our AI generates a photorealistic image showing exactly what it would look like in their home.</div>
+        <div class="fc-tech">Nano Banana Pro · Gemini Flash-Lite · 2-Stage Pipeline</div>
+      </div>
+      <div class="fc">
+        <div class="fc-icon">🔖</div>
+        <div class="fc-title">Bookmarks & History</div>
+        <div class="fc-desc">Customers save their favourite catalogue images and revisit every AI-generated design they've created. All stored securely in their personal account.</div>
+        <div class="fc-tech">PostgreSQL · Cloudflare R2 Storage</div>
+      </div>
+      <div class="fc">
+        <div class="fc-icon">🖼</div>
+        <div class="fc-title">Catalogue Delivery</div>
+        <div class="fc-desc">The entire Ducon image library is served intelligently — fast, cached, and delivered from cloud storage globally. New products can be added without touching the app code.</div>
+        <div class="fc-tech">Cloudflare R2 · Metadata Cache · Remote URL Support</div>
+      </div>
+      <div class="fc">
+        <div class="fc-icon">✅</div>
+        <div class="fc-title">Privacy & Consent</div>
+        <div class="fc-desc">Full GDPR-ready consent system — customers control their marketing, WhatsApp/SMS, and terms preferences. Every choice is stored and can be updated at any time from the app.</div>
+        <div class="fc-tech">user_consent · marketing_consent · whatsapp_sms_consent</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ SLIDE 3: USER JOURNEY ══ -->
+  <div class="slide s3">
+    <div class="section-tag" style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--accent);margin-bottom:10px;">02 — Experience</div>
+    <h2>A Customer's Journey</h2>
+    <p class="s3-sub">From discovery to a photorealistic design preview — here's what happens when a customer uses the app.</p>
+    <div class="journey">
+      <div class="jstep">
+        <div class="jstep-bubble jb1">📲</div>
+        <div class="jstep-title">Opens the App</div>
+        <div class="jstep-desc">Signs in with Google in one tap — or registers with email. Their profile and preferences load instantly.</div>
+        <div class="jstep-note">Google OAuth · JWT Auth</div>
+      </div>
+      <div class="jstep">
+        <div class="jstep-bubble jb2">🔍</div>
+        <div class="jstep-title">Searches the Catalogue</div>
+        <div class="jstep-desc">Types "slate pavers pool area" or uploads a photo of their backyard. AI finds matching products instantly.</div>
+        <div class="jstep-note">Gemini Embeddings · Vector Search</div>
+      </div>
+      <div class="jstep">
+        <div class="jstep-bubble jb3">🔖</div>
+        <div class="jstep-title">Saves Favourites</div>
+        <div class="jstep-desc">Bookmarks products they like. Their saves persist across all their devices and sessions.</div>
+        <div class="jstep-note">PostgreSQL · User Account</div>
+      </div>
+      <div class="jstep">
+        <div class="jstep-bubble jb4">📸</div>
+        <div class="jstep-title">Uploads Their Space</div>
+        <div class="jstep-desc">Takes a photo of their outdoor area and uploads it. Works perfectly from iPhone or Android — any photo format accepted.</div>
+        <div class="jstep-note">HEIC Support · Auto-Optimised</div>
+      </div>
+      <div class="jstep">
+        <div class="jstep-bubble jb5">✨</div>
+        <div class="jstep-title">Gets their Visualisation</div>
+        <div class="jstep-desc">In seconds, sees a photorealistic render of the Ducon design applied to their own space. Saved to their account forever.</div>
+        <div class="jstep-note">Nano Banana Pro · Cloudflare R2</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ SLIDE 4: AI PIPELINE ══ -->
+  <div class="slide s4">
+    <div class="s4-left">
+      <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--accent);margin-bottom:12px;">03 — The AI</div>
+      <h2>The AI Does<br>Two Things,<br><em>Not One</em></h2>
+      <p>Previously the AI worked from a single, fixed set of instructions for every image — like a camera with no settings. Now it thinks first, then creates. The result is a generation that's tailored to what's actually in the photos.</p>
+      <div class="ai-models">
+        <div class="ai-model am1">
+          <div class="ai-model-icon">🧠</div>
+          <div>
+            <div class="ai-model-name">Gemini 3.1 Flash-Lite</div>
+            <div class="ai-model-role">Analyses the images and writes the brief</div>
+          </div>
+        </div>
+        <div class="ai-model am2">
+          <div class="ai-model-icon">🎨</div>
+          <div>
+            <div class="ai-model-name">Nano Banana Pro</div>
+            <div class="ai-model-role">Generates the photorealistic image</div>
+          </div>
+        </div>
+        <div class="ai-model am3">
+          <div class="ai-model-icon">🔍</div>
+          <div>
+            <div class="ai-model-name">Gemini Embedding v2</div>
+            <div class="ai-model-role">Powers the intelligent catalogue search</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="s4-right">
+      <h3>How it works, step by step</h3>
+      <div class="pipeline-vis">
+        <div class="pv-step">
+          <div class="pv-num">1</div>
+          <div>
+            <div class="pv-title">Customer uploads their photo</div>
+            <div class="pv-desc">The system automatically cleans it up — converts iPhone formats, reduces file size, normalises the image so the AI gets perfect input regardless of the device used.</div>
+            <span class="pv-badge">Automatic · No customer action needed</span>
+          </div>
+        </div>
+        <div class="pv-step">
+          <div class="pv-num">2</div>
+          <div>
+            <div class="pv-title">AI studies both images and writes a creative brief</div>
+            <div class="pv-desc">Flash-Lite looks at both the Ducon product/project and the customer's space, then writes a detailed, expert brief for the image generator — tailored specifically to what it sees.</div>
+            <span class="pv-badge">New: dynamic per-generation, not a fixed template</span>
+          </div>
+        </div>
+        <div class="pv-step">
+          <div class="pv-num">3</div>
+          <div>
+            <div class="pv-title">Nano Banana Pro generates the image</div>
+            <div class="pv-desc">Google's premium image generation model uses that brief and both reference images to produce a photorealistic visualisation — preserving the customer's space while applying the Ducon design.</div>
+            <span class="pv-badge">Physics-aware · Photorealistic · 4K capable</span>
+          </div>
+        </div>
+        <div class="pv-step">
+          <div class="pv-num">4</div>
+          <div>
+            <div class="pv-title">Saved and served instantly</div>
+            <div class="pv-desc">The generated image is stored in Cloudflare's global network and a secure link is sent back to the customer's app — their design history is always there when they return.</div>
+            <span class="pv-badge">Cloudflare R2 · Presigned secure URL</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ SLIDE 5: BEFORE VS AFTER ══ -->
+  <div class="slide s5">
+    <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--accent);margin-bottom:10px;">04 — Progress</div>
+    <h2>What We Improved</h2>
+    <p class="s5-sub">Key changes made — each one making the system smarter, faster, or more reliable for customers.</p>
+    <div class="bva-grid">
+      <div class="bva-row">
+        <div class="bva-before">
+          <div class="bva-label">❌ Before</div>
+          <div class="bva-text">One fixed AI instruction for every generation</div>
+          <div class="bva-sub">Same prompt no matter what the images showed</div>
+        </div>
+        <div class="bva-arrow">→</div>
+        <div class="bva-after">
+          <div class="bva-label">✅ After</div>
+          <div class="bva-text">AI writes a custom brief for every unique pair of images</div>
+          <div class="bva-sub">Better quality, more relevant results per customer</div>
+        </div>
+      </div>
+      <div class="bva-row">
+        <div class="bva-before">
+          <div class="bva-label">❌ Before</div>
+          <div class="bva-text">iPhone photos (HEIC) caused poor generation quality</div>
+          <div class="bva-sub">iOS users got noticeably worse results than Android</div>
+        </div>
+        <div class="bva-arrow">→</div>
+        <div class="bva-after">
+          <div class="bva-label">✅ After</div>
+          <div class="bva-text">All phone formats handled automatically on the server</div>
+          <div class="bva-sub">Consistent quality regardless of iPhone or Android</div>
+        </div>
+      </div>
+      <div class="bva-row">
+        <div class="bva-before">
+          <div class="bva-label">❌ Before</div>
+          <div class="bva-text">Two separate search indexes, three different result buckets</div>
+          <div class="bva-sub">Complex, harder to reason about and maintain</div>
+        </div>
+        <div class="bva-arrow">→</div>
+        <div class="bva-after">
+          <div class="bva-label">✅ After</div>
+          <div class="bva-text">One unified search — text, photo, or both combined</div>
+          <div class="bva-sub">Simpler, faster, and powered by Google's latest embedding model</div>
+        </div>
+      </div>
+      <div class="bva-row">
+        <div class="bva-before">
+          <div class="bva-label">❌ Before</div>
+          <div class="bva-text">No consent system — privacy fields were missing</div>
+          <div class="bva-sub">Could not track marketing, WhatsApp or terms consent</div>
+        </div>
+        <div class="bva-arrow">→</div>
+        <div class="bva-after">
+          <div class="bva-label">✅ After</div>
+          <div class="bva-text">Full consent management with granular control</div>
+          <div class="bva-sub">Phone number, WhatsApp/SMS, marketing — all captured and updatable</div>
+        </div>
+      </div>
+      <div class="bva-row">
+        <div class="bva-before">
+          <div class="bva-label">❌ Before</div>
+          <div class="bva-text">Metadata could only be a local file on the server</div>
+          <div class="bva-sub">Harder to update and scale across environments</div>
+        </div>
+        <div class="bva-arrow">→</div>
+        <div class="bva-after">
+          <div class="bva-label">✅ After</div>
+          <div class="bva-text">Metadata can live on Cloudflare — or locally</div>
+          <div class="bva-sub">One setting in the config controls where it comes from</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ SLIDE 6: METRICS ══ -->
+  <div class="slide s6">
+    <div class="dark-tag">05 — Numbers</div>
+    <h2>The System at a Glance</h2>
+    <p class="s6-sub">Everything we built, measured — not in code lines, but in what it means for the product.</p>
+    <div class="metrics-layout">
+      <div class="metric-card">
+        <div class="mc-label">API Endpoints</div>
+        <div class="mc-val c-rust">22</div>
+        <div class="mc-desc">Individual actions the app can call — from "log me in" to "generate a new design"</div>
+      </div>
+      <div class="metric-card">
+        <div class="mc-label">Google AI Models</div>
+        <div class="mc-val c-moss">3</div>
+        <div class="mc-desc">Embeddings for search · Flash-Lite for prompt writing · Nano Banana Pro for generation</div>
+      </div>
+      <div class="metric-card">
+        <div class="mc-label">Consent Fields</div>
+        <div class="mc-val c-sand">3</div>
+        <div class="mc-desc">Terms · Marketing emails · WhatsApp & SMS — all individually managed per customer</div>
+      </div>
+      <div class="chart-card">
+        <div class="cc-title">Capabilities Delivered This Cycle</div>
+        <div class="chart-wrap"><canvas id="capChart"></canvas></div>
+      </div>
+      <div class="metric-card" style="grid-column: span 1;">
+        <div class="mc-label">Ops Automation Scripts</div>
+        <div class="mc-val c-rust">4</div>
+        <div class="mc-desc">Tools to sync images, manage cloud storage, and update the catalogue — no manual work</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ SLIDE 7: SMART SEARCH ══ -->
+  <div class="slide s7">
+    <div class="s7-left">
+      <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--accent);margin-bottom:12px;">06 — Search</div>
+      <h2>Customers Find What They're Looking For</h2>
+      <p>Unlike a basic keyword search, our system understands the meaning behind a query — not just the exact words. A customer who types "warm natural stone" will find images with warm natural stone, even if the catalogue never uses those exact words.</p>
+      <div class="search-types">
+        <div class="stype st1">
+          <div class="stype-icon">💬</div>
+          <div>
+            <div class="stype-title">Search by words</div>
+            <div class="stype-desc">"Modern outdoor entertaining area with pool" — finds matching images by meaning</div>
+          </div>
+        </div>
+        <div class="stype st2">
+          <div class="stype-icon">📸</div>
+          <div>
+            <div class="stype-title">Search by photo</div>
+            <div class="stype-desc">Upload a photo of a space they love — find Ducon products that match the look</div>
+          </div>
+        </div>
+        <div class="stype st3">
+          <div class="stype-icon">🔀</div>
+          <div>
+            <div class="stype-title">Search by both</div>
+            <div class="stype-desc">Words and a photo together — the most precise results possible</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="s7-right">
+      <h3>How it finds the right image</h3>
+      <div class="search-diagram">
+        <div class="sd-top">
+          <div class="sd-input"><div class="sd-input-icon">💬</div>"slate pool area"</div>
+          <div class="sd-or">or</div>
+          <div class="sd-input"><div class="sd-input-icon">📸</div>Customer's photo</div>
+        </div>
+        <div class="sd-arrow">↓</div>
+        <div class="sd-engine">
+          <div class="sd-engine-icon">🧬</div>
+          <div class="sd-engine-label">Gemini Embedding Model</div>
+          <div class="sd-engine-sub">Converts the query into a "fingerprint" that captures its meaning — not just its words</div>
+        </div>
+        <div class="sd-arrow">↓</div>
+        <div class="sd-engine" style="background:rgba(74,96,64,0.1);border-color:rgba(74,96,64,0.3);">
+          <div class="sd-engine-icon">📚</div>
+          <div class="sd-engine-label" style="color:#7ab87a;">Catalogue Vector Search</div>
+          <div class="sd-engine-sub">Finds all catalogue images whose fingerprints are closest to the query's fingerprint</div>
+        </div>
+        <div class="sd-arrow">↓</div>
+        <div class="sd-results">
+          <div class="sd-result">🪨</div>
+          <div class="sd-result">🌿</div>
+          <div class="sd-result">💧</div>
+          <div class="sd-result">🏡</div>
+          <div class="sd-result">🪑</div>
+        </div>
+        <div style="font-size:11px;color:var(--muted);text-align:center;">Top matching catalogue images returned, ranked by relevance</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ SLIDE 8: TECH EXPLAINED ══ -->
+  <div class="slide s8">
+    <div class="dark-tag">07 — Technology</div>
+    <h2>What Powers It All</h2>
+    <p class="s8-sub">The technologies we use — explained without jargon.</p>
+    <div class="tech-grid">
+      <div class="tech-card">
+        <div class="tech-logo">⚡</div>
+        <div class="tech-name">FastAPI</div>
+        <div class="tech-role">The backbone of the backend — handles every request the app sends and returns the right response, fast.</div>
+        <div class="tech-analogy">"Like a smart switchboard operator for the app"</div>
+      </div>
+      <div class="tech-card">
+        <div class="tech-logo">🗄</div>
+        <div class="tech-name">PostgreSQL</div>
+        <div class="tech-role">Stores everything that matters — user accounts, bookmarks, generation history, catalogue records.</div>
+        <div class="tech-analogy">"The filing cabinet that never loses anything"</div>
+      </div>
+      <div class="tech-card">
+        <div class="tech-logo">🔵</div>
+        <div class="tech-name">ChromaDB</div>
+        <div class="tech-role">A special database built for AI search — stores the "meaning fingerprints" of every catalogue image so they can be searched by similarity.</div>
+        <div class="tech-analogy">"A librarian who understands concepts, not just titles"</div>
+      </div>
+      <div class="tech-card">
+        <div class="tech-logo">☁️</div>
+        <div class="tech-name">Cloudflare R2</div>
+        <div class="tech-role">Cloud storage for all generated images and the catalogue. Images load fast globally — and there's no data transfer cost.</div>
+        <div class="tech-analogy">"A photo album stored in the cloud, delivered anywhere"</div>
+      </div>
+      <div class="tech-card">
+        <div class="tech-logo">🎨</div>
+        <div class="tech-name">Nano Banana Pro</div>
+        <div class="tech-role">Google's premium AI image generation model. Creates photorealistic visualisations by understanding both reference images and the written brief.</div>
+        <div class="tech-analogy">"A professional 3D artist who works in seconds"</div>
+      </div>
+      <div class="tech-card">
+        <div class="tech-logo">🧠</div>
+        <div class="tech-name">Gemini Flash-Lite</div>
+        <div class="tech-role">A fast, cost-efficient Google AI model that reads both images and writes the expert creative brief before the image is generated.</div>
+        <div class="tech-analogy">"A creative director who briefs the artist"</div>
+      </div>
+      <div class="tech-card">
+        <div class="tech-logo">🔬</div>
+        <div class="tech-name">Gemini Embeddings</div>
+        <div class="tech-role">Google's model that converts images and text into numerical "fingerprints" that capture their meaning — powering the smart catalogue search.</div>
+        <div class="tech-analogy">"DNA testing, but for images and descriptions"</div>
+      </div>
+      <div class="tech-card">
+        <div class="tech-logo">🔐</div>
+        <div class="tech-name">Google OAuth + JWT</div>
+        <div class="tech-role">Secure, token-based login. "Sign in with Google" works instantly. Returning customers stay logged in safely without re-entering passwords.</div>
+        <div class="tech-analogy">"A digital keycard that expires and auto-renews"</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ══ SLIDE 9: SUMMARY ══ -->
+  <div class="slide s9">
+    <div class="s9-glow"></div>
+    <div style="font-family:'Space Mono',monospace;font-size:9px;letter-spacing:3px;text-transform:uppercase;color:var(--accent);margin-bottom:12px;position:relative;">08 — Summary</div>
+    <h2>What We Delivered</h2>
+    <div class="big-metrics">
+      <div class="bm"><div class="bm-val">22</div><div class="bm-label">App Features Powered</div></div>
+      <div class="bm"><div class="bm-val">3</div><div class="bm-label">AI Models Integrated</div></div>
+      <div class="bm"><div class="bm-val">4</div><div class="bm-label">Database Tables</div></div>
+      <div class="bm"><div class="bm-val">4</div><div class="bm-label">Automation Scripts</div></div>
+    </div>
+    <div class="wins">
+      <div class="win"><div class="win-icon">🎨</div><div><div class="win-title">Smarter AI Generation</div><div class="win-desc">Dynamic prompting tailored to every unique image pair — not a one-size-fits-all template</div></div></div>
+      <div class="win"><div class="win-icon">📱</div><div><div class="win-title">Works on Any Phone</div><div class="win-desc">iPhone HEIC photos now handled automatically — consistent quality across all devices</div></div></div>
+      <div class="win"><div class="win-icon">🔍</div><div><div class="win-title">Unified Smart Search</div><div class="win-desc">One search that understands words, photos, and both together — powered by Google's latest AI</div></div></div>
+      <div class="win"><div class="win-icon">✅</div><div><div class="win-title">Privacy Ready</div><div class="win-desc">Marketing, WhatsApp & terms consent — captured, stored, and updatable per customer</div></div></div>
+      <div class="win"><div class="win-icon">☁️</div><div><div class="win-title">Cloud-First Storage</div><div class="win-desc">All images on Cloudflare R2 — globally fast, cost-efficient, and production-ready</div></div></div>
+      <div class="win"><div class="win-icon">🛠</div><div><div class="win-title">Operational Tooling</div><div class="win-desc">Scripts to manage catalogue updates, cloud sync, and format changes — no manual work</div></div></div>
+      <div class="win"><div class="win-icon">🔐</div><div><div class="win-title">Secure Accounts</div><div class="win-desc">Email + Google sign-in with full profile, role, and account management</div></div></div>
+      <div class="win"><div class="win-icon">🔗</div><div><div class="win-title">Design + Design Mode</div><div class="win-desc">Customers can now combine two Ducon images — not just their photo with a product</div></div></div>
+      <div class="win"><div class="win-icon">⚡</div><div><div class="win-title">Built for Scale</div><div class="win-desc">Fully async — the system handles many users simultaneously without slowing down</div></div></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- NAV -->
+<div class="nav">
+  <button onclick="go(-1)">‹</button>
+  <div class="dots" id="dots"></div>
+  <button onclick="go(1)">›</button>
+  <span class="nav-count" id="counter">1 / 9</span>
+</div>
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  const dotsEl = document.getElementById('dots');
+  const counter = document.getElementById('counter');
+  const progress = document.getElementById('progress');
+  let cur = 0;
+
+  slides.forEach((_, i) => {
+    const d = document.createElement('div');
+    d.className = 'dot' + (i === 0 ? ' active' : '');
+    d.onclick = () => goTo(i);
+    dotsEl.appendChild(d);
+  });
+
+  function goTo(n) {
+    slides[cur].classList.remove('active');
+    document.querySelectorAll('.dot')[cur].classList.remove('active');
+    cur = Math.max(0, Math.min(n, slides.length - 1));
+    slides[cur].classList.add('active');
+    document.querySelectorAll('.dot')[cur].classList.add('active');
+    counter.textContent = `${cur + 1} / ${slides.length}`;
+    progress.style.width = `${((cur + 1) / slides.length) * 100}%`;
+  }
+  function go(d) { goTo(cur + d); }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown' || e.key === ' ') go(1);
+    if (e.key === 'ArrowLeft'  || e.key === 'ArrowUp')  go(-1);
+  });
+  let tx = 0;
+  document.addEventListener('touchstart', e => tx = e.touches[0].clientX);
+  document.addEventListener('touchend',   e => {
+    const dx = tx - e.changedTouches[0].clientX;
+    if (Math.abs(dx) > 50) go(dx > 0 ? 1 : -1);
+  });
+  progress.style.width = `${(1 / slides.length) * 100}%`;
+
+  // Chart — slide 6
+  const ctx = document.getElementById('capChart');
+  if (ctx) {
+    new Chart(ctx, {
+      type: 'bar',
+      data: {
+        labels: ['Auth & User\nManagement', 'AI Generation\nPipeline', 'Smart Search', 'Privacy &\nConsent', 'Storage &\nCloud Ops', 'Bug Fixes &\nImprovements'],
+        datasets: [{
+          label: 'Delivered',
+          data: [10, 9, 8, 8, 7, 6],
+          backgroundColor: [
+            'rgba(61,96,128,0.7)',
+            'rgba(196,92,53,0.7)',
+            'rgba(74,96,64,0.7)',
+            'rgba(201,169,110,0.7)',
+            'rgba(90,128,80,0.6)',
+            'rgba(150,120,80,0.6)',
+          ],
+          borderRadius: 8,
+          borderSkipped: false,
+        }]
+      },
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: {
+            grid: { display: false },
+            ticks: { font: { size: 10, family: 'Inter' }, color: '#7a7060' }
+          },
+          y: {
+            display: false, grid: { display: false }, beginAtZero: true
+          }
+        }
+      }
+    });
+  }
+</script>
+</body>
+</html>

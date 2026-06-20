@@ -34,9 +34,20 @@ from app.routers.guest import (
     log_guest_consent,
     verify_turnstile,
 )
+from app.routers.voice import router as voice_router
+from app.routers.quotation import router as quotation_router
+from app.routers.chat import router as chat_router
+from app.routers.multi_image_gen import router as multi_image_gen_router
+from app.routers.designer_jobs import router as designer_jobs_router
 from app.db.database import get_db
 from app.db.models import Generation, GuestGeneration, Image as DBImage
 from app.auth import get_current_user, get_optional_user
+from app.image_utils import (
+    load_ducon_image as _load_ducon_image,
+    normalize_user_image as _normalize_user_image,
+    get_image_metadata as _get_image_metadata,
+    load_image_info as _load_image_info,
+)
 from datetime import datetime, timedelta, timezone
 
 
@@ -53,6 +64,11 @@ app.include_router(bookmarks_router)
 app.include_router(generations_router)
 app.include_router(images_router)
 app.include_router(guest_router)
+app.include_router(voice_router)
+app.include_router(quotation_router)
+app.include_router(chat_router)
+app.include_router(multi_image_gen_router)
+app.include_router(designer_jobs_router)
 
 # Serve public library images statically
 app.mount("/public/images", StaticFiles(directory="data/images"), name="public_images")
@@ -74,12 +90,8 @@ app.add_middleware(
 #     return {"item_count": request.app.state.collection.count() }
 
 def _mime_type(filename: str) -> str:
-    lower = (filename or "").lower()
-    if lower.endswith(".png"):
-        return "image/png"
-    if lower.endswith(".webp"):
-        return "image/webp"
-    return "image/jpeg"
+    from app.image_utils import mime_type
+    return mime_type(filename)
 
 
 @app.post("/search")
@@ -105,97 +117,12 @@ async def search(
     results = chromadb.retrieve(collection, embedding, limit)
     return {"results": results["ids"]}
 
-MAX_IMAGE_PX = 2048
-
-
-import json as _json
-import time as _time
-
-_IMAGE_INFO_JSON_PATH = os.getenv("IMAGE_INFO_JSON_PATH", "")
-_IMAGE_INFO_CACHE: list[dict] | None = None
-_IMAGE_INFO_CACHE_AT: float = 0.0
-_IMAGE_INFO_CACHE_TTL = 60 * 60 * 24  # 1 day
-
-
-def _load_image_info() -> list[dict]:
-    global _IMAGE_INFO_CACHE, _IMAGE_INFO_CACHE_AT
-    if _IMAGE_INFO_CACHE is not None and (_time.time() - _IMAGE_INFO_CACHE_AT) < _IMAGE_INFO_CACHE_TTL:
-        return _IMAGE_INFO_CACHE
-    if not _IMAGE_INFO_JSON_PATH:
-        return []
-    if _IMAGE_INFO_JSON_PATH.startswith("http://") or _IMAGE_INFO_JSON_PATH.startswith("https://"):
-        import httpx as _httpx
-        r = _httpx.get(_IMAGE_INFO_JSON_PATH, timeout=30)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-    else:
-        p = Path(_IMAGE_INFO_JSON_PATH)
-        if not p.exists():
-            return []
-        with open(p, "r", encoding="utf-8") as f:
-            data = _json.load(f)
-    _IMAGE_INFO_CACHE = data
-    _IMAGE_INFO_CACHE_AT = _time.time()
-    return _IMAGE_INFO_CACHE
-
-
-def _get_image_metadata(filename: str) -> dict | None:
-    """Look up a Ducon image's info entry by filename. Returns None if not found."""
-    try:
-        return next((item for item in _load_image_info() if item.get("filename") == filename), None)
-    except Exception:
-        return None
-
-
-async def _load_ducon_image(db_image) -> Image.Image:
-    """
-    Loads a Ducon catalogue image as a PIL Image.
-    Tries the local data/images/ folder first; falls back to fetching
-    from the R2 URL stored in the database if the file isn't present locally.
-    """
-    local_path = Path(__file__).parent.parent / "data" / "images" / db_image.filename
-    if local_path.exists():
-        return Image.open(local_path)
-
-    if not db_image.url:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Image '{db_image.filename}' not found locally and has no remote URL."
-        )
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(db_image.url)
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to fetch image '{db_image.filename}' from remote URL (HTTP {response.status_code})."
-        )
-    return Image.open(io.BytesIO(response.content))
-
-
-def _normalize_user_image(image_bytes: bytes) -> Image.Image:
-    """
-    Normalizes a user-uploaded image:
-    - Converts HEIC/HEIF (iPhone) to JPEG-compatible RGB
-    - Downsizes to MAX_IMAGE_PX on the longest side if larger, preserving aspect ratio
-    - Always returns an RGB PIL Image
-    """
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    w, h = img.size
-    longest = max(w, h)
-    if longest > MAX_IMAGE_PX:
-        scale = MAX_IMAGE_PX / longest
-        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-
-    return img
-
-
 @app.post("/autogenerate-images")
 async def auto_generate_images(
     request: Request,
-    image_id: int = Form(...),
+    image_id: Optional[int] = Form(None),
+    ducon_reference: Optional[UploadFile] = File(None),
+    ducon_reference_name: Optional[str] = Form(None),
     user_image: Optional[UploadFile] = File(None),
     second_image_id: Optional[int] = Form(None),
     prompt: str = Form(None),
@@ -231,18 +158,34 @@ async def auto_generate_images(
         guest_session = await get_or_create_guest_session(db, raw_session_id, client_ip)
 
     # ── Image validation ──────────────────────────────────────────────────────
+    if image_id is None and ducon_reference is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide either 'image_id' (catalog id) or 'ducon_reference' (design image upload).",
+        )
+    if image_id is not None and ducon_reference is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide only one of 'image_id' or 'ducon_reference', not both.",
+        )
     if user_image is None and second_image_id is None:
         raise HTTPException(status_code=422, detail="Provide either 'user_image' (file upload) or 'second_image_id' (Ducon image id).")
     if user_image is not None and second_image_id is not None:
         raise HTTPException(status_code=422, detail="Provide only one of 'user_image' or 'second_image_id', not both.")
 
     # ── Resolve primary Ducon image ───────────────────────────────────────────
-    result = await db.execute(select(DBImage).where(DBImage.id == image_id))
-    ducon_db_image = result.scalar_one_or_none()
-    if not ducon_db_image:
-        raise HTTPException(status_code=404, detail="Image not found")
-
-    ducon_image = await _load_ducon_image(ducon_db_image)
+    if image_id is not None:
+        result = await db.execute(select(DBImage).where(DBImage.id == image_id))
+        ducon_db_image = result.scalar_one_or_none()
+        if not ducon_db_image:
+            raise HTTPException(status_code=404, detail="Image not found")
+        ducon_image = await _load_ducon_image(ducon_db_image)
+        ducon_image_name = ducon_db_image.name or ducon_db_image.filename
+    else:
+        ducon_db_image = None
+        ref_data = await ducon_reference.read()
+        ducon_image = _normalize_user_image(ref_data)
+        ducon_image_name = (ducon_reference_name or "").strip() or "Ducon Design"
 
     # ── Resolve second image ──────────────────────────────────────────────────
     second_image_name: str | None = None
@@ -259,18 +202,50 @@ async def auto_generate_images(
         second_image_name = second_db_image.name or second_db_image.filename
 
     # ── Step 1: Build Nano Banana prompt ─────────────────────────────────────
-    # enhance_prompt=True (default): Flash-Lite always runs; user prompt is a hint.
-    # enhance_prompt=False: skip Flash-Lite, send user prompt directly to Nano Banana.
+    # enhance_prompt=True (default): the prompt generator runs; user prompt is a hint.
+    # enhance_prompt=False: skip generation/verification, use user prompt directly.
+    # These are used in both the pre-gen verify and the re-verify after rejection.
+    verify_images: list = []
+    verify_labels: list = []
     if enhance_prompt:
         prompt = gemini.generate_prompt(
             image1=ducon_image,
-            image1_name=ducon_db_image.name or ducon_db_image.filename,
-            image1_metadata=_get_image_metadata(ducon_db_image.filename) if use_image_info else None,
+            image1_name=ducon_image_name,
+            image1_metadata=_get_image_metadata(ducon_db_image.filename) if (ducon_db_image and use_image_info) else None,
             image2=user_img,
             image2_name=second_image_name,
             image2_metadata=_get_image_metadata(second_db_image.filename) if (second_db_image and use_image_info) else None,
             user_hint=prompt or None,
         )
+
+        # ── Step 1b: Pre-generation prompt verification loop ──────────────────
+        # The verifier checks image references, camera lock, preservation rules,
+        # product-fidelity rules, and coherence before sending to the image model.
+        # Each failed round feeds the improved prompt back into the verifier.
+        verify_images = [ducon_image, user_img]
+        verify_labels = [
+            f'Ducon reference: "{ducon_image_name}"',
+            second_image_name and f'Second Ducon image: "{second_image_name}"' or "User's outdoor space",
+        ]
+        for vround in range(gemini.PROMPT_VERIFY_MAX_ROUNDS):
+            try:
+                passed, issues, improved_prompt = gemini.verify_prompt(
+                    images=verify_images,
+                    labels=verify_labels,
+                    prompt=prompt,
+                )
+                if passed:
+                    print(f"[PromptVerifier] Passed on round {vround + 1}")
+                    break
+                if improved_prompt:
+                    print(f"[PromptVerifier] Round {vround + 1} failed ({len(issues)} issue(s)), using improved prompt")
+                    prompt = improved_prompt
+                else:
+                    print(f"[PromptVerifier] Round {vround + 1} failed but no improvement available, proceeding")
+                    break
+            except Exception as e:
+                print(f"[PromptVerifier] Skipped on round {vround + 1} due to error: {e}")
+                break
     else:
         if not prompt:
             raise HTTPException(
@@ -278,51 +253,78 @@ async def auto_generate_images(
                 detail="A prompt is required when enhance_prompt is disabled.",
             )
 
-    # ── Step 2: Generate image ────────────────────────────────────────────────
-    generation_filename = f"{ducon_db_image.filename}_{uuid.uuid4()}.png"
+    # ── Step 2: Generation + post-evaluation loop ─────────────────────────────
+    # On the first pass: generate with the (verified) prompt.
+    # On rejection: regenerate up to GEN_EVAL_MAX_ROUNDS times using the revised
+    # prompt from the evaluator. All attempts write to the same local file so only
+    # the final approved (or best-effort last) image is uploaded to storage.
+    ducon_stem = ducon_db_image.filename if ducon_db_image else "reference"
+    generation_filename = f"{ducon_stem}_{uuid.uuid4()}.png"
 
     if is_guest:
         subfolder = f"guests/{raw_session_id}"
     else:
         subfolder = str(current_user.id)
 
-    gemini.combine_images(
-        generation_filename,
-        ducon_image,
-        user_img,
-        prompt=prompt,
-        subfolder=subfolder,
-    )
+    local_output = Path("outputs") / subfolder / generation_filename
+    max_gen_rounds = gemini.GEN_EVAL_MAX_ROUNDS if enhance_prompt else 1
 
-    # ── Step 2b: Evaluate and optionally regenerate ───────────────────────────
-    # Only runs when enhance_prompt=True (Flash-Lite wrote the prompt).
-    # The generated image is on local disk at this point — before any R2 upload.
-    # If evaluation rejects it, combine_images() overwrites the local file with a
-    # corrected generation. Only the final image (approved or retried) is uploaded.
-    if enhance_prompt:
-        local_output = Path("outputs") / subfolder / generation_filename
+    for gen_round in range(max_gen_rounds):
+        gemini.combine_images(
+            generation_filename,
+            ducon_image,
+            user_img,
+            prompt=prompt,
+            subfolder=subfolder,
+        )
+
+        if not enhance_prompt:
+            break  # no evaluation when prompt enhancement is disabled
+
         try:
             generated_img = Image.open(local_output)
-            approved, revised_prompt = gemini.evaluate_generation(
+            approved, revised_prompt, issues = gemini.evaluate_generation(
                 image1=ducon_image,
                 image2=user_img,
                 generated=generated_img,
                 prompt_used=prompt,
-                image1_name=ducon_db_image.name or ducon_db_image.filename,
+                image1_name=ducon_image_name,
                 image2_name=second_image_name,
             )
-            if not approved and revised_prompt:
-                print(f"[Evaluator] Regenerating with revised prompt...")
-                gemini.combine_images(
-                    generation_filename,
-                    ducon_image,
-                    user_img,
-                    prompt=revised_prompt,
-                    subfolder=subfolder,
+            if approved:
+                print(f"[Evaluator] Approved on generation round {gen_round + 1}")
+                break
+            if revised_prompt and gen_round + 1 < max_gen_rounds:
+                print(
+                    f"[Evaluator] Rejected on round {gen_round + 1} "
+                    f"({len(issues)} issue(s)) — regenerating with revised prompt"
                 )
+                # Run the revised prompt back through the pre-gen verifier so it
+                # also passes structural rules before the next generation attempt.
+                for vround in range(gemini.PROMPT_VERIFY_MAX_ROUNDS):
+                    try:
+                        v_passed, _, v_improved = gemini.verify_prompt(
+                            images=verify_images,
+                            labels=verify_labels,
+                            prompt=revised_prompt,
+                        )
+                        if v_passed or not v_improved:
+                            break
+                        revised_prompt = v_improved
+                    except Exception as ve:
+                        print(f"[PromptVerifier] Skipped on re-verify round {vround + 1}: {ve}")
+                        break
+                prompt = revised_prompt
+            else:
+                print(
+                    f"[Evaluator] Rejected on round {gen_round + 1} — "
+                    f"no revised prompt available or max rounds reached, keeping last output"
+                )
+                break
         except Exception as e:
-            # Evaluation failure must not block the response — proceed with original
-            print(f"[Evaluator] Skipped due to error: {e}")
+            # Evaluation failure must not block the response — proceed with current image
+            print(f"[Evaluator] Skipped on generation round {gen_round + 1} due to error: {e}")
+            break
 
     # ── Step 3: Persist & respond ─────────────────────────────────────────────
     if is_guest:
@@ -333,7 +335,7 @@ async def auto_generate_images(
             guest_session_id=raw_session_id,
             generation_name=generation_filename,
             url=stored_key,
-            ducon_image_id=ducon_db_image.id,
+            ducon_image_id=ducon_db_image.id if ducon_db_image else None,
             expires_at=expires_at,
         )
         db.add(db_generation)
@@ -347,7 +349,7 @@ async def auto_generate_images(
             "id": db_generation.id,
             "generation_name": generation_filename,
             "signed_url": signed_url,
-            "ducon_image_id": ducon_db_image.id,
+            "ducon_image_id": ducon_db_image.id if ducon_db_image else None,
             "expires_at": expires_at.isoformat(),
         }
     else:
@@ -357,7 +359,7 @@ async def auto_generate_images(
             user_id=current_user.id,
             generation_name=generation_filename,
             url=stored_key,
-            ducon_image_id=ducon_db_image.id,
+            ducon_image_id=ducon_db_image.id if ducon_db_image else None,
         )
         db.add(db_generation)
         await db.flush()
@@ -369,7 +371,7 @@ async def auto_generate_images(
             "generation_name": generation_filename,
             "url": stored_key,
             "signed_url": signed_url,
-            "ducon_image_id": ducon_db_image.id,
+            "ducon_image_id": ducon_db_image.id if ducon_db_image else None,
         }
 
 
