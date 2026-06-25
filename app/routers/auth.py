@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -7,14 +8,17 @@ from app.db.models import User
 from app.db.schema import UserCreate, UserLogin, Token, UserResponse, GoogleAuthToken, ConsentUpdate, ProfileUpdate
 from app.auth import (
     hash_password, verify_password, create_access_token,
-    get_current_user, verify_google_token,
+    get_current_user, verify_google_token, revoke_token, decode_token_payload,
 )
+from app.rate_limiter import require_rate_limit
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+_oauth2 = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
 
 @router.post("/signup", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def signup(payload: UserCreate, db: AsyncSession = Depends(get_db)):
+async def signup(request: Request, payload: UserCreate, db: AsyncSession = Depends(get_db)):
+    require_rate_limit(request, max_requests=10, window_seconds=60, key_prefix="signup")
     result = await db.execute(select(User).where(User.email == payload.email))
     existing = result.scalar_one_or_none()
 
@@ -43,7 +47,8 @@ async def signup(payload: UserCreate, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/login", response_model=Token)
-async def login(payload: UserLogin, db: AsyncSession = Depends(get_db)):
+async def login(request: Request, payload: UserLogin, db: AsyncSession = Depends(get_db)):
+    require_rate_limit(request, max_requests=8, window_seconds=60, key_prefix="login")
     result = await db.execute(select(User).where(User.email == payload.email))
     user = result.scalar_one_or_none()
 
@@ -65,7 +70,8 @@ async def login(payload: UserLogin, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/google", response_model=Token)
-async def google_auth(payload: GoogleAuthToken, db: AsyncSession = Depends(get_db)):
+async def google_auth(request: Request, payload: GoogleAuthToken, db: AsyncSession = Depends(get_db)):
+    require_rate_limit(request, max_requests=10, window_seconds=60, key_prefix="google_auth")
     """
     Accepts a Google ID token from the frontend (via Google Identity Services).
     - New user  → creates account (password_hash=null)
@@ -186,11 +192,29 @@ async def update_profile(
     return current_user
 
 
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(token: str = Depends(_oauth2)):
+    """Revoke the current Bearer token so it can no longer be used."""
+    if token:
+        payload = decode_token_payload(token)
+        jti = payload.get("jti")
+        exp = payload.get("exp", 0)
+        if jti:
+            revoke_token(jti, float(exp))
+
+
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_account(
+    token: str = Depends(_oauth2),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Permanently deletes the currently authenticated user's account."""
+    """Permanently deletes the currently authenticated user's account and revokes the token."""
+    if token:
+        payload = decode_token_payload(token)
+        jti = payload.get("jti")
+        exp = payload.get("exp", 0)
+        if jti:
+            revoke_token(jti, float(exp))
     await db.delete(current_user)
     await db.commit()

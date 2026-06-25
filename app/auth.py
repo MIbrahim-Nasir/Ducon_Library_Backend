@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+import uuid
 
 from jose import JWTError, jwt
 from passlib.context import CryptContext
@@ -25,6 +26,23 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
+# ── Token revocation (in-memory; cleared on server restart) ───────────────────
+# Maps jti → expiry timestamp so we can prune expired entries.
+_revoked_jtis: dict[str, float] = {}
+
+
+def revoke_token(jti: str, exp: float) -> None:
+    _revoked_jtis[jti] = exp
+    # Prune already-expired entries to keep the set small
+    now = datetime.now(timezone.utc).timestamp()
+    stale = [k for k, v in _revoked_jtis.items() if v < now]
+    for k in stale:
+        del _revoked_jtis[k]
+
+
+def _is_revoked(jti: str) -> bool:
+    return jti in _revoked_jtis
+
 
 # ── Password helpers ───────────────────────────────────
 def hash_password(password: str) -> str:
@@ -40,7 +58,11 @@ def create_access_token(user_id: int, expires_delta: Optional[timedelta] = None)
     expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
-    return jwt.encode({"sub": str(user_id), "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(
+        {"sub": str(user_id), "exp": expire, "jti": str(uuid.uuid4())},
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
 
 
 # ── Google token verification ────────────────────────
@@ -71,7 +93,10 @@ async def get_optional_user(
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
+        jti: str = payload.get("jti", "")
         if user_id is None:
+            return None
+        if jti and _is_revoked(jti):
             return None
         result = await db.execute(select(User).where(User.id == int(user_id)))
         return result.scalar_one_or_none()
@@ -91,7 +116,10 @@ async def get_current_user(
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
+        jti: str = payload.get("jti", "")
         if user_id is None:
+            raise credentials_exception
+        if jti and _is_revoked(jti):
             raise credentials_exception
     except JWTError:
         raise credentials_exception
@@ -101,3 +129,11 @@ async def get_current_user(
     if user is None:
         raise credentials_exception
     return user
+
+
+def decode_token_payload(token: str) -> dict:
+    """Decode a token without raising — returns empty dict on failure."""
+    try:
+        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        return {}

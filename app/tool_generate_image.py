@@ -57,12 +57,12 @@ from app.db.models import Generation, Image as DBImage
 from app import storage
 from app.gemini import (
     get_gemini_client,
-    generate_prompt,
     verify_prompt,
     evaluate_generation,
     PROMPT_VERIFY_MAX_ROUNDS,
     GEN_EVAL_MAX_ROUNDS,
 )
+from app.image_gen_agent import ImageGenAgent
 from app.image_utils import normalize_user_image
 from app.prompt_generator_session import DesignerPromptSession
 
@@ -367,25 +367,26 @@ async def generate_multi_image(
     # so only enhance direct calls here.
     active_prompt = prompt
     direct_roles = _select_qc_roles(labels)
+    image_gen_agent: ImageGenAgent | None = None
     if enable_verify and _should_enhance_direct_prompt(prompt_session, labels) and direct_roles:
         ref_idx, user_idx = direct_roles
+        image_gen_agent = ImageGenAgent(
+            image1_name=labels[ref_idx],
+            image2_name=None if _is_user_space_label(labels[user_idx]) else labels[user_idx],
+            image2_is_user_space=_is_user_space_label(labels[user_idx]),
+        )
         try:
-            active_prompt = await asyncio.to_thread(
-                generate_prompt,
+            active_prompt = await image_gen_agent.generate_initial_prompt(
                 image1=pil_images[ref_idx],
-                image1_name=labels[ref_idx],
                 image2=pil_images[user_idx],
-                image2_name=None if _is_user_space_label(labels[user_idx]) else labels[user_idx],
                 user_hint=prompt,
             )
         except Exception as exc:
-            logger.warning("[MultiImageGen] Prompt enhancement skipped: %s", exc)
+            logger.warning("[MultiImageGen] ImageGenAgent prompt skipped: %s", exc)
+            image_gen_agent = None
 
-    # ── Pre-generation prompt verification ────────────────────────────────────
-    # Verify the prompt references images correctly, includes camera lock,
-    # preservation rules, and Ducon product-fidelity requirements before
-    # sending to the expensive image-generation model.
-    if enable_verify and len(pil_images) >= 1:
+    # Pre-generation verify only when not using the unified ImageGenAgent session.
+    if enable_verify and image_gen_agent is None and len(pil_images) >= 1:
         current_prompt = active_prompt
         for vround in range(PROMPT_VERIFY_MAX_ROUNDS):
             try:
@@ -439,17 +440,25 @@ async def generate_multi_image(
         try:
             generated_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             ref_idx, user_idx = qc_roles
-            approved, revised_prompt, issues = await asyncio.to_thread(
-                evaluate_generation,
-                pil_images[ref_idx],
-                pil_images[user_idx],
-                generated_pil,
-                active_prompt,
-                labels[ref_idx],
-                labels[user_idx],
-            )
+            if image_gen_agent is not None:
+                approved, revised_prompt, issues = await image_gen_agent.evaluate_output(
+                    generated=generated_pil,
+                    gen_round=gen_round + 1,
+                )
+            else:
+                approved, revised_prompt, issues = await asyncio.to_thread(
+                    evaluate_generation,
+                    pil_images[ref_idx],
+                    pil_images[user_idx],
+                    generated_pil,
+                    active_prompt,
+                    labels[ref_idx],
+                    labels[user_idx],
+                )
             if approved:
                 logger.info("[MultiImageGen] Generation approved on round %d", gen_round + 1)
+                if image_gen_agent is not None:
+                    image_gen_agent.schedule_post_success_improvement()
                 break
             if gen_round + 1 < max_rounds:
                 logger.info(
@@ -457,7 +466,9 @@ async def generate_multi_image(
                     gen_round + 1, len(issues),
                 )
                 _dbg("[MULTI_IMAGE ▶ EVAL ISSUES]", issues)
-                if prompt_session is not None:
+                if image_gen_agent is not None and revised_prompt:
+                    next_prompt = revised_prompt
+                elif prompt_session is not None:
                     next_prompt = await prompt_session.revise_from_qc(
                         {
                             "verdict": "rejected",
@@ -476,18 +487,18 @@ async def generate_multi_image(
                     )
                     break
 
-                # Stateless re-verify before next generation round
-                for vround in range(PROMPT_VERIFY_MAX_ROUNDS):
-                    try:
-                        v_p, _, v_imp = await asyncio.to_thread(
-                            verify_prompt, pil_images, labels, next_prompt
-                        )
-                        if v_p or not v_imp:
+                if image_gen_agent is None:
+                    for vround in range(PROMPT_VERIFY_MAX_ROUNDS):
+                        try:
+                            v_p, _, v_imp = await asyncio.to_thread(
+                                verify_prompt, pil_images, labels, next_prompt
+                            )
+                            if v_p or not v_imp:
+                                break
+                            next_prompt = v_imp
+                        except Exception as ve:
+                            logger.warning("[MultiImageGen] Re-verify skipped (round %d): %s", vround + 1, ve)
                             break
-                        next_prompt = v_imp
-                    except Exception as ve:
-                        logger.warning("[MultiImageGen] Re-verify skipped (round %d): %s", vround + 1, ve)
-                        break
                 active_prompt = next_prompt
                 if prompt_session is not None:
                     prompt_session.last_prompt = active_prompt

@@ -55,4 +55,4 @@ async def get_metadata():
     try:
         return _load_metadata()
     except (FileNotFoundError, RuntimeError) as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Image metadata is temporarily unavailable.")

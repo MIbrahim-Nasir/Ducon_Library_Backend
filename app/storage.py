@@ -69,7 +69,12 @@ def _r2():
 def _local_path(key: str) -> Path:
     """'generations/{user_id}/{filename}'  →  outputs/{user_id}/{filename}"""
     _, user_id, filename = key.split("/", 2)
-    return _OUTPUTS_DIR / user_id / filename
+    result = (_OUTPUTS_DIR / user_id / filename).resolve()
+    try:
+        result.relative_to(_OUTPUTS_DIR.resolve())
+    except ValueError:
+        raise ValueError(f"Refusing to serve path outside outputs directory: {key!r}")
+    return result
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────

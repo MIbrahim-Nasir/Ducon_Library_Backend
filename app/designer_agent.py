@@ -41,6 +41,7 @@ from app.image_utils import load_ducon_image
 from app.ml import GeminiEmbeddingModel
 from app.tool_generate_image import ImageDescriptor, generate_multi_image
 from app.prompt_generator_session import DesignerPromptSession
+from app import prompt_loader
 
 
 DESIGNER_AGENT_MODEL = os.getenv("DESIGNER_AGENT_MODEL", "gemini-3.5-flash")
@@ -459,53 +460,11 @@ async def run_designer_job(
 
 async def _analyze_and_plan(user_image: Image.Image, user_prompt: str) -> dict[str, Any]:
     client = get_gemini_client()
-    prompt = f"""
-You are Ducon's senior outdoor living designer.
-
-Analyze the client's uploaded space photo and create a practical design plan for
-an autonomous AI image-generation workflow. This plan will be consumed by a
-prompt engineer, search agent, generator, and visual QC.
-
-Be concrete. The old Ducon single-image generation worked best when the plan
-contained camera lock, fixed-structure inventory, eligible zones, and material
-application mapping. Produce that same level of context here.
-
-If the user gave suggestions, respect them. If not, choose a tasteful Ducon-style
-direction yourself.
-
-Return ONLY valid JSON with:
-{{
-  "space_analysis": "what you see in the client's image",
-  "camera_lock": {{
-    "height": "ground/eye/elevated/aerial",
-    "angle": "straight-on/oblique/angled downward/etc",
-    "focal_length_feel": "wide/standard/mild telephoto",
-    "framing": "left/right/foreground/background boundaries to preserve",
-    "lighting": "observed lighting and shadow direction",
-    "aspect_ratio": "observed aspect ratio"
-  }},
-  "fixed_structures": ["specific permanent elements that must not change"],
-  "eligible_zones": ["named physical zones that can receive Ducon treatment"],
-  "avoid_zones": ["zones/elements that should not be modified"],
-  "design_direction": "recommended concept",
-  "preserve": ["elements to keep unchanged"],
-  "opportunities": ["specific improvements"],
-  "search_queries": ["3-5 Ducon catalog searches for references/products"],
-  "reference_needs": ["what kind of Ducon references are needed and why"],
-  "zone_mapping_intent": ["how reference types should map onto eligible zones"],
-  "generation_prompt": "precise prompt seed referencing image 1 as the client space and later images as Ducon references",
-  "success_criteria": [
-    "camera/perspective preserved",
-    "fixed structures preserved",
-    "Ducon material/product fidelity",
-    "correct zone application",
-    "no unrelated added objects",
-    "photorealism"
-  ]
-}}
-
-User request/suggestions: {user_prompt or "No specific instructions. Design independently."}
-"""
+    prompt_loader.ensure_prompts_loaded()
+    prompt = (
+        f"{prompt_loader.DESIGNER_ANALYZE_PLAN}\n\n"
+        f'User request/suggestions: {user_prompt or "No specific instructions. Design independently."}'
+    )
     _dbg(
         "[DESIGNER ▶ GEMINI analyze_plan]",
         {
@@ -653,91 +612,13 @@ async def _evaluate_generation(
     prompt: str,
 ) -> dict[str, Any]:
     client = get_gemini_client()
-    eval_prompt = f"""
-You are a strict visual quality gate for Ducon autonomous design previews.
-
-Image 1: the original client space photo.
-Image 2: the AI-generated design candidate.
-Images 3+: the actual Ducon reference images used, in the same order as the References JSON.
-
-EVALUATE ALL SECTIONS:
-
-SECTION A — PRESERVATION (must not change)
-A1 POV & CAMERA: The viewpoint, angle, height, and perspective must exactly match
-the client space image. FAIL if the camera has shifted, recomposed, or zoomed.
-
-A2 HARD STRUCTURES: All permanent elements must remain unchanged: buildings,
-facades, walls, fences, gates, pillars, mature trees, existing pools, stairs,
-boundary edges. FAIL if any changed shape, moved, disappeared, or appeared
-without instruction.
-
-A3 SCENE BOUNDARIES: The sky, horizon, background and peripheral framing must be
-unchanged. FAIL if the scene has been extended, cropped, or the background altered.
-
-SECTION B — DUCON ELEMENT FIDELITY
-B1 AREA/SURFACE PRODUCTS (tiles, pavers, slabs, stone, coping, wall cladding,
-pool surfaces, driveway surfaces):
-The material's colour, texture, grain, finish, and pattern MUST match the Ducon
-reference exactly. Layout, orientation, joint spacing, and arrangement may adapt
-to site geometry. FAIL if the material looks different in colour, texture, or
-finish from the reference, or if a different material has been substituted.
-
-B2 FIXED/HARD PRODUCTS (planters, fountains, water features, pergolas, canopy
-structures, shade sails, BBQ units, outdoor kitchens, pillar caps, louvred roofs,
-furniture, decorative columns):
-These are objects with a fixed visual identity. They MUST appear identical to the
-reference: same colour, material, shape, proportions. Only placement and
-orientation within the scene may change. FAIL if any such product looks redesigned,
-recolored, or structurally different from its reference.
-
-B3 APPLICATION ZONES: The Ducon design must be applied to the correct
-surfaces/zones per the plan/prompt. FAIL if applied to wrong surfaces, applied
-inconsistently, or if important eligible zones were missed.
-
-SECTION C — HALLUCINATIONS
-C1 NO EXTRA ELEMENTS: No unrequested structures, objects, furniture, plants,
-pools, water features, text, logos, or decorative items. FAIL for any clear
-hallucinated addition not in the plan or prompt.
-
-C2 NO REMOVED ELEMENTS: Significant existing elements from the user's space must
-not be silently removed.
-
-SECTION D — QUALITY
-D1 PHOTOREALISM: Must look like a real photograph. Severe compositing artefacts
-or unnatural material rendering is a FAIL. Minor edge imperfections are acceptable.
-D2 LIGHTING: Cast shadows and ambient colour temperature should match the original.
-
-DECISION RULES:
-- PASS only if the prompt's main requested transformation is visibly fulfilled.
-- PASS only if score >= {DESIGNER_AGENT_PASS_SCORE} AND A1, A2, A3, B1, B2, B3, C1, and C2 are pass or genuinely not-applicable.
-- FAIL if the candidate used the wrong reference, applied the design to the wrong zone, omitted the requested Ducon product/material, changed permanent architecture, added unrelated objects, or looks materially different from the reference.
-- Do not let an attractive image pass if it is not faithful to the user's space, selected Ducon references, and prompt.
-
-SCORING: 0=completely wrong, 5=partially correct, 7=acceptable but still fails if any critical section fails, 8=good, 10=excellent.
-
-Return ONLY valid JSON:
-{{
-  "score": 0-10,
-  "passed": true/false,
-  "strengths": ["..."],
-  "issues": ["..."],
-  "reference_match_issues": ["..."],
-  "client_space_preservation_issues": ["..."],
-  "hallucinations": ["..."],
-  "section_results": {{
-    "A1_pov": "pass/fail/na", "A2_structures": "pass/fail/na",
-    "A3_scene": "pass/fail/na", "B1_area_products": "pass/fail/na",
-    "B2_fixed_products": "pass/fail/na", "B3_zones": "pass/fail/na",
-    "C1_no_extra": "pass/fail/na", "C2_no_missing": "pass/fail/na",
-    "D1_photorealism": "pass/fail/na", "D2_lighting": "pass/fail/na"
-  }},
-  "improvements": "specific changes for the next generation prompt — must directly address every failed section and preserve sections that passed"
-}}
-
-Plan: {json.dumps(plan, ensure_ascii=False)}
-References: {json.dumps(references, ensure_ascii=False)}
-Prompt used: {prompt}
-"""
+    prompt_loader.ensure_prompts_loaded()
+    eval_prompt = (
+        f"{prompt_loader.DESIGNER_EVALUATE_GENERATION}\n\n"
+        f"Plan: {json.dumps(plan, ensure_ascii=False)}\n"
+        f"References: {json.dumps(references, ensure_ascii=False)}\n"
+        f"Prompt used: {prompt}"
+    )
     _dbg(
         "[DESIGNER ▶ GEMINI evaluate]",
         {
@@ -770,15 +651,13 @@ Prompt used: {prompt}
 
 async def _summarize_final(plan: dict[str, Any], best: dict[str, Any], attempts: list[dict[str, Any]]) -> str:
     client = get_gemini_client()
-    prompt = f"""
-Write a concise user-facing summary for a Ducon design run.
-Mention the design direction, why the chosen reference images fit, and what the
-best generation achieved. Keep it warm and practical. Do not mention internal scores unless useful.
-
-Plan: {json.dumps(plan, ensure_ascii=False)}
-Best: {json.dumps(best, ensure_ascii=False)}
-Attempt count: {len(attempts)}
-"""
+    prompt_loader.ensure_prompts_loaded()
+    prompt = (
+        f"{prompt_loader.DESIGNER_FINAL_SUMMARY}\n\n"
+        f"Plan: {json.dumps(plan, ensure_ascii=False)}\n"
+        f"Best: {json.dumps(best, ensure_ascii=False)}\n"
+        f"Attempt count: {len(attempts)}"
+    )
     _dbg(
         "[DESIGNER ▶ GEMINI final_summary]",
         {"model": DESIGNER_AGENT_MODEL, "prompt_chars": len(prompt), "prompt_preview": prompt[:1200]},
@@ -846,30 +725,20 @@ def _compose_generation_prompt(
     attempt_no: int,
     previous_feedback: Optional[str],
 ) -> str:
-    prompt = f"""
-{base_prompt}
-
-Image 1 is the client's original space. Use later images as Ducon design/product
-references. Create a photorealistic Ducon outdoor living design that fits the
-client's existing perspective, lighting, architecture, and scale.
-
-Preserve: {', '.join(plan.get('preserve') or []) or 'important existing architecture and spatial layout'}.
-Success criteria: {', '.join(plan.get('success_criteria') or [])}.
-
-Reference fidelity rules:
-- Keep the client's POV, buildings, boundaries, openings, skyline, and important
-  existing geometry as close to image 1 as possible.
-- Use Ducon reference images as strict visual sources. Materials must retain
-  their color, texture, veining, pattern, and finish. Fixed products must keep
-  their identity and proportions; only placement, scale, and orientation may adapt.
-- Do not invent unrelated products, new buildings, extra pools, furniture, plants,
-  logos, text, or decorative elements unless the plan explicitly needs them.
-- If using paving, tiles, slabs, coping, or wall cladding, adapt the layout to the
-  site while preserving the actual material appearance from the reference.
-"""
+    prompt_loader.ensure_prompts_loaded()
+    preserve_list = ", ".join(plan.get("preserve") or []) or "important existing architecture and spatial layout"
+    success_list = ", ".join(plan.get("success_criteria") or [])
+    retry_block = ""
     if attempt_no > 1 and previous_feedback:
-        prompt += f"\nImprove this attempt based on reviewer feedback: {previous_feedback}\n"
-    return prompt.strip()
+        retry_block = f"\nImprove this attempt based on reviewer feedback: {previous_feedback}\n"
+    suffix = prompt_loader.render_prompt_template(
+        prompt_loader.DESIGNER_COMPOSE_GENERATION_SUFFIX,
+        PRESERVE_LIST=preserve_list,
+        SUCCESS_CRITERIA_LIST=success_list,
+        RETRY_FEEDBACK_BLOCK=retry_block,
+    )
+    prompt = f"{base_prompt}\n\n{suffix}".strip()
+    return prompt
 
 
 def _fallback_queries(user_prompt: str) -> list[str]:

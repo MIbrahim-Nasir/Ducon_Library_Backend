@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -23,12 +23,14 @@ from app.db.database import get_db
 from app.db.models import Image as DBImage, User
 from app.image_utils import get_image_metadata, load_ducon_image, normalize_user_image
 from app import gemini
+from app.rate_limiter import require_rate_limit
 
 router = APIRouter(prefix="/quotation", tags=["quotation"])
 
 
 @router.post("")
 async def create_quotation(
+    request: Request,
     ducon_image_id: int = Form(
         ...,
         description="ID of the Ducon catalog image that was used in the generation.",
@@ -70,6 +72,7 @@ async def create_quotation(
     analysis by Gemini 3.1 Pro.  They are indicative, not contractual.
     """
 
+    require_rate_limit(request, max_requests=5, window_seconds=60, key_prefix="quotation")
     # ── Resolve Ducon catalog image from DB ───────────────────────────────────
     result = await db.execute(select(DBImage).where(DBImage.id == ducon_image_id))
     ducon_db_image = result.scalar_one_or_none()
@@ -87,7 +90,7 @@ async def create_quotation(
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Failed to load Ducon catalog image: {exc}",
+            detail="Could not load the selected catalog image. Please try again.",
         ) from exc
 
     try:
@@ -100,7 +103,7 @@ async def create_quotation(
     except Exception as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"Could not read user_image: {exc}",
+            detail="Could not process the uploaded image. Please use a JPG or PNG file.",
         ) from exc
 
     try:
@@ -115,7 +118,7 @@ async def create_quotation(
     except Exception as exc:
         raise HTTPException(
             status_code=422,
-            detail=f"Could not read generation_image: {exc}",
+            detail="Could not process the generated image. Please try again.",
         ) from exc
 
     # ── Fetch Ducon metadata for richer product identification ────────────────
@@ -134,12 +137,12 @@ async def create_quotation(
         # Model returned unparseable JSON
         raise HTTPException(
             status_code=502,
-            detail=f"Analysis model returned an unexpected response: {exc}",
+            detail="Analysis returned an unexpected response. Please try again.",
         ) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Gemini API error during quotation analysis: {exc}",
+            detail="Quotation analysis failed. Please try again.",
         ) from exc
 
     return {

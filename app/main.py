@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from . import chromadb
 from app.ml import GeminiEmbeddingModel
 import io
+import json
 import os
 import httpx
 from PIL import Image
@@ -12,9 +13,11 @@ from fastapi.middleware.cors import CORSMiddleware
 # Register HEIC/HEIF support so Pillow can open iPhone images
 pillow_heif.register_heif_opener()
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
 from typing import Optional
 from . import gemini
 from . import storage
+from app.image_gen_agent import ImageGenAgent
 from pathlib import Path
 import uuid
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,6 +25,11 @@ from sqlalchemy import select
 from dotenv import load_dotenv
 
 load_dotenv()
+
+from app.prompt_loader import load_prompts
+from app.studio_directions_agent import curate_studio_directions, stream_studio_directions_events
+
+load_prompts()
 
 from app.routers.auth import router as auth_router
 from app.routers.bookmarks import router as bookmarks_router
@@ -53,6 +61,7 @@ from datetime import datetime, timedelta, timezone
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    load_prompts()
     app.state.collection = chromadb.get_db_collection()
     app.state.embedding_model = GeminiEmbeddingModel()
     yield
@@ -116,6 +125,77 @@ async def search(
 
     results = chromadb.retrieve(collection, embedding, limit)
     return {"results": results["ids"]}
+
+
+_STUDIO_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Content-Encoding": "identity",
+    "X-Accel-Buffering": "no",
+}
+
+
+@app.post("/studio/directions")
+async def studio_directions(
+    request: Request,
+    space: str = Form(...),
+    style: str = Form(...),
+    file: UploadFile = File(...),
+    stream: str = Form("true"),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Step 4 curator: AI search agent picks 9 catalog directions for the studio wizard.
+    """
+    try:
+        space_data = json.loads(space)
+        style_data = json.loads(style)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail="Invalid space/style JSON.") from exc
+
+    if not isinstance(space_data, dict) or not isinstance(style_data, dict):
+        raise HTTPException(status_code=422, detail="space and style must be JSON objects.")
+
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=422, detail="User space photo is required.")
+
+    user_mime = _mime_type(file.filename or "space.jpg")
+    collection = request.app.state.collection
+    embedding_model: GeminiEmbeddingModel = app.state.embedding_model
+
+    use_stream = str(stream).strip().lower() in ("true", "1", "yes", "on")
+    if use_stream:
+        return StreamingResponse(
+            stream_studio_directions_events(
+                collection=collection,
+                embedding_model=embedding_model,
+                user_image_bytes=image_bytes,
+                user_mime=user_mime,
+                space=space_data,
+                style=style_data,
+            ),
+            media_type="text/event-stream",
+            headers=_STUDIO_SSE_HEADERS,
+        )
+
+    try:
+        return await curate_studio_directions(
+            db=db,
+            collection=collection,
+            embedding_model=embedding_model,
+            user_image_bytes=image_bytes,
+            user_mime=user_mime,
+            space=space_data,
+            style=style_data,
+        )
+    except Exception as exc:
+        print(f"[StudioDirections] endpoint error: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc) or "Studio direction curation failed.",
+        ) from exc
+
 
 @app.post("/autogenerate-images")
 async def auto_generate_images(
@@ -202,50 +282,22 @@ async def auto_generate_images(
         second_image_name = second_db_image.name or second_db_image.filename
 
     # ── Step 1: Build Nano Banana prompt ─────────────────────────────────────
-    # enhance_prompt=True (default): the prompt generator runs; user prompt is a hint.
-    # enhance_prompt=False: skip generation/verification, use user prompt directly.
-    # These are used in both the pre-gen verify and the re-verify after rejection.
-    verify_images: list = []
-    verify_labels: list = []
+    # enhance_prompt=True (default): unified ImageGenAgent writes prompt + evaluates retries.
+    # enhance_prompt=False: skip agent, use user prompt directly.
+    image_gen_agent: ImageGenAgent | None = None
     if enhance_prompt:
-        prompt = gemini.generate_prompt(
-            image1=ducon_image,
+        image_gen_agent = ImageGenAgent(
             image1_name=ducon_image_name,
-            image1_metadata=_get_image_metadata(ducon_db_image.filename) if (ducon_db_image and use_image_info) else None,
-            image2=user_img,
             image2_name=second_image_name,
+            image2_is_user_space=second_image_name is None,
+        )
+        prompt = await image_gen_agent.generate_initial_prompt(
+            image1=ducon_image,
+            image2=user_img,
+            image1_metadata=_get_image_metadata(ducon_db_image.filename) if (ducon_db_image and use_image_info) else None,
             image2_metadata=_get_image_metadata(second_db_image.filename) if (second_db_image and use_image_info) else None,
             user_hint=prompt or None,
         )
-
-        # ── Step 1b: Pre-generation prompt verification loop ──────────────────
-        # The verifier checks image references, camera lock, preservation rules,
-        # product-fidelity rules, and coherence before sending to the image model.
-        # Each failed round feeds the improved prompt back into the verifier.
-        verify_images = [ducon_image, user_img]
-        verify_labels = [
-            f'Ducon reference: "{ducon_image_name}"',
-            second_image_name and f'Second Ducon image: "{second_image_name}"' or "User's outdoor space",
-        ]
-        for vround in range(gemini.PROMPT_VERIFY_MAX_ROUNDS):
-            try:
-                passed, issues, improved_prompt = gemini.verify_prompt(
-                    images=verify_images,
-                    labels=verify_labels,
-                    prompt=prompt,
-                )
-                if passed:
-                    print(f"[PromptVerifier] Passed on round {vround + 1}")
-                    break
-                if improved_prompt:
-                    print(f"[PromptVerifier] Round {vround + 1} failed ({len(issues)} issue(s)), using improved prompt")
-                    prompt = improved_prompt
-                else:
-                    print(f"[PromptVerifier] Round {vround + 1} failed but no improvement available, proceeding")
-                    break
-            except Exception as e:
-                print(f"[PromptVerifier] Skipped on round {vround + 1} due to error: {e}")
-                break
     else:
         if not prompt:
             raise HTTPException(
@@ -254,10 +306,8 @@ async def auto_generate_images(
             )
 
     # ── Step 2: Generation + post-evaluation loop ─────────────────────────────
-    # On the first pass: generate with the (verified) prompt.
-    # On rejection: regenerate up to GEN_EVAL_MAX_ROUNDS times using the revised
-    # prompt from the evaluator. All attempts write to the same local file so only
-    # the final approved (or best-effort last) image is uploaded to storage.
+    # ImageGenAgent writes the prompt, Nano Banana generates, same agent evaluates.
+    # On rejection: agent revises prompt (with Nano Banana behaviour analysis) and retries.
     ducon_stem = ducon_db_image.filename if ducon_db_image else "reference"
     generation_filename = f"{ducon_stem}_{uuid.uuid4()}.png"
 
@@ -283,47 +333,29 @@ async def auto_generate_images(
 
         try:
             generated_img = Image.open(local_output)
-            approved, revised_prompt, issues = gemini.evaluate_generation(
-                image1=ducon_image,
-                image2=user_img,
+            approved, revised_prompt, issues = await image_gen_agent.evaluate_output(
                 generated=generated_img,
-                prompt_used=prompt,
-                image1_name=ducon_image_name,
-                image2_name=second_image_name,
+                gen_round=gen_round + 1,
             )
             if approved:
-                print(f"[Evaluator] Approved on generation round {gen_round + 1}")
+                print(f"[ImageGenAgent] Approved on generation round {gen_round + 1}")
+                image_gen_agent.schedule_post_success_improvement()
                 break
             if revised_prompt and gen_round + 1 < max_gen_rounds:
                 print(
-                    f"[Evaluator] Rejected on round {gen_round + 1} "
+                    f"[ImageGenAgent] Rejected on round {gen_round + 1} "
                     f"({len(issues)} issue(s)) — regenerating with revised prompt"
                 )
-                # Run the revised prompt back through the pre-gen verifier so it
-                # also passes structural rules before the next generation attempt.
-                for vround in range(gemini.PROMPT_VERIFY_MAX_ROUNDS):
-                    try:
-                        v_passed, _, v_improved = gemini.verify_prompt(
-                            images=verify_images,
-                            labels=verify_labels,
-                            prompt=revised_prompt,
-                        )
-                        if v_passed or not v_improved:
-                            break
-                        revised_prompt = v_improved
-                    except Exception as ve:
-                        print(f"[PromptVerifier] Skipped on re-verify round {vround + 1}: {ve}")
-                        break
                 prompt = revised_prompt
             else:
                 print(
-                    f"[Evaluator] Rejected on round {gen_round + 1} — "
+                    f"[ImageGenAgent] Rejected on round {gen_round + 1} — "
                     f"no revised prompt available or max rounds reached, keeping last output"
                 )
                 break
         except Exception as e:
             # Evaluation failure must not block the response — proceed with current image
-            print(f"[Evaluator] Skipped on generation round {gen_round + 1} due to error: {e}")
+            print(f"[ImageGenAgent] Skipped on generation round {gen_round + 1} due to error: {e}")
             break
 
     # ── Step 3: Persist & respond ─────────────────────────────────────────────

@@ -51,6 +51,54 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/chat", tags=["chat"])
 _MAX_TOOL_RESULT_CHARS = int(os.getenv("CHAT_TOOL_RESULT_MAX_CHARS", "12000"))
 _MAX_AISEARCH_ITEMS = int(os.getenv("CHAT_AISEARCH_MAX_ITEMS", "8"))
+_MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50")) * 1024 * 1024
+
+# Magic-byte signatures for allowed file types
+_ALLOWED_MIME_PREFIXES = (
+    "image/",
+    "application/pdf",
+)
+_MAGIC_SIGNATURES: dict[bytes, str] = {
+    b"\xff\xd8\xff": "image/jpeg",
+    b"\x89PNG\r\n\x1a\n": "image/png",
+    b"GIF87a": "image/gif",
+    b"GIF89a": "image/gif",
+    b"RIFF": "image/webp",     # RIFF....WEBP — check further below
+    b"\x00\x00\x00\x0cjP  ": "image/jp2",
+    b"\x49\x49\x2a\x00": "image/tiff",
+    b"\x4d\x4d\x00\x2a": "image/tiff",
+    b"%PDF": "application/pdf",
+    b"\x00\x00\x00": "video/mp4",   # blocked further in mime check
+}
+_BLOCKED_EXTENSIONS = {".exe", ".sh", ".bat", ".cmd", ".js", ".py", ".php", ".rb", ".ps1"}
+
+
+def _sniff_mime(data: bytes) -> str | None:
+    """Return a MIME type guessed from the first few bytes, or None if unknown."""
+    header = data[:16]
+    for sig, mime in _MAGIC_SIGNATURES.items():
+        if header[:len(sig)] == sig:
+            # Extra WebP discriminator
+            if sig == b"RIFF" and data[8:12] != b"WEBP":
+                return None
+            return mime
+    return None
+
+
+def _validate_upload(filename: str, data: bytes) -> None:
+    """Raise 400/413 if the upload violates size or MIME policy."""
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum allowed size is {_MAX_UPLOAD_BYTES // (1024*1024)} MB.",
+        )
+    ext = os.path.splitext(filename.lower())[1]
+    if ext in _BLOCKED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="File type not allowed.")
+    sniffed = _sniff_mime(data)
+    if sniffed is not None:
+        if not any(sniffed.startswith(p) for p in _ALLOWED_MIME_PREFIXES):
+            raise HTTPException(status_code=400, detail="File type not allowed.")
 
 
 # ── Request / response models ─────────────────────────────────────────────────
@@ -167,6 +215,7 @@ async def chat_message(
         file_bytes = await upload.read()
         if not file_bytes:
             continue
+        _validate_upload(upload.filename, file_bytes)
         mime = upload.content_type or _infer_mime(upload.filename)
         try:
             uploaded = await chat_agent.upload_file_to_gemini(
@@ -188,7 +237,7 @@ async def chat_message(
             logger.warning("File upload failed for %s: %s", upload.filename, exc)
             raise HTTPException(
                 status_code=502,
-                detail=f"Failed to upload file '{upload.filename}' to Gemini: {exc}",
+                detail="File upload failed. Please try again or use a different file.",
             ) from exc
 
         file_type = _gemini_type_from_mime(uploaded["mime_type"])
