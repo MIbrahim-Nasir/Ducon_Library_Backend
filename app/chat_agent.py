@@ -138,11 +138,9 @@ CHAT_TOOLS: list[dict] = [
             "Semantic visual search of the Ducon project catalog. "
             "Use for any catalog search — natural-language descriptions, specific project "
             "names, product types, themes, tags, or any keyword the user mentions. "
-            "Returns Array<CatalogImage>, where each item has {id, name, filename, class, "
-            "theme, project, tags, url, _type:'catalog_image'}. It opens the AI search modal "
-            "and resolves when results are set. Treat results as records/metadata, not visual "
-            "inspection of pixels. If you need to understand or reference the actual image, "
-            "call get_image with the chosen result ID/name/object."
+            "Returns Array<CatalogImage> shown inline in chat as an image slider. "
+            "For browse/inspiration requests: call ONCE, then reply briefly — do not "
+            "chain extra searches or get_image. Treat results as records/metadata."
         ),
         "parameters": {
             "type": "object",
@@ -220,10 +218,10 @@ CHAT_TOOLS: list[dict] = [
         "type": "function",
         "name": "get_image",
         "description": (
-            "Open an image in the Image Viewer and return it. Resolves catalog images, AI "
-            "generations, and user uploads in priority order. Use after AISearch when you need "
-            "proper visual understanding or a concrete design/product reference. Returns "
-            "CatalogImage | UploadImage | AIGeneration."
+            "Resolve a catalog image, AI generation, or user upload by reference. "
+            "In chat, results appear inline — do NOT use after AISearch browse flows. "
+            "Use only when generation/quotation needs a concrete ref. "
+            "Catalog: numeric id or name. AI generation: always gen:ID (ids collide with catalog)."
         ),
         "parameters": {
             "type": "object",
@@ -281,27 +279,6 @@ CHAT_TOOLS: list[dict] = [
     },
     {
         "type": "function",
-        "name": "open_catalog",
-        "description": (
-            "Navigate to the main catalog view and scroll so the category tabs and design grid "
-            "are visible at the top of the screen. Returns {status:'open'}. "
-            "Use when the user wants to browse, explore, or scroll through the full catalog."
-        ),
-        "parameters": {"type": "object", "properties": {}},
-    },
-    {
-        "type": "function",
-        "name": "UploadImage",
-        "description": (
-            "Opens the file picker so the user can upload a photo of their space. "
-            "Resolves with {id, name, filename, _isUpload:true, _type:'user_upload'} once the "
-            "user confirms. Pass id or the full object as a user upload source in "
-            "generate_multi_image. Use when no upload_id is available from a chat attachment."
-        ),
-        "parameters": {"type": "object", "properties": {}},
-    },
-    {
-        "type": "function",
         "name": "start_designer_job",
         "description": (
             "Start a long-running autonomous Ducon design job. Use when the user provides a "
@@ -326,8 +303,9 @@ CHAT_TOOLS: list[dict] = [
                 "user_upload_image": {
                     "type": "string",
                     "description": (
-                        "Upload id/source for the client's space image. Use an upload id from chat "
-                        "attachment or UploadImage result. If unknown, call UploadImage first."
+                        "Upload id/source for the client's space image. Use an upload id from a "
+                        "chat attachment message. If missing, ask the user to attach their space "
+                        "photo with the paperclip button in the chat composer."
                     ),
                 },
                 "model": {
@@ -364,8 +342,17 @@ CHAT_TOOLS: list[dict] = [
             "  - Catalog image  → numeric ID string, e.g. '42'\n"
             "  - Catalog by name → image filename/name, e.g. 'marble_pool_coping'\n"
             "  - Previous generation → 'gen:123' where 123 is the generation id\n"
-            "  - User upload → upload id string/number from UploadImage or chat attachment, or 'upload' to ask frontend to open picker\n"
+            "  - User upload → upload id string from chat attachment hint, e.g. '7'\n"
             "  - Direct URL → full https:// URL\n"
+            "\n\n"
+            "LABEL CONVENTIONS (required for quality — same as Studio):\n"
+            "  - User's space photo → label MUST be 'User space photo'\n"
+            "  - Main Ducon reference → label 'Ducon design direction'\n"
+            "  - Extra catalog refs → label 'Ducon product' or descriptive product name\n"
+            "  - Put user space FIRST in the images array, then design direction, then products.\n"
+            "\n\n"
+            "The backend runs the same ImageGenAgent prompt writer + evaluator loop as Studio "
+            "when labels match this pattern (enhanced prompt + QC retries).\n"
             "\n\n"
             "MODEL LIMITS: max 10 images total. "
             "Use model='pro' (default) for high quality; model='flash' for faster iterations."
@@ -384,7 +371,10 @@ CHAT_TOOLS: list[dict] = [
                 },
                 "images": {
                     "type": "array",
-                    "description": "Ordered list of images. Max 10. Order matters — prompt references them by position.",
+                    "description": (
+                        "Ordered list of images. Max 10. Order: user space first, "
+                        "Ducon design direction second, then any product refs."
+                    ),
                     "maxItems": 10,
                     "items": {
                         "type": "object",
@@ -392,17 +382,17 @@ CHAT_TOOLS: list[dict] = [
                             "source": {
                                 "type": "string",
                                 "description": (
-                                    "Image source: catalog ID ('42'), catalog name ('marble_coping'), "
-                                    "generation reference ('gen:123'), upload id from UploadImage/chat attachment, "
-                                    "'upload' to open picker, or URL."
+                                    "Image source string: catalog ID ('42'), catalog name, "
+                                    "generation ref ('gen:123'), chat upload id ('7'), or URL. "
+                                    "For chat attachments use the upload id from the message hint."
                                 ),
                             },
                             "label": {
                                 "type": "string",
                                 "description": (
-                                    "Short descriptive label shown before this image in the prompt context, "
-                                    "e.g. 'Ducon marble coping', 'user terrace', 'mood board'. "
-                                    "Match the wording you use in the prompt."
+                                    "Required role label. User photo: 'User space photo'. "
+                                    "Main Ducon ref: 'Ducon design direction'. "
+                                    "Products: 'Ducon product' or specific product name."
                                 ),
                             },
                         },

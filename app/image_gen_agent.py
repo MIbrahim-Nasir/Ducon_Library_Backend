@@ -20,10 +20,9 @@ from google.genai.types import Content, GenerateContentConfig, Part, ThinkingCon
 from app.gemini import (
     IMAGE_GEN_MODEL,
     PROMPT_GEN_MODEL,
-    _EVAL_CRITICAL_SECTIONS,
     _PROMPT_THINKING_LEVEL,
-    _eval_section_passes,
     _parse_json_response,
+    finalize_evaluation,
     get_gemini_client,
     log_section_analysis,
 )
@@ -59,6 +58,10 @@ class ImageGenAgent:
         image1_name: str,
         image2_name: str | None,
         image2_is_user_space: bool,
+        labels: list[str] | None = None,
+        user_space_index: int | None = None,
+        design_direction_index: int | None = None,
+        product_indices: list[int] | None = None,
     ) -> None:
         self._conversation: list[Content] = []
         self.last_prompt: str = ""
@@ -67,6 +70,76 @@ class ImageGenAgent:
         self.image2_is_user_space = image2_is_user_space
         self.rejection_count: int = 0
         self.successful_round: int = 0
+
+        if labels:
+            self.labels = labels
+            self.user_space_index = user_space_index if user_space_index is not None else 0
+            self.design_direction_index = (
+                design_direction_index if design_direction_index is not None else 1
+            )
+            self.product_indices = product_indices or []
+        else:
+            self.labels = [image1_name, image2_name or "user space"]
+            self.user_space_index = 1 if image2_is_user_space else len(self.labels) - 1
+            self.design_direction_index = 0
+            self.product_indices = []
+
+    def _role_line(self, index: int) -> str:
+        label = self.labels[index]
+        img_num = index + 1
+        if index == self.user_space_index:
+            return f'Image {img_num}: user\'s outdoor space — "{label}"'
+        if index == self.design_direction_index:
+            return f'Image {img_num}: Ducon design direction — "{label}"'
+        if index in self.product_indices:
+            return f'Image {img_num}: Ducon product reference — "{label}"'
+        return f'Image {img_num}: Ducon catalog reference — "{label}"'
+
+    def _build_prompt_context(
+        self,
+        *,
+        user_hint: str | None = None,
+        image1_metadata: dict[str, Any] | None = None,
+        image2_metadata: dict[str, Any] | None = None,
+    ) -> str:
+        if len(self.labels) > 2 or self.product_indices:
+            role_block = "\n".join(
+                f"- {self._role_line(i)}" for i in range(len(self.labels))
+            )
+            context = (
+                "Multi-image studio generation. Input roles:\n"
+                f"{role_block}\n\n"
+                "Write the complete Nano Banana Pro generation prompt. Apply the design "
+                "direction to eligible zones in the user's space. Integrate EACH product "
+                "reference image as a distinct Ducon product with placement from its own image number."
+            )
+        elif self.image2_is_user_space:
+            context = (
+                f'Image 1 is a Ducon catalog image named "{self.image1_name}". '
+                f"Image 2 is the user's outdoor space to transform. "
+                f"Write the complete Nano Banana Pro generation prompt."
+            )
+        else:
+            context = (
+                f'Image 1 is a Ducon catalog image named "{self.image1_name}". '
+                f'Image 2 is a Ducon catalog image named "{self.image2_name}". '
+                f"Write the complete Nano Banana Pro generation prompt to combine them."
+            )
+
+        if image1_metadata:
+            context += f"\n\nMetadata for Image 1:\n{json.dumps(image1_metadata, indent=2)}"
+        if image2_metadata:
+            context += f"\n\nMetadata for Image 2:\n{json.dumps(image2_metadata, indent=2)}"
+        if user_hint:
+            context += (
+                f'\n\nUser direction (incorporate when consistent with images): "{user_hint}"'
+            )
+
+        context += (
+            "\n\nReturn ONLY the full generation prompt text. Self-check all V1–V16 rules "
+            "before responding."
+        )
+        return context
 
     def schedule_post_success_improvement(self) -> None:
         """
@@ -166,39 +239,19 @@ Return POST-SUCCESS IMPROVEMENT JSON only.
         self,
         *,
         image1: Image.Image,
-        image2: Image.Image,
+        image2: Image.Image | None = None,
+        images: list[Image.Image] | None = None,
         image1_metadata: dict[str, Any] | None = None,
         image2_metadata: dict[str, Any] | None = None,
         user_hint: str | None = None,
     ) -> str:
-        if self.image2_is_user_space:
-            context = (
-                f'Image 1 is a Ducon catalog image named "{self.image1_name}". '
-                f"Image 2 is the user's outdoor space to transform. "
-                f"Write the complete Nano Banana Pro generation prompt."
-            )
-        else:
-            context = (
-                f'Image 1 is a Ducon catalog image named "{self.image1_name}". '
-                f'Image 2 is a Ducon catalog image named "{self.image2_name}". '
-                f"Write the complete Nano Banana Pro generation prompt to combine them."
-            )
-
-        if image1_metadata:
-            context += f"\n\nMetadata for Image 1:\n{json.dumps(image1_metadata, indent=2)}"
-        if image2_metadata:
-            context += f"\n\nMetadata for Image 2:\n{json.dumps(image2_metadata, indent=2)}"
-        if user_hint:
-            context += (
-                f'\n\nUser direction (incorporate when consistent with images): "{user_hint}"'
-            )
-
-        context += (
-            "\n\nReturn ONLY the full generation prompt text. Self-check all V1–V11 rules "
-            "before responding."
+        pil_images = images if images else [image1, image2]  # type: ignore[list-item]
+        context = self._build_prompt_context(
+            user_hint=user_hint,
+            image1_metadata=image1_metadata,
+            image2_metadata=image2_metadata,
         )
-
-        parts: list[Part] = [_pil_part(image1), _pil_part(image2), Part(text=context)]
+        parts: list[Part] = [_pil_part(img) for img in pil_images] + [Part(text=context)]
         self._conversation.append(Content(role="user", parts=parts))
         return await self._complete_prompt_turn()
 
@@ -207,25 +260,27 @@ Return POST-SUCCESS IMPROVEMENT JSON only.
         *,
         generated: Image.Image,
         gen_round: int,
-    ) -> tuple[bool, str | None, list[str]]:
-        """Evaluate the latest generation; on rejection return a revised prompt."""
+    ) -> tuple[bool, list[str]]:
+        """
+        Evaluate the latest generation against the input images and the prompt
+        that was used.  Returns (approved, issues).
+
+        On rejection the conversation history is updated with the evaluation
+        analysis so the subsequent generate_retry_prompt() call can synthesise
+        a better prompt using the full session context.
+        """
         eval_context = (
             f"Generation round {gen_round} — evaluate the LAST image (AI output from "
             f"{IMAGE_GEN_MODEL}) against your previous prompt and the input images from "
             f"this session.\n\n"
-            f'Image 1 (Ducon reference): "{self.image1_name}". '
-        )
-        if self.image2_is_user_space:
-            eval_context += "Image 2: user's outdoor space."
-        else:
-            eval_context += f'Image 2 (Ducon): "{self.image2_name}".'
-        eval_context += (
-            f'\n\nPrompt used:\n"""\n{self.last_prompt}\n"""\n\n'
-            "For every section: fill section_analysis (aspect → reference observation → "
-            "generated observation → evaluation → verdict) then section_results. "
-            "section_analysis is REQUIRED for all sections on both approval and rejection. "
-            "Return evaluation JSON only. If rejected, include revised_prompt with "
-            "nano_banana_analysis-informed fixes."
+            "Input image roles:\n"
+            + "\n".join(f"- {self._role_line(i)}" for i in range(len(self.labels)))
+            + f'\n\nPrompt used:\n"""\n{self.last_prompt}\n"""\n\n'
+            "Evaluate against ALL input images. For B4_product_integration check EACH "
+            "product reference separately (N/A only if no product images). "
+            "For every section: fill section_analysis then section_results. "
+            "If ANY section_results value is fail, verdict MUST be rejected. "
+            "Return evaluation JSON only."
         )
 
         parts = [_pil_part(generated), Part(text=eval_context)]
@@ -249,44 +304,51 @@ Return POST-SUCCESS IMPROVEMENT JSON only.
             Content(role="model", parts=[Part(text=response.text or "")])
         )
 
-        issues: list[str] = data.get("issues") or []
-        section_results = data.get("section_results") or {}
-        failed_sections = [
-            key
-            for key in _EVAL_CRITICAL_SECTIONS
-            if not _eval_section_passes(section_results.get(key))
-        ]
-        if failed_sections:
-            issues = [
-                *issues,
-                f"Critical QC sections failed or missing: {', '.join(failed_sections)}",
-            ]
-
-        approved = data.get("verdict") == "approved" and not issues
-        revised_prompt: str | None = None
+        approved, issues, _inline_revised = finalize_evaluation(data)
         if approved:
             self.successful_round = gen_round
         else:
             self.rejection_count += 1
-            revised = data.get("revised_prompt")
-            if isinstance(revised, str) and revised.strip():
-                revised_prompt = revised.strip()
 
         nb_analysis = data.get("nano_banana_analysis")
         print(
             f"[ImageGenAgent] round={gen_round} verdict={data.get('verdict')} "
             f"reason={data.get('reason')}"
         )
-        log_section_analysis(data.get("section_analysis"), section_results)
+        log_section_analysis(data.get("section_analysis"), data.get("section_results") or {})
         if nb_analysis:
             print(f"[ImageGenAgent] nano_banana_analysis: {nb_analysis}")
         if issues:
             print(f"[ImageGenAgent] issues: {issues}")
-        if revised_prompt:
-            self.last_prompt = revised_prompt
-            print(f"[ImageGenAgent] revised_prompt (first 400 chars):\n{revised_prompt[:400]}\n")
 
-        return approved, revised_prompt, issues
+        return approved, issues
+
+    async def generate_retry_prompt(
+        self,
+        *,
+        gen_round: int,
+        issues: list[str],
+    ) -> str:
+        """
+        After an evaluation rejection, run a dedicated prompt-writing turn.
+
+        The conversation already contains the evaluation analysis from
+        evaluate_output(); this turn instructs the agent to synthesise that
+        analysis into a fresh, improved generation prompt.  Returns the new
+        prompt string and updates self.last_prompt.
+        """
+        issue_lines = "\n".join(f"- {i}" for i in issues) if issues else "- (see evaluation above)"
+        retry_context = (
+            f"Round {gen_round} was rejected.\n"
+            f"Issues identified:\n{issue_lines}\n\n"
+            "Using the evaluation analysis above, write an improved Nano Banana Pro "
+            "generation prompt that fully addresses every identified issue. "
+            "Apply all V1–V16 rules. Return ONLY the full generation prompt text."
+        )
+        self._conversation.append(Content(role="user", parts=[Part(text=retry_context)]))
+        prompt = await self._complete_prompt_turn()
+        print(f"[ImageGenAgent] retry prompt (round {gen_round}, first 400 chars):\n{prompt[:400]}\n")
+        return prompt
 
     async def _complete_prompt_turn(self) -> str:
         prompt_loader.ensure_prompts_loaded()

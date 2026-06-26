@@ -32,6 +32,7 @@ Repeat from step 1 for the next user message, passing `previous_interaction_id`.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -118,8 +119,10 @@ class ToolResultRequest(BaseModel):
 # ── Shared SSE response config ────────────────────────────────────────────────
 
 _SSE_HEADERS = {
-    "Cache-Control":   "no-cache",
-    "X-Accel-Buffering": "no",       # disable nginx buffering
+    "Cache-Control":     "no-cache",
+    "Connection":        "keep-alive",
+    "Content-Encoding":  "identity",   # prevent any intermediate compression
+    "X-Accel-Buffering": "no",         # disable nginx / Cloudflare buffering
 }
 
 
@@ -127,8 +130,26 @@ async def _stream_with_session_save(
     user_id: int,
     generator,
 ):
-    """Persist interaction_id from each `done` SSE event to the user's chat session."""
-    async for chunk in generator:
+    """Persist interaction_id and emit keepalive pings to prevent proxy timeouts."""
+    KEEPALIVE_INTERVAL = 15.0  # seconds — resets Cloudflare's 100 s idle timeout
+
+    async def _next_or_timeout(aiter, timeout):
+        """Return (chunk, False) or (None, True) on timeout."""
+        try:
+            return await asyncio.wait_for(aiter.__anext__(), timeout=timeout), False
+        except StopAsyncIteration:
+            return None, False
+        except asyncio.TimeoutError:
+            return None, True
+
+    aiter = generator.__aiter__()
+    while True:
+        chunk, timed_out = await _next_or_timeout(aiter, KEEPALIVE_INTERVAL)
+        if timed_out:
+            yield ": keepalive\n\n"
+            continue
+        if chunk is None:
+            break
         if chunk.startswith("data:"):
             try:
                 payload = json.loads(chunk[5:].strip())
@@ -253,8 +274,10 @@ async def chat_message(
         input_parts.append({"type": "text", "text": message})
     input_parts.extend(file_parts)
 
-    # ── Stream ────────────────────────────────────────────────────────────────
-    effective_prev = previous_interaction_id or chat_session.get_interaction_id(current_user.id)
+    # Prefer server-persisted session (updated by voice_context injects) over a
+    # possibly stale client previous_interaction_id.
+    session_prev = chat_session.get_interaction_id(current_user.id)
+    effective_prev = session_prev or previous_interaction_id
     return StreamingResponse(
         _stream_with_session_save(
             current_user.id,
@@ -339,7 +362,10 @@ async def chat_tool_result(
             current_user.id,
             chat_agent.stream_chat(
                 input_parts=input_parts,
-                previous_interaction_id=body.previous_interaction_id,
+                previous_interaction_id=(
+                    chat_session.get_interaction_id(current_user.id)
+                    or body.previous_interaction_id
+                ),
             ),
         ),
         media_type="text/event-stream",
@@ -417,8 +443,9 @@ def _compact_ai_search_result(result: object) -> object:
         "_original_count": len(items),
         "items": compact_items,
         "instruction": (
-            "These are compact search records, not actual image pixels. "
-            "Call get_image with a selected id/name before relying on visual details."
+            "Results are already shown to the user in the chat image slider. "
+            "Do NOT call get_image or run additional AISearch/KeywordSearch unless "
+            "the user asks for more. Catalog ids require plain id; AI generations use gen:ID."
         ),
     }
 
@@ -482,7 +509,7 @@ class VoiceContextRequest(BaseModel):
     store this as its next previous_interaction_id so the next text-chat turn
     chains from here.
     """
-    user_text:               str
+    user_text:               str = ""
     assistant_text:          str = ""
     tool_name:               Optional[str]   = None
     tool_summary:            Optional[str]   = None   # compact JSON-friendly text
@@ -499,16 +526,14 @@ async def inject_voice_context(
     Returns { "interaction_id": "v1_..." } — store and pass as
     previous_interaction_id on the next /chat/message call.
     """
-    # Build a compact summary message that the chat model can absorb without
-    # generating a long response.  The user turn describes what happened in
-    # voice; the model is asked only to silently acknowledge and remember.
-    parts: list[str] = [
-        "[Voice interaction context — store in memory, no need to reply verbosely]",
-        f"User (voice): {body.user_text}",
-    ]
-    if body.assistant_text:
-        parts.append(f"Assistant (voice): {body.assistant_text}")
+    # Store voice turns in the shared Interactions history.
+    # For normal dialogue, pass the user's exact words as the user turn (best recall).
     if body.tool_name and body.tool_summary:
+        parts: list[str] = []
+        if body.user_text:
+            parts.append(f"User: {body.user_text}")
+        if body.assistant_text:
+            parts.append(f"Assistant (voice): {body.assistant_text}")
         parts.append(f"Tool executed: {body.tool_name}")
         if body.tool_name == "start_designer_job":
             parts.append("Designer job result — store ALL of the following for follow-up questions:")
@@ -521,22 +546,278 @@ async def inject_voice_context(
             )
         else:
             parts.append(f"Result summary: {body.tool_summary}")
-    parts.append(
-        "Acknowledge this voice interaction in one short sentence (e.g. 'Noted.')."
-        " You will be asked a follow-up question by the user in text next."
-    )
+        parts.append(
+            "This exchange happened in the voice session. Remember it for follow-up text chat. "
+            "Acknowledge in one short sentence (e.g. 'Noted.')."
+        )
+        input_parts = [{"type": "text", "text": "\n".join(parts)}]
+    elif body.user_text:
+        memory_text = body.user_text
+        if body.assistant_text:
+            memory_text += (
+                "\n\n[Voice assistant reply for context: "
+                f"{body.assistant_text}]"
+            )
+        input_parts = [{"type": "text", "text": memory_text}]
+    elif body.assistant_text:
+        input_parts = [{
+            "type": "text",
+            "text": (
+                f"[Voice assistant said: {body.assistant_text}]\n"
+                "Remember this from the voice session for follow-up text chat. "
+                "Acknowledge in one short sentence."
+            ),
+        }]
+    else:
+        return {"interaction_id": chat_session.get_interaction_id(current_user.id)}
 
-    input_parts = [{"type": "text", "text": "\n".join(parts)}]
+    session_prev = chat_session.get_interaction_id(current_user.id)
+    chain_prev = session_prev or body.previous_interaction_id
 
     interaction_id: Optional[str] = None
     async for raw in _stream_with_session_save(
         current_user.id,
         chat_agent.stream_chat(
             input_parts=input_parts,
-            previous_interaction_id=body.previous_interaction_id or chat_session.get_interaction_id(current_user.id),
+            previous_interaction_id=chain_prev,
         ),
     ):
         # The SSE stream contains JSON events — we only care about `done`
+        if not raw.startswith("data:"):
+            continue
+        payload_str = raw[len("data:"):].strip()
+        try:
+            payload = json.loads(payload_str)
+            if payload.get("type") == "done":
+                interaction_id = payload.get("interaction_id")
+                break
+        except (json.JSONDecodeError, AttributeError):
+            continue
+
+    return {"interaction_id": interaction_id}
+
+
+# ── POST /chat/browse_context ─────────────────────────────────────────────────
+
+class BrowseContextRequest(BaseModel):
+    """
+    Inject UI-driven catalog browse steps (explore products, category picks, etc.)
+    into the shared Interactions history without sending image data.
+    """
+    actions: list[dict]
+    previous_interaction_id: Optional[str] = None
+
+
+def _format_product_ref(idx: int, item: dict) -> str:
+    cid = item.get("catalog_id")
+    name = item.get("name") or f"catalog {cid}"
+    desc = item.get("description") or ""
+    filename = item.get("filename")
+    parts = [f"     {idx}. catalog_id={cid} name=\"{name}\""]
+    if desc:
+        parts.append(f"desc=\"{desc}\"")
+    if filename:
+        parts.append(f"filename=\"{filename}\"")
+    return " ".join(parts)
+
+
+def _format_browse_memory(actions: list[dict]) -> str:
+    lines = [
+        "[Chat UI browse session — the user explored catalog options in the chat UI "
+        "(not via agent tools). No images are included.",
+        "Use catalog_id with get_image(catalog_id) to open a catalog image, or "
+        "generation_ref with get_image(generation_ref) for AI generations.",
+        "Sequence:",
+    ]
+    step = 1
+    for action in actions:
+        kind = action.get("type") or ""
+        if kind == "explore_products":
+            lines.append(f"{step}. User chose to explore Ducon products.")
+            user_msg = action.get("user_message")
+            if user_msg:
+                lines.append(f"   User prompt shown: \"{user_msg}\"")
+            cats = action.get("categories") or []
+            if cats:
+                lines.append(f"   Product categories shown: {', '.join(cats)}")
+            step += 1
+        elif kind == "category_selected":
+            cat = action.get("category") or "unknown"
+            lines.append(f"{step}. User selected product category \"{cat}\".")
+            products = action.get("products") or []
+            if products:
+                lines.append(f"   Products shown ({len(products)}):")
+                for i, p in enumerate(products, 1):
+                    lines.append(_format_product_ref(i, p))
+            step += 1
+        elif kind == "product_viewed":
+            cat = action.get("category")
+            prefix = f"{step}. User opened product"
+            if cat:
+                prefix += f" from \"{cat}\""
+            lines.append(f"{prefix} for preview:")
+            lines.append(f"   {_format_product_ref(1, action).lstrip()}")
+            step += 1
+        elif kind == "catalog_attached":
+            lines.append(f"{step}. User attached a catalog reference to chat:")
+            lines.append(f"   {_format_product_ref(1, action).lstrip()}")
+            step += 1
+        elif kind == "generation_attached":
+            gen_ref = action.get("generation_ref") or f"gen:{action.get('generation_id')}"
+            name = action.get("name") or f"generation {action.get('generation_id')}"
+            lines.append(
+                f"{step}. User attached AI generation \"{name}\" "
+                f"(generation_ref=\"{gen_ref}\", id={action.get('generation_id')})."
+            )
+            step += 1
+        else:
+            summary = action.get("summary") or json.dumps(action, ensure_ascii=False)
+            lines.append(f"{step}. {summary}")
+            step += 1
+
+    lines.append(
+        "Remember this browse context for follow-up questions. "
+        "Acknowledge in one short sentence (e.g. 'Noted your product browsing.')."
+    )
+    return "\n".join(lines)
+
+
+@router.post("/browse_context")
+async def inject_browse_context(
+    body: BrowseContextRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Persist UI browse steps into Gemini Interactions history (text-only refs).
+    Returns { "interaction_id": "v1_..." } for the next /chat/message call.
+    """
+    if not body.actions:
+        return {"interaction_id": chat_session.get_interaction_id(current_user.id)}
+
+    memory_text = _format_browse_memory(body.actions)
+    input_parts = [{"type": "text", "text": memory_text}]
+
+    session_prev = chat_session.get_interaction_id(current_user.id)
+    chain_prev = session_prev or body.previous_interaction_id
+
+    interaction_id: Optional[str] = None
+    async for raw in _stream_with_session_save(
+        current_user.id,
+        chat_agent.stream_chat(
+            input_parts=input_parts,
+            previous_interaction_id=chain_prev,
+        ),
+    ):
+        if not raw.startswith("data:"):
+            continue
+        payload_str = raw[len("data:"):].strip()
+        try:
+            payload = json.loads(payload_str)
+            if payload.get("type") == "done":
+                interaction_id = payload.get("interaction_id")
+                break
+        except (json.JSONDecodeError, AttributeError):
+            continue
+
+    return {"interaction_id": interaction_id}
+
+
+# ── POST /chat/studio_context ────────────────────────────────────────────────
+
+class StudioContextRequest(BaseModel):
+    """
+    Inject Studio AI wizard context (selections, prompt, generation ref) into
+    the shared Interactions history. Images are attached separately via /chat/message.
+    """
+    context: dict
+    previous_interaction_id: Optional[str] = None
+
+
+def _format_studio_memory(ctx: dict) -> str:
+    gen_id = ctx.get("generation_id")
+    gen_ref = ctx.get("generation_ref") or (f"gen:{gen_id}" if gen_id else None)
+    gen_name = ctx.get("generation_name") or f"generation {gen_id}"
+    prompt = (ctx.get("prompt") or "").strip()
+
+    lines = [
+        "[Studio AI visualization — the user completed the Studio wizard and generated a design.",
+        "The next user message includes attached images: studio result, original space photo, "
+        "and catalog reference images where available.",
+        "Use generation_ref with get_image(generation_ref) to reopen the AI result; "
+        "catalog_id with get_image(catalog_id) for catalog references.",
+        "",
+        "Generation:",
+        f"  generation_id={gen_id} generation_ref=\"{gen_ref}\" name=\"{gen_name}\"",
+    ]
+
+    if prompt:
+        lines.append("")
+        lines.append("Prompt used for generation:")
+        lines.append(prompt)
+
+    space_summary = ctx.get("space_summary")
+    style_summary = ctx.get("style_summary")
+    direction = ctx.get("direction_title")
+    if space_summary:
+        lines.append(f"Space type(s): {space_summary}")
+    if style_summary:
+        lines.append(f"Style direction(s): {style_summary}")
+    if direction:
+        lines.append(f"Design direction: {direction}")
+
+    ref = ctx.get("reference_design")
+    if ref and ref.get("catalog_id"):
+        lines.append(
+            f"Reference design: catalog_id={ref['catalog_id']} "
+            f"name=\"{ref.get('name') or 'reference'}\""
+        )
+
+    products = ctx.get("products") or []
+    if products:
+        lines.append(f"Products included ({len(products)}):")
+        for i, p in enumerate(products, 1):
+            cid = p.get("catalog_id")
+            label = p.get("label") or p.get("name") or f"product {i}"
+            if cid:
+                lines.append(f"  {i}. catalog_id={cid} label=\"{label}\"")
+            else:
+                lines.append(f"  {i}. label=\"{label}\"")
+
+    lines.append("")
+    lines.append(
+        "Remember this Studio context for follow-up edits. "
+        "Acknowledge briefly and offer concrete refinement options "
+        "(materials, layout, products, lighting, etc.)."
+    )
+    return "\n".join(lines)
+
+
+@router.post("/studio_context")
+async def inject_studio_context(
+    body: StudioContextRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Persist Studio wizard generation context into Gemini Interactions history.
+    Returns { "interaction_id": "v1_..." } for the next /chat/message call.
+    """
+    if not body.context:
+        return {"interaction_id": chat_session.get_interaction_id(current_user.id)}
+
+    memory_text = _format_studio_memory(body.context)
+    input_parts = [{"type": "text", "text": memory_text}]
+
+    session_prev = chat_session.get_interaction_id(current_user.id)
+    chain_prev = session_prev or body.previous_interaction_id
+
+    interaction_id: Optional[str] = None
+    async for raw in _stream_with_session_save(
+        current_user.id,
+        chat_agent.stream_chat(
+            input_parts=input_parts,
+            previous_interaction_id=chain_prev,
+        ),
+    ):
         if not raw.startswith("data:"):
             continue
         payload_str = raw[len("data:"):].strip()

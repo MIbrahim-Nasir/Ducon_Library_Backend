@@ -65,6 +65,12 @@ short labels only. FAIL if the prompt includes forensic material DNA, long visua
 descriptions, or SIMPLE-zone text specifications instead of extract-from-images wording.
 Must include explicit apply_only_to and preserve blocks (or equivalent clearly labeled lists).
 
+V11 — MULTI-IMAGE ROLES (when 3+ images)
+The prompt must distinguish the user space, design direction, and each product image by
+number/label. Each product image must have a placement instruction. FAIL if product images
+are omitted, merged into one vague "products" line without image numbers, or if design
+direction and product roles are conflated.
+
 Return ONLY valid JSON with exactly these fields:
 {
   "passed": true or false,

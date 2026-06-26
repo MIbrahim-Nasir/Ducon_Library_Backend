@@ -88,6 +88,23 @@ def _parse_json_response(text: str | None) -> dict:
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid JSON from model: {raw[:200]}") from exc
 
+    # Models occasionally wrap the expected object in a JSON array
+    # (e.g. "[{...}]"). Recover by unwrapping the first dict element rather
+    # than failing the whole evaluation/parse.
+    if isinstance(obj, list):
+        dict_items = [item for item in obj if isinstance(item, dict)]
+        if len(dict_items) == 1:
+            print("[Gemini JSON] unwrapped single-object array response")
+            obj = dict_items[0]
+        elif len(dict_items) > 1:
+            print(
+                f"[Gemini JSON] merged {len(dict_items)} object array elements"
+            )
+            merged: dict = {}
+            for item in dict_items:
+                merged.update(item)
+            obj = merged
+
     if not isinstance(obj, dict):
         raise ValueError(f"Expected JSON object, got {type(obj).__name__}")
 
@@ -107,6 +124,7 @@ _EVAL_CRITICAL_SECTIONS = (
     "B1_area_products",
     "B2_fixed_products",
     "B3_zones",
+    "B4_product_integration",
     "C1_no_extra",
     "C2_no_missing",
     "E1_site_geometry",
@@ -123,6 +141,7 @@ _EVAL_SECTION_ORDER = (
     "B1_area_products",
     "B2_fixed_products",
     "B3_zones",
+    "B4_product_integration",
     "C1_no_extra",
     "C2_no_missing",
     "D1_photorealism",
@@ -138,6 +157,76 @@ _EVAL_SECTION_ORDER = (
 def _eval_section_passes(value: object) -> bool:
     normalized = str(value or "").strip().lower()
     return normalized in {"pass", "na", "n/a", "not_applicable", "not applicable"}
+
+
+def _eval_section_fails(value: object) -> bool:
+    return str(value or "").strip().lower() == "fail"
+
+
+def finalize_evaluation(data: dict) -> tuple[bool, list[str], str | None]:
+    """
+    Normalize model QC JSON into a strict approve/reject decision.
+    Overrides lenient model verdicts when section_results or analysis disagree.
+    """
+    issues: list[str] = list(data.get("issues") or [])
+    section_results = data.get("section_results") or {}
+    section_analysis = data.get("section_analysis") or {}
+
+    if not isinstance(section_results, dict):
+        section_results = {}
+
+    failed_critical = [
+        key for key in _EVAL_CRITICAL_SECTIONS
+        if not _eval_section_passes(section_results.get(key))
+    ]
+    if failed_critical:
+        issues.append(
+            f"Critical QC sections failed or missing: {', '.join(failed_critical)}"
+        )
+
+    for key, value in section_results.items():
+        if _eval_section_fails(value):
+            issues.append(f"Section {key} marked fail in section_results")
+
+    if isinstance(section_analysis, dict):
+        for key in _EVAL_SECTION_ORDER:
+            if key not in section_results:
+                continue
+            entry = section_analysis.get(key)
+            if not isinstance(entry, dict):
+                continue
+            analysis_verdict = str(entry.get("verdict") or "").strip().lower()
+            result_verdict = str(section_results.get(key) or "").strip().lower()
+            if analysis_verdict == "fail" and _eval_section_passes(result_verdict):
+                issues.append(
+                    f"Section {key}: section_analysis verdict is fail but section_results is not fail"
+                )
+            if (
+                analysis_verdict in {"pass", "fail", "na", "n/a"}
+                and result_verdict
+                and analysis_verdict not in {"na", "n/a", "not_applicable", "not applicable"}
+                and analysis_verdict != result_verdict
+            ):
+                issues.append(
+                    f"Section {key}: verdict mismatch (analysis={analysis_verdict}, results={result_verdict})"
+                )
+
+    verdict = str(data.get("verdict") or "").strip().lower()
+    if verdict == "approved" and failed_critical:
+        issues.append("Model returned approved but critical sections did not pass")
+
+    issues = list(dict.fromkeys(issues))
+    approved = verdict == "approved" and not issues
+
+    revised_prompt = data.get("revised_prompt")
+    if approved:
+        revised_prompt = None
+    elif not isinstance(revised_prompt, str) or not revised_prompt.strip():
+        revised_prompt = None
+    else:
+        revised_prompt = revised_prompt.strip()
+
+    return approved, issues, revised_prompt
 
 
 def log_section_analysis(
@@ -205,7 +294,8 @@ def evaluate_generation(
         f'The last image is the AI-generated result produced using this prompt:\n\n"{prompt_used}"\n\n'
         "For every section: fill section_analysis (aspect → reference observation → "
         "generated observation → evaluation → verdict) then section_results. "
-        "section_analysis is required on approval and rejection."
+        "section_analysis is required on approval and rejection. "
+        "If ANY section_results value is fail, verdict MUST be rejected."
     )
 
     response = client.models.generate_content(
@@ -219,31 +309,83 @@ def evaluate_generation(
     )
 
     data = _parse_json_response(response.text)
-    issues: list[str] = data.get("issues") or []
-    section_results = data.get("section_results") or {}
-    failed_sections = [
-        key for key in _EVAL_CRITICAL_SECTIONS
-        if not _eval_section_passes(section_results.get(key))
-    ]
-    if failed_sections:
-        issues = [
-            *issues,
-            f"Critical QC sections failed or missing: {', '.join(failed_sections)}",
-        ]
-
-    approved = data.get("verdict") == "approved" and not issues
-    revised_prompt = data.get("revised_prompt") if not approved else None
+    approved, issues, revised_prompt = finalize_evaluation(data)
 
     print(f"[Evaluator] verdict={data.get('verdict')}  reason={data.get('reason')}")
     log_section_analysis(
         data.get("section_analysis"),
-        section_results,
+        data.get("section_results") or {},
         prefix="[Evaluator]",
     )
     if issues:
         print(f"[Evaluator] issues: {issues}")
     if revised_prompt:
         print(f"[Evaluator] revised_prompt (first 400 chars):\n{revised_prompt[:400]}\n")
+
+    return approved, revised_prompt, issues
+
+
+def evaluate_generation_multi(
+    images: list[Image.Image],
+    labels: list[str],
+    generated: Image.Image,
+    prompt_used: str,
+    *,
+    user_space_index: int,
+    design_direction_index: int | None = None,
+    product_indices: list[int] | None = None,
+) -> tuple[bool, str | None, list[str]]:
+    """Evaluate a generation against user space, design direction, and product references."""
+    prompt_loader.ensure_prompts_loaded()
+    client = get_gemini_client()
+
+    product_indices = product_indices or []
+    role_lines = []
+    for i, label in enumerate(labels):
+        img_num = i + 1
+        if i == user_space_index:
+            role_lines.append(f'Image {img_num}: user\'s outdoor space — "{label}"')
+        elif design_direction_index is not None and i == design_direction_index:
+            role_lines.append(f'Image {img_num}: Ducon design direction — "{label}"')
+        elif i in product_indices:
+            role_lines.append(f'Image {img_num}: Ducon product reference — "{label}"')
+        else:
+            role_lines.append(f'Image {img_num}: Ducon catalog reference — "{label}"')
+
+    context = (
+        "Input image roles:\n"
+        + "\n".join(f"- {line}" for line in role_lines)
+        + f"\n\nThe last image is the AI-generated result produced using this prompt:\n\n\"{prompt_used}\"\n\n"
+        "Evaluate against ALL input images. For B4_product_integration: check EACH product "
+        "reference image separately (mark N/A only if no product images). "
+        "For every section: fill section_analysis then section_results. "
+        "If ANY section_results value is fail, verdict MUST be rejected."
+    )
+
+    contents = [*images, generated, context]
+    response = client.models.generate_content(
+        model=PROMPT_GEN_MODEL,
+        contents=contents,
+        config=GenerateContentConfig(
+            system_instruction=prompt_loader.EVAL_SYSTEM_INSTRUCTION,
+            response_mime_type="application/json",
+            thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
+        ),
+    )
+
+    data = _parse_json_response(response.text)
+    approved, issues, revised_prompt = finalize_evaluation(data)
+
+    print(f"[EvaluatorMulti] verdict={data.get('verdict')}  reason={data.get('reason')}")
+    log_section_analysis(
+        data.get("section_analysis"),
+        data.get("section_results") or {},
+        prefix="[EvaluatorMulti]",
+    )
+    if issues:
+        print(f"[EvaluatorMulti] issues: {issues}")
+    if revised_prompt:
+        print(f"[EvaluatorMulti] revised_prompt (first 400 chars):\n{revised_prompt[:400]}\n")
 
     return approved, revised_prompt, issues
 

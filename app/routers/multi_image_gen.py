@@ -73,11 +73,13 @@ Agent source convention (chat tool call → frontend resolution)
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from typing import List, Optional
+from typing import AsyncIterator, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
@@ -98,8 +100,70 @@ _VALID_TYPES    = {"catalog_id", "catalog_name", "generation_id", "url", "file"}
 _VALID_MODELS   = {"pro", "flash"}
 _VALID_RATIOS   = {"1:1", "4:3", "3:4", "16:9", "9:16"}
 
+_GEN_SSE_HEADERS = {
+    "Cache-Control":     "no-cache",
+    "Connection":        "keep-alive",
+    "Content-Encoding":  "identity",
+    "X-Accel-Buffering": "no",  # disable nginx / Cloudflare buffering
+}
+_KEEPALIVE_INTERVAL = 10.0  # seconds — well under Cloudflare's 100 s idle timeout
+
+
+async def _stream_generation(descriptors, prompt, model, aspect_ratio, user_id, db) -> AsyncIterator[str]:
+    """
+    SSE generator that runs generate_multi_image in a background task and
+    emits `: keepalive` comments every 10 s while waiting, so Cloudflare
+    (Tunnel or CDN) never sees an idle connection and drops it at 100 s.
+
+    Events:
+      data: {"type": "status",  "message": "..."}   — informational, safe to ignore
+      data: {"type": "done",    "id": ..., ...}      — success; same shape as old JSON response
+      data: {"type": "error",   "message": "..."}    — failure; client should throw
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def worker():
+        try:
+            result = await generate_multi_image(
+                user_id=user_id,
+                prompt=prompt,
+                descriptors=descriptors,
+                model=model,
+                aspect_ratio=aspect_ratio or None,
+                db=db,
+            )
+            await queue.put(("done", result))
+        except (ValueError, RuntimeError) as exc:
+            await queue.put(("error", str(exc)))
+        except Exception as exc:
+            logger.exception("[MultiImageGen] Unexpected error in generation worker")
+            await queue.put(("error", f"Unexpected error: {exc}"))
+
+    task = asyncio.create_task(worker())
+    try:
+        # Emit an initial status so the client knows work started
+        yield f"data: {json.dumps({'type': 'status', 'message': 'Generation started'})}\n\n"
+
+        while True:
+            try:
+                event_type, payload = await asyncio.wait_for(
+                    queue.get(), timeout=_KEEPALIVE_INTERVAL
+                )
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+
+            if event_type == "done":
+                yield f"data: {json.dumps({'type': 'done', **payload})}\n\n"
+            else:
+                yield f"data: {json.dumps({'type': 'error', 'message': payload})}\n\n"
+            break
+    finally:
+        await task
+
 
 @router.post("")
+@router.post("/")
 async def create_multi_image_generation(
     prompt: str = Form(..., description="Full task prompt for the generation model."),
     images_meta: Optional[str] = Form(
@@ -238,26 +302,19 @@ async def create_multi_image_generation(
                 source=entry["source"],
             ))
 
-    # ── Generate ──────────────────────────────────────────────────────────────
-    try:
-        result = await generate_multi_image(
-            user_id=current_user.id,
-            prompt=prompt,
+    # ── Generate (SSE so keepalive pings prevent Cloudflare proxy timeouts) ───
+    return StreamingResponse(
+        _stream_generation(
             descriptors=descriptors,
+            prompt=prompt,
             model=model,
-            aspect_ratio=aspect_ratio or None,
+            aspect_ratio=aspect_ratio,
+            user_id=current_user.id,
             db=db,
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    except RuntimeError as exc:
-        logger.error("[MultiImageGen] Generation failed: %s", exc)
-        raise HTTPException(status_code=502, detail=f"Image generation failed: {exc}")
-    except Exception as exc:
-        logger.exception("[MultiImageGen] Unexpected error")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {exc}")
-
-    return result
+        ),
+        media_type="text/event-stream",
+        headers=_GEN_SSE_HEADERS,
+    )
 
 
 def _normalize_meta_entry(entry: dict) -> dict:

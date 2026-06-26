@@ -435,8 +435,33 @@ def _format_sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _normalize_picker(data: dict) -> dict:
+    """Support single or multi (OR) picker payloads from the studio wizard."""
+    if not isinstance(data, dict):
+        return {}
+    selections = data.get("selections")
+    if isinstance(selections, list) and selections:
+        labels = [
+            s.get("label") for s in selections
+            if isinstance(s, dict) and s.get("label")
+        ]
+        tokens: list[str] = []
+        for s in selections:
+            if isinstance(s, dict):
+                tokens.extend(s.get("tokens") or [])
+        out = dict(data)
+        out["label"] = " · ".join(labels) if labels else data.get("label", "")
+        out["labels"] = labels
+        out["tokens"] = list(dict.fromkeys(tokens))
+        out["mode"] = data.get("mode") or "or"
+        return out
+    return data
+
+
 def _subtitle_base(space: dict, style: dict) -> str:
-    return " · ".join(x for x in (space.get("label"), style.get("label")) if x)
+    space_labels = space.get("labels") or ([space.get("label")] if space.get("label") else [])
+    style_labels = style.get("labels") or ([style.get("label")] if style.get("label") else [])
+    return " · ".join(x for x in [*space_labels, *style_labels] if x)
 
 
 def _direction_image_url(direction: dict[str, Any]) -> str:
@@ -485,7 +510,7 @@ def _fallback_directions(session: StudioDirectionsSession, space: dict, style: d
     """Deterministic fallback if the agent does not submit in time."""
     pool = list(session.candidate_pool.values())
     pool.sort(key=lambda r: (0 if (r.get("level") or "").lower() == "design" else 1, r.get("name") or ""))
-    subtitle_base = " · ".join(x for x in (space.get("label"), style.get("label")) if x)
+    subtitle_base = _subtitle_base(space, style)
     titles = [
         "Primary match", "Alternative look", "Bold option", "Refined layout",
         "Open plan", "Statement entry", "Warm palette", "High contrast", "Resort feel",
@@ -512,15 +537,35 @@ EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 def _build_presearch_queries(space: dict, style: dict) -> list[str]:
-    """Build diverse pre-search queries from the user's space + style selections."""
-    s = (space.get("label") or "outdoor space").strip()
-    st = (style.get("label") or "").strip()
-    # Three angles: direct match, brand/luxury, and finished-project focus.
-    return [
-        f"{st} {s}".strip(),
-        f"Ducon luxury {s} outdoor {st} design".strip(),
-        f"{st} {s} premium landscaping finished project outdoor living".strip(),
+    """Build diverse pre-search queries from the user's space + style selections (OR)."""
+    spaces = space.get("selections") or ([space] if space.get("label") else [])
+    styles = style.get("selections") or ([style] if style.get("label") else [])
+    if not spaces:
+        spaces = [{"label": "outdoor space"}]
+    if not styles:
+        styles = [{"label": ""}]
+
+    queries: list[str] = []
+    for st in styles[:3]:
+        for sp in spaces[:3]:
+            s = (sp.get("label") or "outdoor space").strip()
+            st_l = (st.get("label") or "").strip()
+            q = f"{st_l} {s}".strip()
+            if q and q not in queries:
+                queries.append(q)
+
+    s0 = (spaces[0].get("label") or "outdoor space").strip()
+    st0 = (styles[0].get("label") or "").strip()
+    extras = [
+        f"Ducon luxury {s0} outdoor {st0} design".strip(),
+        f"{st0} {s0} premium landscaping finished project outdoor living".strip(),
     ]
+    for e in extras:
+        if e and e not in queries:
+            queries.append(e)
+        if len(queries) >= 3:
+            break
+    return queries[:3]
 
 
 async def _presearch_candidates(
@@ -606,6 +651,8 @@ async def curate_studio_directions(
         f"[StudioDirections] model={model_id!r} thinking={thinking_label!r}"
     )
     session = StudioDirectionsSession()
+    space = _normalize_picker(space)
+    style = _normalize_picker(style)
 
     # Normalize user image once — raw uploads can be 5–12 MB from phone cameras.
     # This reduces upload size for every Gemini embedding and generate call.
@@ -863,10 +910,17 @@ async def stream_studio_directions_events(
         finally:
             await queue.put(None)
 
+    KEEPALIVE_INTERVAL = 15.0  # seconds — resets Cloudflare's 100 s idle timeout
+
     task = asyncio.create_task(worker())
     try:
         while True:
-            item = await queue.get()
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_INTERVAL)
+            except asyncio.TimeoutError:
+                # Send an SSE comment — ignored by clients, resets proxy idle timers
+                yield ": keepalive\n\n"
+                continue
             if item is None:
                 break
             yield _format_sse(item)
@@ -876,9 +930,21 @@ async def stream_studio_directions_events(
 
 
 def build_legacy_query(space: dict, style: dict) -> str:
+    spaces = space.get("selections") or ([space] if space.get("label") else [])
+    styles = style.get("selections") or ([style] if style.get("label") else [])
+    space_part = ""
+    if spaces:
+        labels = [str(s.get("label") or "").lower() for s in spaces if s.get("label")]
+        if labels:
+            space_part = f" for {' or '.join(f'a {l}' for l in labels)}"
+    style_part = ""
+    if styles:
+        labels = [str(s.get("label") or "").lower() for s in styles if s.get("label")]
+        if labels:
+            style_part = f" in {' or '.join(labels)} style"
     return (
         "Ducon premium outdoor living design inspiration"
-        + (f" for a {(space.get('label') or '').lower()}" if space.get("label") else "")
-        + (f" in {(style.get('label') or '').lower()} style" if style.get("label") else "")
+        + space_part
+        + style_part
         + ". Show finished landscape designs suitable for visualization on a user photo."
     )

@@ -59,6 +59,7 @@ from app.gemini import (
     get_gemini_client,
     verify_prompt,
     evaluate_generation,
+    evaluate_generation_multi,
     PROMPT_VERIFY_MAX_ROUNDS,
     GEN_EVAL_MAX_ROUNDS,
 )
@@ -108,7 +109,57 @@ def _is_user_space_label(label: str) -> bool:
         "uploaded space",
         "original space",
         "space photo",
+        "user upload",
+        "attached space",
+        "my space",
+        "site photo",
+        "room photo",
     ))
+
+
+def _is_design_direction_label(label: str) -> bool:
+    normalized = (label or "").strip().lower()
+    return any(token in normalized for token in (
+        "design direction",
+        "direction design",
+        "ducon design direction",
+        "ducon design",
+        "reference design",
+        "catalog reference",
+        "design reference",
+    ))
+
+
+def classify_image_roles(labels: list[str]) -> dict[str, int | list[int]] | None:
+    """
+    Map labels to user space, design direction, and product reference indices.
+    Studio order: [user space, design direction, product, product, ...]
+    """
+    if len(labels) < 2:
+        return None
+
+    user_idx = next((i for i, label in enumerate(labels) if _is_user_space_label(label)), None)
+    design_idx = next(
+        (i for i, label in enumerate(labels) if _is_design_direction_label(label)),
+        None,
+    )
+
+    if user_idx is None:
+        user_idx = len(labels) - 1
+
+    if design_idx is None:
+        design_idx = next((i for i in range(len(labels)) if i != user_idx), 0)
+
+    product_idxs = [
+        i for i in range(len(labels))
+        if i != user_idx and i != design_idx
+    ]
+
+    return {
+        "user_space_index": user_idx,
+        "design_direction_index": design_idx,
+        "product_indices": product_idxs,
+    }
 
 
 def _select_qc_roles(labels: list[str]) -> tuple[int, int] | None:
@@ -119,26 +170,17 @@ def _select_qc_roles(labels: list[str]) -> tuple[int, int] | None:
     multi-image calls often pass [Ducon ref, user space]. The evaluator needs
     explicit roles, not positional guesses.
     """
-    if len(labels) < 2:
+    roles = classify_image_roles(labels)
+    if roles is None:
         return None
-
-    user_idx = next((i for i, label in enumerate(labels) if _is_user_space_label(label)), None)
-    if user_idx is None:
-        # Legacy fallback used by older direct calls.
-        user_idx = len(labels) - 1
-
-    ref_idx = next((i for i in range(len(labels)) if i != user_idx), None)
-    if ref_idx is None:
-        return None
-    return ref_idx, user_idx
+    return roles["design_direction_index"], roles["user_space_index"]
 
 
 def _should_enhance_direct_prompt(prompt_session: Optional[DesignerPromptSession], labels: list[str]) -> bool:
-    """Direct chat/voice generations should use the proven prompt generator path."""
-    roles = _select_qc_roles(labels)
-    # The legacy prompt generator writes for exactly: image 1 = Ducon reference,
-    # image 2 = user space. Only use it when the direct call has that shape.
-    return prompt_session is None and len(labels) == 2 and roles == (0, 1)
+    """Direct chat/voice/studio generations should use the unified prompt generator path."""
+    if prompt_session is not None:
+        return False
+    return classify_image_roles(labels) is not None
 
 # ── Image descriptor ──────────────────────────────────────────────────────────
 
@@ -366,19 +408,25 @@ async def generate_multi_image(
     # user space before generation. Designer jobs already use DesignerPromptSession,
     # so only enhance direct calls here.
     active_prompt = prompt
-    direct_roles = _select_qc_roles(labels)
+    image_roles = classify_image_roles(labels)
     image_gen_agent: ImageGenAgent | None = None
-    if enable_verify and _should_enhance_direct_prompt(prompt_session, labels) and direct_roles:
-        ref_idx, user_idx = direct_roles
+    if enable_verify and _should_enhance_direct_prompt(prompt_session, labels) and image_roles:
+        user_idx = image_roles["user_space_index"]
+        design_idx = image_roles["design_direction_index"]
+        product_idxs = image_roles["product_indices"]
         image_gen_agent = ImageGenAgent(
-            image1_name=labels[ref_idx],
-            image2_name=None if _is_user_space_label(labels[user_idx]) else labels[user_idx],
-            image2_is_user_space=_is_user_space_label(labels[user_idx]),
+            image1_name=labels[design_idx],
+            image2_name=labels[user_idx],
+            image2_is_user_space=True,
+            labels=labels,
+            user_space_index=user_idx,
+            design_direction_index=design_idx,
+            product_indices=product_idxs,
         )
         try:
             active_prompt = await image_gen_agent.generate_initial_prompt(
-                image1=pil_images[ref_idx],
-                image2=pil_images[user_idx],
+                image1=pil_images[design_idx],
+                images=pil_images,
                 user_hint=prompt,
             )
         except Exception as exc:
@@ -422,6 +470,8 @@ async def generate_multi_image(
     max_rounds       = GEN_EVAL_MAX_ROUNDS if enable_verify else 1
 
     image_bytes: bytes | None = None
+    generation_approved = False   # track whether any round was approved
+
     for gen_round in range(max_rounds):
         image_bytes = await asyncio.to_thread(
             _run_generation_sync,
@@ -435,15 +485,33 @@ async def generate_multi_image(
         qc_roles = _select_qc_roles(labels)
         if not enable_verify or qc_roles is None:
             # Verification requires at least two input images to be meaningful.
+            generation_approved = True
             break
 
         try:
             generated_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
             ref_idx, user_idx = qc_roles
+
+            # ── Evaluate ──────────────────────────────────────────────────────
             if image_gen_agent is not None:
-                approved, revised_prompt, issues = await image_gen_agent.evaluate_output(
+                # Two-phase: evaluate (analyse failure) then generate (write new
+                # prompt) — both via the same stateful agent session so all prior
+                # context is available to the prompt-writing turn.
+                approved, issues = await image_gen_agent.evaluate_output(
                     generated=generated_pil,
                     gen_round=gen_round + 1,
+                )
+                revised_prompt = None  # will be produced by generate_retry_prompt below
+            elif image_roles and len(pil_images) > 2:
+                approved, revised_prompt, issues = await asyncio.to_thread(
+                    evaluate_generation_multi,
+                    pil_images,
+                    labels,
+                    generated_pil,
+                    active_prompt,
+                    user_space_index=image_roles["user_space_index"],
+                    design_direction_index=image_roles["design_direction_index"],
+                    product_indices=image_roles["product_indices"],
                 )
             else:
                 approved, revised_prompt, issues = await asyncio.to_thread(
@@ -455,61 +523,90 @@ async def generate_multi_image(
                     labels[ref_idx],
                     labels[user_idx],
                 )
+
+            # ── Approved ──────────────────────────────────────────────────────
             if approved:
+                generation_approved = True
                 logger.info("[MultiImageGen] Generation approved on round %d", gen_round + 1)
                 if image_gen_agent is not None:
                     image_gen_agent.schedule_post_success_improvement()
                 break
-            if gen_round + 1 < max_rounds:
-                logger.info(
-                    "[MultiImageGen] Generation rejected on round %d (%d issues) — retrying",
-                    gen_round + 1, len(issues),
-                )
-                _dbg("[MULTI_IMAGE ▶ EVAL ISSUES]", issues)
-                if image_gen_agent is not None and revised_prompt:
-                    next_prompt = revised_prompt
-                elif prompt_session is not None:
-                    next_prompt = await prompt_session.revise_from_qc(
-                        {
-                            "verdict": "rejected",
-                            "issues": issues,
-                            "passed": False,
-                        },
-                        context_label=f"Inner generation QC round {gen_round + 1}",
-                    )
-                elif revised_prompt:
-                    next_prompt = revised_prompt
-                else:
-                    logger.info(
-                        "[MultiImageGen] Generation rejected on round %d — "
-                        "no revised prompt available, keeping output",
-                        gen_round + 1,
-                    )
-                    break
 
-                if image_gen_agent is None:
-                    for vround in range(PROMPT_VERIFY_MAX_ROUNDS):
-                        try:
-                            v_p, _, v_imp = await asyncio.to_thread(
-                                verify_prompt, pil_images, labels, next_prompt
-                            )
-                            if v_p or not v_imp:
-                                break
-                            next_prompt = v_imp
-                        except Exception as ve:
-                            logger.warning("[MultiImageGen] Re-verify skipped (round %d): %s", vround + 1, ve)
-                            break
-                active_prompt = next_prompt
-                if prompt_session is not None:
-                    prompt_session.last_prompt = active_prompt
-            else:
-                logger.info(
-                    "[MultiImageGen] Generation rejected on round %d — max rounds reached, keeping output",
+            # ── Rejected ─────────────────────────────────────────────────────
+            if gen_round + 1 >= max_rounds:
+                # All rounds exhausted — refuse to return a rejected image.
+                logger.warning(
+                    "[MultiImageGen] Generation rejected on final round %d — "
+                    "refusing to return rejected output",
                     gen_round + 1,
                 )
-                break
+                raise RuntimeError(
+                    f"Image generation quality check failed after {max_rounds} attempt(s). "
+                    "Please try rephrasing your request or using different reference images."
+                )
+
+            logger.info(
+                "[MultiImageGen] Generation rejected on round %d (%d issues) — retrying",
+                gen_round + 1, len(issues),
+            )
+            _dbg("[MULTI_IMAGE ▶ EVAL ISSUES]", issues)
+
+            # ── Generate improved prompt ───────────────────────────────────
+            if image_gen_agent is not None:
+                # Dedicated prompt-writing turn: agent uses its own evaluation
+                # analysis (already in conversation history) to write a better prompt.
+                next_prompt = await image_gen_agent.generate_retry_prompt(
+                    gen_round=gen_round + 1,
+                    issues=issues,
+                )
+            elif prompt_session is not None:
+                next_prompt = await prompt_session.revise_from_qc(
+                    {
+                        "verdict": "rejected",
+                        "issues": issues,
+                        "passed": False,
+                    },
+                    context_label=f"Inner generation QC round {gen_round + 1}",
+                )
+            elif revised_prompt:
+                next_prompt = revised_prompt
+            else:
+                logger.info(
+                    "[MultiImageGen] Generation rejected on round %d — "
+                    "no revised prompt available, skipping remaining retries",
+                    gen_round + 1,
+                )
+                raise RuntimeError(
+                    f"Image generation quality check failed after {gen_round + 1} attempt(s) "
+                    "and no improved prompt could be produced."
+                )
+
+            # Verify the new prompt against the inputs (non-agent path only)
+            if image_gen_agent is None:
+                for vround in range(PROMPT_VERIFY_MAX_ROUNDS):
+                    try:
+                        v_p, _, v_imp = await asyncio.to_thread(
+                            verify_prompt, pil_images, labels, next_prompt
+                        )
+                        if v_p or not v_imp:
+                            break
+                        next_prompt = v_imp
+                    except Exception as ve:
+                        logger.warning("[MultiImageGen] Re-verify skipped (round %d): %s", vround + 1, ve)
+                        break
+
+            active_prompt = next_prompt
+            if prompt_session is not None:
+                prompt_session.last_prompt = active_prompt
+
+        except RuntimeError:
+            raise
         except Exception as ev:
+            # Evaluation or prompt-generation itself errored — log and use the
+            # current image as-is (best-effort; avoids losing a good generation
+            # due to QC infrastructure failure).
             logger.warning("[MultiImageGen] Post-gen evaluation failed (round %d): %s", gen_round + 1, ev)
+            generation_approved = True
             if prompt_session is not None:
                 raise RuntimeError(f"Post-generation QC failed: {ev}") from ev
             break

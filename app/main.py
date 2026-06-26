@@ -2,6 +2,7 @@ from fastapi import FastAPI, Request, UploadFile, File, Form, Depends, HTTPExcep
 from contextlib import asynccontextmanager
 from . import chromadb
 from app.ml import GeminiEmbeddingModel
+import asyncio
 import io
 import json
 import os
@@ -198,6 +199,7 @@ async def studio_directions(
 
 
 @app.post("/autogenerate-images")
+@app.post("/autogenerate-images/")
 async def auto_generate_images(
     request: Request,
     image_id: Optional[int] = Form(None),
@@ -281,110 +283,116 @@ async def auto_generate_images(
         user_img = await _load_ducon_image(second_db_image)
         second_image_name = second_db_image.name or second_db_image.filename
 
-    # ── Step 1: Build Nano Banana prompt ─────────────────────────────────────
-    # enhance_prompt=True (default): unified ImageGenAgent writes prompt + evaluates retries.
-    # enhance_prompt=False: skip agent, use user prompt directly.
-    image_gen_agent: ImageGenAgent | None = None
-    if enhance_prompt:
-        image_gen_agent = ImageGenAgent(
-            image1_name=ducon_image_name,
-            image2_name=second_image_name,
-            image2_is_user_space=second_image_name is None,
-        )
-        prompt = await image_gen_agent.generate_initial_prompt(
-            image1=ducon_image,
-            image2=user_img,
-            image1_metadata=_get_image_metadata(ducon_db_image.filename) if (ducon_db_image and use_image_info) else None,
-            image2_metadata=_get_image_metadata(second_db_image.filename) if (second_db_image and use_image_info) else None,
-            user_hint=prompt or None,
-        )
-    else:
-        if not prompt:
-            raise HTTPException(
-                status_code=422,
-                detail="A prompt is required when enhance_prompt is disabled.",
+    async def run_generation() -> dict:
+        # ── Step 1: Build Nano Banana prompt ─────────────────────────────────
+        # enhance_prompt=True (default): unified ImageGenAgent writes prompt + evaluates retries.
+        # enhance_prompt=False: skip agent, use user prompt directly.
+        active_prompt = prompt
+        image_gen_agent: ImageGenAgent | None = None
+        if enhance_prompt:
+            image_gen_agent = ImageGenAgent(
+                image1_name=ducon_image_name,
+                image2_name=second_image_name,
+                image2_is_user_space=second_image_name is None,
+            )
+            active_prompt = await image_gen_agent.generate_initial_prompt(
+                image1=ducon_image,
+                image2=user_img,
+                image1_metadata=_get_image_metadata(ducon_db_image.filename) if (ducon_db_image and use_image_info) else None,
+                image2_metadata=_get_image_metadata(second_db_image.filename) if (second_db_image and use_image_info) else None,
+                user_hint=prompt or None,
+            )
+        else:
+            if not active_prompt:
+                raise HTTPException(
+                    status_code=422,
+                    detail="A prompt is required when prompt enhancement is off.",
+                )
+
+        # ── Step 2: Generation + post-evaluation loop ─────────────────────────
+        ducon_stem = ducon_db_image.filename if ducon_db_image else "reference"
+        generation_filename = f"{ducon_stem}_{uuid.uuid4()}.png"
+
+        if is_guest:
+            subfolder = f"guests/{raw_session_id}"
+        else:
+            subfolder = str(current_user.id)
+
+        local_output = Path("outputs") / subfolder / generation_filename
+        max_gen_rounds = gemini.GEN_EVAL_MAX_ROUNDS if enhance_prompt else 1
+
+        for gen_round in range(max_gen_rounds):
+            # gemini.combine_images is blocking. Run it off the event loop so
+            # SSE keepalives can continue while Cloudflare Tunnel is waiting.
+            await asyncio.to_thread(
+                gemini.combine_images,
+                generation_filename,
+                ducon_image,
+                user_img,
+                prompt=active_prompt,
+                subfolder=subfolder,
             )
 
-    # ── Step 2: Generation + post-evaluation loop ─────────────────────────────
-    # ImageGenAgent writes the prompt, Nano Banana generates, same agent evaluates.
-    # On rejection: agent revises prompt (with Nano Banana behaviour analysis) and retries.
-    ducon_stem = ducon_db_image.filename if ducon_db_image else "reference"
-    generation_filename = f"{ducon_stem}_{uuid.uuid4()}.png"
+            if not enhance_prompt:
+                break
 
-    if is_guest:
-        subfolder = f"guests/{raw_session_id}"
-    else:
-        subfolder = str(current_user.id)
+            try:
+                generated_img = Image.open(local_output)
+                approved, issues = await image_gen_agent.evaluate_output(
+                    generated=generated_img,
+                    gen_round=gen_round + 1,
+                )
+                if approved:
+                    print(f"[ImageGenAgent] Approved on generation round {gen_round + 1}")
+                    image_gen_agent.schedule_post_success_improvement()
+                    break
+                if gen_round + 1 < max_gen_rounds:
+                    print(
+                        f"[ImageGenAgent] Rejected on round {gen_round + 1} "
+                        f"({len(issues)} issue(s)) — requesting improved prompt"
+                    )
+                    active_prompt = await image_gen_agent.generate_retry_prompt(
+                        gen_round=gen_round + 1,
+                        issues=issues,
+                    )
+                else:
+                    print(
+                        f"[ImageGenAgent] Rejected on round {gen_round + 1} — "
+                        f"max rounds reached, keeping last output"
+                    )
+                    break
+            except Exception as e:
+                # Evaluation failure must not block the response — proceed with current image
+                print(f"[ImageGenAgent] Skipped on generation round {gen_round + 1} due to error: {e}")
+                break
 
-    local_output = Path("outputs") / subfolder / generation_filename
-    max_gen_rounds = gemini.GEN_EVAL_MAX_ROUNDS if enhance_prompt else 1
+        # ── Step 3: Persist & respond ─────────────────────────────────────────
+        if is_guest:
+            stored_key = storage.save_guest_generation(raw_session_id, generation_filename)
+            expires_at = datetime.now(timezone.utc) + timedelta(hours=48)
 
-    for gen_round in range(max_gen_rounds):
-        gemini.combine_images(
-            generation_filename,
-            ducon_image,
-            user_img,
-            prompt=prompt,
-            subfolder=subfolder,
-        )
-
-        if not enhance_prompt:
-            break  # no evaluation when prompt enhancement is disabled
-
-        try:
-            generated_img = Image.open(local_output)
-            approved, revised_prompt, issues = await image_gen_agent.evaluate_output(
-                generated=generated_img,
-                gen_round=gen_round + 1,
+            db_generation = GuestGeneration(
+                guest_session_id=raw_session_id,
+                generation_name=generation_filename,
+                url=stored_key,
+                ducon_image_id=ducon_db_image.id if ducon_db_image else None,
+                expires_at=expires_at,
             )
-            if approved:
-                print(f"[ImageGenAgent] Approved on generation round {gen_round + 1}")
-                image_gen_agent.schedule_post_success_improvement()
-                break
-            if revised_prompt and gen_round + 1 < max_gen_rounds:
-                print(
-                    f"[ImageGenAgent] Rejected on round {gen_round + 1} "
-                    f"({len(issues)} issue(s)) — regenerating with revised prompt"
-                )
-                prompt = revised_prompt
-            else:
-                print(
-                    f"[ImageGenAgent] Rejected on round {gen_round + 1} — "
-                    f"no revised prompt available or max rounds reached, keeping last output"
-                )
-                break
-        except Exception as e:
-            # Evaluation failure must not block the response — proceed with current image
-            print(f"[ImageGenAgent] Skipped on generation round {gen_round + 1} due to error: {e}")
-            break
+            db.add(db_generation)
+            await increment_guest_count(db, guest_session)
+            await log_guest_consent(db, raw_session_id, client_ip)
+            await db.flush()
+            await db.commit()
 
-    # ── Step 3: Persist & respond ─────────────────────────────────────────────
-    if is_guest:
-        stored_key = storage.save_guest_generation(raw_session_id, generation_filename)
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=48)
+            signed_url = storage.get_guest_generation_url(db_generation.id, stored_key)
+            return {
+                "id": db_generation.id,
+                "generation_name": generation_filename,
+                "signed_url": signed_url,
+                "ducon_image_id": ducon_db_image.id if ducon_db_image else None,
+                "expires_at": expires_at.isoformat(),
+            }
 
-        db_generation = GuestGeneration(
-            guest_session_id=raw_session_id,
-            generation_name=generation_filename,
-            url=stored_key,
-            ducon_image_id=ducon_db_image.id if ducon_db_image else None,
-            expires_at=expires_at,
-        )
-        db.add(db_generation)
-        await increment_guest_count(db, guest_session)
-        await log_guest_consent(db, raw_session_id, client_ip)
-        await db.flush()
-        await db.commit()
-
-        signed_url = storage.get_guest_generation_url(db_generation.id, stored_key)
-        return {
-            "id": db_generation.id,
-            "generation_name": generation_filename,
-            "signed_url": signed_url,
-            "ducon_image_id": ducon_db_image.id if ducon_db_image else None,
-            "expires_at": expires_at.isoformat(),
-        }
-    else:
         stored_key = storage.save_generation(current_user.id, generation_filename)
 
         db_generation = Generation(
@@ -405,6 +413,43 @@ async def auto_generate_images(
             "signed_url": signed_url,
             "ducon_image_id": ducon_db_image.id if ducon_db_image else None,
         }
+
+    async def stream_autogeneration():
+        queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
+
+        async def worker():
+            try:
+                result = await run_generation()
+                await queue.put(("done", result))
+            except HTTPException as exc:
+                await queue.put(("error", exc.detail or "Generation failed."))
+            except Exception as exc:
+                print(f"[AutoGenerate] stream error: {exc}")
+                await queue.put(("error", str(exc) or "Generation failed."))
+
+        task = asyncio.create_task(worker())
+        try:
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Generation started'})}\n\n"
+            while True:
+                try:
+                    event_type, payload = await asyncio.wait_for(queue.get(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+
+                if event_type == "done":
+                    yield f"data: {json.dumps({'type': 'done', **payload})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'error', 'message': payload})}\n\n"
+                break
+        finally:
+            await task
+
+    return StreamingResponse(
+        stream_autogeneration(),
+        media_type="text/event-stream",
+        headers=_STUDIO_SSE_HEADERS,
+    )
 
 
 def main():
