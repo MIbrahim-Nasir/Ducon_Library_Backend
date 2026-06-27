@@ -134,6 +134,19 @@ PROMPT_VERIFY_MAX_ROUNDS=2
 # Keep OFF in prod — auto-learn can rewrite/degrade the system prompt.
 IMAGE_GEN_AGENT_AUTO_LEARN=false
 
+# ─── Claude (Anthropic) provider — optional ──────────────────
+# USE_CLAUDE=true routes the TEXT-reasoning agents (chat agent, image-gen prompt
+# writer + verifier + QC evaluator, designer job agent) through Claude instead of
+# Gemini. Gemini is ALWAYS kept for AI search/embeddings, the voice agent (Live),
+# the Studio directions agent, and the image-generation models (Nano Banana).
+# Requires the `anthropic` package (already in requirements.txt) + an API key.
+USE_CLAUDE=false
+ANTHROPIC_API_KEY=your_anthropic_api_key   # required only when USE_CLAUDE=true
+CLAUDE_MODEL=claude-sonnet-4-6
+CLAUDE_THINKING=adaptive                    # adaptive(high) | off | <int budget_tokens>
+CLAUDE_MAX_TOKENS=16000
+CLAUDE_CHAT_MAX_MESSAGES=60
+
 # ─── Guest limits / bot protection ───────────────────────────
 GUEST_GEN_LIMIT=3
 GUEST_IP_GEN_LIMIT=6
@@ -414,6 +427,7 @@ should move from **connecting → listening** within a couple of seconds.
 
 - [ ] `GOOGLE_API_KEY`, `JWT_SECRET_KEY`, `DATABASE_URL` set in backend `.env`
 - [ ] `IMAGE_GEN_AGENT_AUTO_LEARN=false`
+- [ ] If `USE_CLAUDE=true`: `ANTHROPIC_API_KEY` set and `anthropic` installed (`pip install -r requirements.txt`)
 - [ ] `outputs/`, `chroma_db/`, `data/images/` exist and are writable
 - [ ] `uvicorn[standard]` installed (WebSocket support)
 - [ ] systemd service running with `--timeout 0`

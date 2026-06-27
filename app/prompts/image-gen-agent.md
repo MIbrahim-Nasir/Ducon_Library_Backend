@@ -236,19 +236,39 @@ mark it `"na"` — do not invent failures.
 - Approve only if the result satisfies the main objective and all of A1–E5 pass
   or are genuinely `na`.
 
-### INPUT PHOTO QUALITY ASSESSMENT (always include — never affects the verdict)
+### INPUT SUITABILITY & QUALITY ASSESSMENT (always include — never affects the verdict)
 
-Separately judge the **user's space photo** (the input, NOT the generated result)
-for capture problems that limit how good ANY visualization can be:
+Separately judge the **user's space photo** (an INPUT, NOT the generated result)
+on TWO dimensions:
+
+**(a) Capture quality** — problems that limit how good ANY visualization can be:
 - heavy **tilt** / non-level horizon,
 - severe **crop** or only a partial view of the space,
 - **obstructed** view (cars, clutter, people, heavy shadow covering key zones),
 - **extreme angle** (too low, too high, or oblique so zones are barely visible),
 - **low resolution / blur / poor exposure**.
 
-This is informational guidance for the user — it must NOT change `verdict` or any
-`section_results`. If the photo is fine, return `"ok": true`. If not, list concrete
-issues and a short, friendly `user_message` they can act on.
+**(b) Suitability for the selected design** — whether the user's space is a sensible
+target for the chosen **design direction** and **products**:
+- the **space type does not match** the selected design (e.g. an indoor room or a
+  balcony chosen for an expansive garden/pool-deck design, or vice-versa),
+- there is **no eligible area** in the photo to apply the selected materials/products
+  (e.g. no ground/paving visible, or the usable zone is tiny / off-frame),
+- the selected **products don't fit** the space (e.g. a large pergola/fountain with
+  no plausible place to sit in the captured area),
+- the scene is **fundamentally unsuited** to the request (not an outdoor space at all,
+  fully enclosed, or the relevant surfaces aren't shown).
+
+Set `"ok": false` if EITHER dimension is problematic. Use `severity` "major" for
+suitability/mismatch problems and severe capture issues, "minor" for mild capture
+issues. List concrete `issues` and write a short, friendly, actionable `user_message`
+(e.g. "Your photo looks like an indoor room, but you chose a garden design — upload a
+photo of the outdoor area you want transformed.").
+
+This is informational guidance for the user ONLY — it must NOT change `verdict` or any
+`section_results`, and you must still evaluate and (when possible) approve the
+generation on its own merits. If the input is both well-captured and suitable, return
+`"ok": true`.
 
 ---
 

@@ -18,6 +18,7 @@ from google.genai.types import Content, GenerateContentConfig, Part, ThinkingCon
 
 from app.gemini import get_gemini_client, PROMPT_GEN_MODEL, _PROMPT_THINKING_LEVEL
 from app import prompt_loader
+from app import llm_provider
 
 
 def _strip_prompt_fences(text: str) -> str:
@@ -43,8 +44,27 @@ class DesignerPromptSession:
 
     def __init__(self) -> None:
         self._conversation: list[Content] = []
+        # Parallel transcript used when USE_CLAUDE is enabled.
+        self._claude_messages: list[dict] = []
         self.last_prompt: str = ""
         self.revision_count: int = 0
+
+    def _append_user_turn(self, pil_images: list[Image.Image], text: str) -> None:
+        if llm_provider.use_claude():
+            blocks = [llm_provider.pil_image_block(img) for img in pil_images]
+            blocks.append(llm_provider.text_block(text))
+            self._claude_messages.append({"role": "user", "content": blocks})
+        else:
+            parts: list[Part] = [_pil_part(img) for img in pil_images] + [Part(text=text)]
+            self._conversation.append(Content(role="user", parts=parts))
+
+    def _append_model_turn(self, text: str) -> None:
+        if llm_provider.use_claude():
+            self._claude_messages.append(
+                {"role": "assistant", "content": [llm_provider.text_block(text)]}
+            )
+        else:
+            self._conversation.append(Content(role="model", parts=[Part(text=text)]))
 
     async def generate_initial(
         self,
@@ -83,9 +103,7 @@ camera lock, fixed-structure preservation, zone mapping, direct visual reference
 for complex patterns, no creative licence, and photorealistic close.
 """.strip()
 
-        parts: list[Part] = [_pil_part(img) for img in images]
-        parts.append(Part(text=user_text))
-        self._conversation.append(Content(role="user", parts=parts))
+        self._append_user_turn(list(images), user_text)
         return await self._complete_turn()
 
     async def revise_from_qc(
@@ -126,7 +144,7 @@ Stateless QC feedback (treat as ground truth for what failed):
 Revise your prompt to fix every failed criterion. Keep what worked. Return the full new prompt.
 """.strip()
 
-        self._conversation.append(Content(role="user", parts=[Part(text=user_text)]))
+        self._append_user_turn([], user_text)
         return await self._complete_turn()
 
     def record_external_revision(self, prompt: str, *, source: str, issues: Optional[list[str]] = None) -> None:
@@ -144,34 +162,39 @@ Revise your prompt to fix every failed criterion. Keep what worked. Return the f
             "issues": issues or [],
             "current_prompt": prompt,
         }
-        self._conversation.append(Content(
-            role="user",
-            parts=[Part(text=(
-                "A stateless quality gate revised the prompt before image generation. "
-                "Treat this as the current prompt state for future retries:\n"
-                f"{json.dumps(note, ensure_ascii=False)}"
-            ))],
+        self._append_user_turn([], (
+            "A stateless quality gate revised the prompt before image generation. "
+            "Treat this as the current prompt state for future retries:\n"
+            f"{json.dumps(note, ensure_ascii=False)}"
         ))
-        self._conversation.append(Content(role="model", parts=[Part(text=prompt)]))
+        self._append_model_turn(prompt)
         self.last_prompt = prompt
 
     async def _complete_turn(self) -> str:
         prompt_loader.ensure_prompts_loaded()
-        client = get_gemini_client()
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=PROMPT_GEN_MODEL,
-            contents=self._conversation,
-            config=GenerateContentConfig(
-                system_instruction=prompt_loader.DESIGNER_PROMPT_WRITER_SYSTEM,
-                thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
-            ),
-        )
-        text = _strip_prompt_fences(response.text or "")
+        if llm_provider.use_claude():
+            msg = await llm_provider.acomplete_message(
+                system=prompt_loader.DESIGNER_PROMPT_WRITER_SYSTEM,
+                messages=self._claude_messages,
+                thinking=True,
+            )
+            text = _strip_prompt_fences(llm_provider.extract_text(msg))
+        else:
+            client = get_gemini_client()
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=PROMPT_GEN_MODEL,
+                contents=self._conversation,
+                config=GenerateContentConfig(
+                    system_instruction=prompt_loader.DESIGNER_PROMPT_WRITER_SYSTEM,
+                    thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
+                ),
+            )
+            text = _strip_prompt_fences(response.text or "")
         if not text:
             raise RuntimeError("Prompt generator returned empty text.")
 
-        self._conversation.append(Content(role="model", parts=[Part(text=text)]))
+        self._append_model_turn(text)
         self.last_prompt = text
         self.revision_count += 1
         return text

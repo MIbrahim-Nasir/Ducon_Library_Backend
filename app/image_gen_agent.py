@@ -28,6 +28,7 @@ from app.gemini import (
     log_section_analysis,
 )
 from app import prompt_loader
+from app import llm_provider
 
 # Auto-learn rewrites image-gen-agent.md after successful (post-retry) runs.
 # It is OFF by default: an unconstrained "improve your own system prompt" loop
@@ -70,6 +71,8 @@ class ImageGenAgent:
         product_indices: list[int] | None = None,
     ) -> None:
         self._conversation: list[Content] = []
+        # Parallel transcript used when USE_CLAUDE is enabled (Anthropic messages).
+        self._claude_messages: list[dict] = []
         self.last_prompt: str = ""
         self.image1_name = image1_name
         self.image2_name = image2_name
@@ -150,6 +153,33 @@ class ImageGenAgent:
         )
         return context
 
+    # ── Provider-agnostic transcript helpers ────────────────────────────────
+    def _append_user_turn(self, pil_images: list[Image.Image], text: str) -> None:
+        if llm_provider.use_claude():
+            blocks = [llm_provider.pil_image_block(img) for img in pil_images]
+            blocks.append(llm_provider.text_block(text))
+            self._claude_messages.append({"role": "user", "content": blocks})
+        else:
+            parts: list[Part] = [_pil_part(img) for img in pil_images] + [Part(text=text)]
+            self._conversation.append(Content(role="user", parts=parts))
+
+    def _append_model_turn(self, text: str) -> None:
+        if llm_provider.use_claude():
+            self._claude_messages.append(
+                {"role": "assistant", "content": [llm_provider.text_block(text)]}
+            )
+        else:
+            self._conversation.append(Content(role="model", parts=[Part(text=text)]))
+
+    async def _claude_complete(self, *, as_json: bool) -> str:
+        """Run one Claude turn over the parallel transcript; returns raw text."""
+        msg = await llm_provider.acomplete_message(
+            system=prompt_loader.IMAGE_GEN_AGENT_SYSTEM,
+            messages=self._claude_messages,
+            thinking=True,
+        )
+        return llm_provider.extract_text(msg)
+
     def schedule_post_success_improvement(self) -> None:
         """
         Fire-and-forget: analyze session failures and maybe update image-gen-agent.md.
@@ -205,24 +235,28 @@ Decide whether the standing system prompt should be updated for future Nano Bana
 Return POST-SUCCESS IMPROVEMENT JSON only.
 """.strip()
 
-        self._conversation.append(Content(role="user", parts=[Part(text=learn_context)]))
+        self._append_user_turn([], learn_context)
 
-        client = get_gemini_client()
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=PROMPT_GEN_MODEL,
-            contents=self._conversation,
-            config=GenerateContentConfig(
-                system_instruction=prompt_loader.IMAGE_GEN_AGENT_SYSTEM,
-                response_mime_type="application/json",
-                thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
-            ),
-        )
-
-        data = _parse_json_response(response.text)
-        self._conversation.append(
-            Content(role="model", parts=[Part(text=response.text or "")])
-        )
+        if llm_provider.use_claude():
+            raw_text = await self._claude_complete(as_json=True)
+            data = _parse_json_response(raw_text)
+            self._append_model_turn(raw_text)
+        else:
+            client = get_gemini_client()
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=PROMPT_GEN_MODEL,
+                contents=self._conversation,
+                config=GenerateContentConfig(
+                    system_instruction=prompt_loader.IMAGE_GEN_AGENT_SYSTEM,
+                    response_mime_type="application/json",
+                    thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
+                ),
+            )
+            data = _parse_json_response(response.text)
+            self._conversation.append(
+                Content(role="model", parts=[Part(text=response.text or "")])
+            )
 
         should_update = bool(data.get("should_update"))
         updated = data.get("updated_system_prompt")
@@ -260,8 +294,7 @@ Return POST-SUCCESS IMPROVEMENT JSON only.
             image1_metadata=image1_metadata,
             image2_metadata=image2_metadata,
         )
-        parts: list[Part] = [_pil_part(img) for img in pil_images] + [Part(text=context)]
-        self._conversation.append(Content(role="user", parts=parts))
+        self._append_user_turn(list(pil_images), context)
         return await self._complete_prompt_turn()
 
     async def evaluate_output(
@@ -289,31 +322,36 @@ Return POST-SUCCESS IMPROVEMENT JSON only.
             "product reference separately (N/A only if no product images). "
             "For every section: fill section_analysis then section_results. "
             "If ANY section_results value is fail, verdict MUST be rejected. "
-            "ALSO assess the user's space photo capture quality and return the "
+            "ALSO assess the user's space photo for BOTH capture quality AND "
+            "suitability for the selected design direction/products (e.g. wrong "
+            "space type, no eligible area, scene unsuited) and return the "
             "input_quality object (this never affects the verdict). "
             "Return evaluation JSON only."
         )
 
-        parts = [_pil_part(generated), Part(text=eval_context)]
-        self._conversation.append(Content(role="user", parts=parts))
-
         prompt_loader.ensure_prompts_loaded()
-        client = get_gemini_client()
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=PROMPT_GEN_MODEL,
-            contents=self._conversation,
-            config=GenerateContentConfig(
-                system_instruction=prompt_loader.IMAGE_GEN_AGENT_SYSTEM,
-                response_mime_type="application/json",
-                thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
-            ),
-        )
+        self._append_user_turn([generated], eval_context)
 
-        data = _parse_json_response(response.text)
-        self._conversation.append(
-            Content(role="model", parts=[Part(text=response.text or "")])
-        )
+        if llm_provider.use_claude():
+            raw_text = await self._claude_complete(as_json=True)
+            data = _parse_json_response(raw_text)
+            self._append_model_turn(raw_text)
+        else:
+            client = get_gemini_client()
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=PROMPT_GEN_MODEL,
+                contents=self._conversation,
+                config=GenerateContentConfig(
+                    system_instruction=prompt_loader.IMAGE_GEN_AGENT_SYSTEM,
+                    response_mime_type="application/json",
+                    thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
+                ),
+            )
+            data = _parse_json_response(response.text)
+            self._conversation.append(
+                Content(role="model", parts=[Part(text=response.text or "")])
+            )
 
         approved, issues, _inline_revised = finalize_evaluation(data)
 
@@ -373,28 +411,31 @@ Return POST-SUCCESS IMPROVEMENT JSON only.
             "generation prompt that fully addresses every identified issue. "
             "Apply all V1–V16 rules. Return ONLY the full generation prompt text."
         )
-        self._conversation.append(Content(role="user", parts=[Part(text=retry_context)]))
+        self._append_user_turn([], retry_context)
         prompt = await self._complete_prompt_turn()
         print(f"[ImageGenAgent] retry prompt (round {gen_round}, first 400 chars):\n{prompt[:400]}\n")
         return prompt
 
     async def _complete_prompt_turn(self) -> str:
         prompt_loader.ensure_prompts_loaded()
-        client = get_gemini_client()
-        response = await asyncio.to_thread(
-            client.models.generate_content,
-            model=PROMPT_GEN_MODEL,
-            contents=self._conversation,
-            config=GenerateContentConfig(
-                system_instruction=prompt_loader.IMAGE_GEN_AGENT_SYSTEM,
-                thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
-            ),
-        )
-        text = _strip_prompt_fences(response.text or "")
+        if llm_provider.use_claude():
+            text = _strip_prompt_fences(await self._claude_complete(as_json=False))
+        else:
+            client = get_gemini_client()
+            response = await asyncio.to_thread(
+                client.models.generate_content,
+                model=PROMPT_GEN_MODEL,
+                contents=self._conversation,
+                config=GenerateContentConfig(
+                    system_instruction=prompt_loader.IMAGE_GEN_AGENT_SYSTEM,
+                    thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
+                ),
+            )
+            text = _strip_prompt_fences(response.text or "")
         if not text:
             raise RuntimeError("ImageGenAgent returned empty prompt.")
 
-        self._conversation.append(Content(role="model", parts=[Part(text=text)]))
+        self._append_model_turn(text)
         self.last_prompt = text
         print(f"[ImageGenAgent] initial prompt (first 400 chars):\n{text[:400]}\n")
         return text

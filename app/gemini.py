@@ -10,6 +10,7 @@ import os
 from typing import Optional
 
 from app import prompt_loader
+from app import llm_provider
 
 load_dotenv()
 
@@ -60,6 +61,33 @@ def get_gemini_client():
     if _client is None:
         _client = genai.Client(api_key=GOOGLE_API_KEY)
     return _client
+
+
+def _vision_json(system_instruction: str, images: list, context: str) -> dict:
+    """
+    Run a multimodal → JSON request through the active provider.
+
+    Used by the prompt generator, prompt verifier, and generation evaluators.
+    Claude (when USE_CLAUDE) gets base64 image blocks + the context text and the
+    same system prompt; Gemini uses native PIL contents with JSON mime type.
+    Both return a parsed dict.
+    """
+    if llm_provider.use_claude():
+        blocks = [llm_provider.pil_image_block(im) for im in images]
+        blocks.append(llm_provider.text_block(context))
+        return llm_provider.generate_json(system_instruction, blocks)
+
+    client = get_gemini_client()
+    response = client.models.generate_content(
+        model=PROMPT_GEN_MODEL,
+        contents=[*images, context],
+        config=GenerateContentConfig(
+            system_instruction=system_instruction,
+            response_mime_type="application/json",
+            thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
+        ),
+    )
+    return _parse_json_response(response.text)
 
 
 def _parse_json_response(text: str | None) -> dict:
@@ -335,17 +363,11 @@ def evaluate_generation(
         "If ANY section_results value is fail, verdict MUST be rejected."
     )
 
-    response = client.models.generate_content(
-        model=PROMPT_GEN_MODEL,
-        contents=[image1, image2, generated, context],
-        config=GenerateContentConfig(
-            system_instruction=prompt_loader.EVAL_SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
-        ),
+    data = _vision_json(
+        prompt_loader.EVAL_SYSTEM_INSTRUCTION,
+        [image1, image2, generated],
+        context,
     )
-
-    data = _parse_json_response(response.text)
     approved, issues, revised_prompt = finalize_evaluation(data)
 
     print(f"[Evaluator] verdict={data.get('verdict')}  reason={data.get('reason')}")
@@ -399,18 +421,11 @@ def evaluate_generation_multi(
         "If ANY section_results value is fail, verdict MUST be rejected."
     )
 
-    contents = [*images, generated, context]
-    response = client.models.generate_content(
-        model=PROMPT_GEN_MODEL,
-        contents=contents,
-        config=GenerateContentConfig(
-            system_instruction=prompt_loader.EVAL_SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
-        ),
+    data = _vision_json(
+        prompt_loader.EVAL_SYSTEM_INSTRUCTION,
+        [*images, generated],
+        context,
     )
-
-    data = _parse_json_response(response.text)
     approved, issues, revised_prompt = finalize_evaluation(data)
 
     print(f"[EvaluatorMulti] verdict={data.get('verdict')}  reason={data.get('reason')}")
@@ -462,19 +477,11 @@ def verify_prompt(
         f"Prompt to verify:\n{prompt}"
     )
 
-    contents = [*images, context]
-
-    response = client.models.generate_content(
-        model=PROMPT_GEN_MODEL,
-        contents=contents,
-        config=GenerateContentConfig(
-            system_instruction=prompt_loader.PROMPT_VERIFY_SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
-        ),
+    data = _vision_json(
+        prompt_loader.PROMPT_VERIFY_SYSTEM_INSTRUCTION,
+        list(images),
+        context,
     )
-
-    data = _parse_json_response(response.text)
     passed: bool = bool(data.get("passed", False))
     issues: list[str] = data.get("issues") or []
     improved_prompt: str | None = data.get("improved_prompt") if not passed else None
@@ -547,17 +554,11 @@ def generate_prompt(
             f"Incorporate this intent into the generated prompt where it is consistent with the images and Ducon's style."
         )
 
-    response = client.models.generate_content(
-        model=PROMPT_GEN_MODEL,
-        contents=[image1, image2, context],
-        config=GenerateContentConfig(
-            system_instruction=prompt_loader.PROMPT_SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
-        ),
+    data = _vision_json(
+        prompt_loader.PROMPT_SYSTEM_INSTRUCTION,
+        [image1, image2],
+        context,
     )
-
-    data = _parse_json_response(response.text)
     prompt = data.get("image_generation_prompt", "")
 
     print(f"[Prompt Generator] operation_type: {data.get('operation_type', 'unknown')}")

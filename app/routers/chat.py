@@ -46,6 +46,7 @@ from app.auth import get_current_user
 from app.db.models import User
 from app import chat_agent
 from app import chat_session
+from app import llm_provider
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +229,11 @@ async def chat_message(
         },
     )
 
-    # ── Upload attached files to Gemini Files API ─────────────────────────────
+    # ── Attach files ──────────────────────────────────────────────────────────
+    # Gemini path → upload to the Files API and reference by URI.
+    # Claude path → Anthropic Messages API is stateless and cannot read Gemini
+    #   File URIs, so we send the bytes inline as base64 image/document blocks.
+    use_claude = llm_provider.use_claude()
     file_parts: list[dict] = []
     for upload in files:
         if not upload.filename:
@@ -238,6 +243,31 @@ async def chat_message(
             continue
         _validate_upload(upload.filename, file_bytes)
         mime = upload.content_type or _infer_mime(upload.filename)
+
+        if use_claude:
+            import base64 as _b64
+            if mime.startswith("image/"):
+                claude_mime, claude_bytes = _normalize_image_for_claude(file_bytes, mime)
+                file_parts.append({
+                    "type": "image_b64",
+                    "data": _b64.b64encode(claude_bytes).decode("ascii"),
+                    "mime_type": claude_mime,
+                })
+            elif mime == "application/pdf":
+                file_parts.append({
+                    "type": "document_b64",
+                    "data": _b64.b64encode(file_bytes).decode("ascii"),
+                    "mime_type": mime,
+                })
+            else:
+                # Unsupported inline type for Claude — skip with a note.
+                logger.info("Skipping non-image/pdf attachment for Claude: %s (%s)", upload.filename, mime)
+            chat_agent._dbg(
+                "[CHAT ROUTER ▶ FILE INLINE (claude)]",
+                {"filename": upload.filename, "bytes": len(file_bytes), "mime_type": mime},
+            )
+            continue
+
         try:
             uploaded = await chat_agent.upload_file_to_gemini(
                 file_bytes=file_bytes,
@@ -481,6 +511,30 @@ def _infer_mime(filename: str) -> str:
     return "application/octet-stream"
 
 
+# Anthropic accepts only these image media types inline.
+_CLAUDE_IMAGE_MIMES = ("image/jpeg", "image/png", "image/gif", "image/webp")
+
+
+def _normalize_image_for_claude(data: bytes, mime: str) -> tuple[str, bytes]:
+    """
+    Return (media_type, bytes) suitable for Anthropic. JPEG/PNG/GIF/WEBP pass
+    through untouched; anything else (HEIC/HEIF/TIFF/…) is decoded with Pillow
+    (HEIF opener is registered in main.py) and re-encoded to JPEG.
+    """
+    if mime in _CLAUDE_IMAGE_MIMES:
+        return mime, data
+    try:
+        from PIL import Image as _PILImage
+        import io as _io
+        img = _PILImage.open(_io.BytesIO(data))
+        buf = _io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG", quality=92)
+        return "image/jpeg", buf.getvalue()
+    except Exception as exc:
+        logger.warning("Could not normalize %s for Claude (%s); sending as-is.", mime, exc)
+        return mime, data
+
+
 def _gemini_type_from_mime(mime: str) -> str:
     """Map a MIME type to the Gemini Interactions API content type string."""
     if mime.startswith("image/"):
@@ -580,6 +634,7 @@ async def inject_voice_context(
         chat_agent.stream_chat(
             input_parts=input_parts,
             previous_interaction_id=chain_prev,
+            allow_tools=False,
         ),
     ):
         # The SSE stream contains JSON events — we only care about `done`
@@ -706,6 +761,7 @@ async def inject_browse_context(
         chat_agent.stream_chat(
             input_parts=input_parts,
             previous_interaction_id=chain_prev,
+            allow_tools=False,
         ),
     ):
         if not raw.startswith("data:"):
@@ -816,6 +872,7 @@ async def inject_studio_context(
         chat_agent.stream_chat(
             input_parts=input_parts,
             previous_interaction_id=chain_prev,
+            allow_tools=False,
         ),
     ):
         if not raw.startswith("data:"):

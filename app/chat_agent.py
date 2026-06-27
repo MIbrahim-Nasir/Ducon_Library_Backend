@@ -34,9 +34,12 @@ import json
 import logging
 import os
 import tempfile
+import uuid
 from typing import AsyncGenerator, Optional
 
 from google import genai
+
+from app import llm_provider
 
 logger = logging.getLogger(__name__)
 
@@ -535,6 +538,8 @@ def _sse_error(message: str) -> str:
 async def stream_chat(
     input_parts: list,
     previous_interaction_id: Optional[str] = None,
+    *,
+    allow_tools: bool = True,
 ) -> AsyncGenerator[str, None]:
     """
     Async generator that runs one chat turn and yields SSE-formatted strings.
@@ -559,6 +564,13 @@ async def stream_chat(
         step.stop                 → event.index
         interaction.completed     → event.interaction.id, event.interaction.status
     """
+    # Route to Claude when enabled — Claude has no server-managed Interactions
+    # API, so we keep our own message transcript keyed by the conversation id.
+    if llm_provider.use_claude():
+        async for chunk in _stream_chat_claude(input_parts, previous_interaction_id, allow_tools=allow_tools):
+            yield chunk
+        return
+
     client = get_client()
 
     generation_config: dict = {}
@@ -769,3 +781,270 @@ async def stream_chat(
     # ── Done — always emitted last ────────────────────────────────────────────
     _dbg("[CHAT ▶ DONE]", {"interaction_id": interaction_id})
     yield _sse({"type": "done", "interaction_id": interaction_id})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Claude (Anthropic) chat path — used when USE_CLAUDE is enabled.
+#
+# Unlike Gemini's Interactions API (server-managed history via
+# previous_interaction_id), Anthropic's Messages API is stateless. We keep the
+# full conversation transcript in-process, keyed by a stable conversation id.
+# That id is returned in the `done` event exactly like an interaction_id, so the
+# router/voice/studio/browse memory-sync flows are unchanged: each turn appends
+# to the same transcript, and voice/text share it via chat_session.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# conversation_id → list[message dict]  (in-process; mirrors chat_session lifetime)
+_CLAUDE_HISTORY: dict[str, list[dict]] = {}
+_CLAUDE_HISTORY_MAX_MESSAGES = int(os.getenv("CLAUDE_CHAT_MAX_MESSAGES", "60"))
+
+_claude_chat_tools_cache: Optional[list[dict]] = None
+
+
+def get_claude_chat_tools() -> list[dict]:
+    global _claude_chat_tools_cache
+    if _claude_chat_tools_cache is None:
+        _claude_chat_tools_cache = llm_provider.to_claude_tools(CHAT_TOOLS)
+    return _claude_chat_tools_cache
+
+
+def _trim_history(messages: list[dict]) -> list[dict]:
+    """
+    Keep history bounded. Never split a tool_use/tool_result pair and never lead
+    with an assistant turn (Anthropic requires the first message to be 'user').
+    """
+    if len(messages) <= _CLAUDE_HISTORY_MAX_MESSAGES:
+        return messages
+    trimmed = messages[-_CLAUDE_HISTORY_MAX_MESSAGES:]
+    # Drop leading assistant / tool_result messages until we start on a clean user turn.
+    while trimmed:
+        first = trimmed[0]
+        if first.get("role") != "user":
+            trimmed = trimmed[1:]
+            continue
+        blocks = first.get("content")
+        if isinstance(blocks, list) and any(
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks
+        ):
+            trimmed = trimmed[1:]
+            continue
+        break
+    return trimmed
+
+
+def _last_assistant_tool_use_ids(messages: list[dict]) -> list[dict]:
+    """Return [{id,name}] for tool_use blocks of the most recent assistant message."""
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        ids: list[dict] = []
+        for b in msg.get("content") or []:
+            if isinstance(b, dict) and b.get("type") == "tool_use":
+                ids.append({"id": b.get("id"), "name": b.get("name")})
+        return ids
+    return []
+
+
+def _build_claude_user_message(input_parts: list, prior_messages: list[dict]) -> dict:
+    """
+    Convert router input_parts into a single Claude user message.
+
+    Two shapes occur:
+      • Normal turn   → text + inline base64 image blocks.
+      • Tool results  → function_result parts → tool_result blocks, reconciled
+        against the previous assistant message's tool_use ids so Anthropic's
+        "every tool_use needs a matching tool_result" rule is always satisfied.
+    """
+    function_results: dict[str, dict] = {}
+    normal_blocks: list[dict] = []
+
+    for part in input_parts:
+        if isinstance(part, str):
+            if part:
+                normal_blocks.append(llm_provider.text_block(part))
+            continue
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type")
+        if ptype == "text":
+            txt = part.get("text") or ""
+            if txt:
+                normal_blocks.append(llm_provider.text_block(txt))
+        elif ptype == "image_b64":
+            data_b64 = part.get("data")
+            if data_b64:
+                normal_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": part.get("mime_type") or "image/jpeg",
+                        "data": data_b64,
+                    },
+                })
+        elif ptype == "image_url":
+            url = part.get("url")
+            if url:
+                normal_blocks.append({
+                    "type": "image",
+                    "source": {"type": "url", "url": url},
+                })
+        elif ptype == "document_b64":
+            data_b64 = part.get("data")
+            if data_b64:
+                normal_blocks.append({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": part.get("mime_type") or "application/pdf",
+                        "data": data_b64,
+                    },
+                })
+        elif ptype == "function_result":
+            call_id = part.get("call_id") or part.get("name")
+            text = _function_result_to_text(part.get("result"))
+            function_results[str(call_id)] = {
+                "text": text,
+                "is_error": _function_result_is_error(part.get("result")),
+            }
+
+    if function_results:
+        expected = _last_assistant_tool_use_ids(prior_messages)
+        blocks: list[dict] = []
+        used: set[str] = set()
+        for tu in expected:
+            cid = str(tu.get("id"))
+            res = function_results.get(cid)
+            used.add(cid)
+            if res is None:
+                blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu.get("id"),
+                    "content": [{"type": "text", "text": "No result was returned for this tool call."}],
+                    "is_error": True,
+                })
+            else:
+                blocks.append({
+                    "type": "tool_result",
+                    "tool_use_id": tu.get("id"),
+                    "content": [{"type": "text", "text": res["text"]}],
+                    "is_error": res["is_error"],
+                })
+        # Include any extra results that didn't match a known tool_use (defensive).
+        for cid, res in function_results.items():
+            if cid in used:
+                continue
+            blocks.append({
+                "type": "tool_result",
+                "tool_use_id": cid,
+                "content": [{"type": "text", "text": res["text"]}],
+                "is_error": res["is_error"],
+            })
+        return {"role": "user", "content": blocks}
+
+    if not normal_blocks:
+        normal_blocks = [llm_provider.text_block("(no content)")]
+    return {"role": "user", "content": normal_blocks}
+
+
+def _function_result_to_text(result: object) -> str:
+    """The router wraps tool results as [{'type':'text','text':...}]; unwrap to text."""
+    if isinstance(result, list):
+        texts = []
+        for item in result:
+            if isinstance(item, dict) and item.get("type") == "text":
+                texts.append(item.get("text") or "")
+            else:
+                texts.append(json.dumps(item, ensure_ascii=False))
+        return "\n".join(t for t in texts if t)
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _function_result_is_error(result: object) -> bool:
+    if isinstance(result, list) and result:
+        first = result[0]
+        if isinstance(first, dict):
+            txt = (first.get("text") or "")
+            return txt.startswith("Error:")
+    return False
+
+
+async def _stream_chat_claude(
+    input_parts: list,
+    previous_interaction_id: Optional[str],
+    *,
+    allow_tools: bool = True,
+) -> AsyncGenerator[str, None]:
+    """Claude equivalent of stream_chat — same SSE event contract."""
+    conv_id = previous_interaction_id if (previous_interaction_id and str(previous_interaction_id).startswith("cld_")) else f"cld_{uuid.uuid4().hex}"
+    messages: list[dict] = list(_CLAUDE_HISTORY.get(conv_id, []))
+
+    user_msg = _build_claude_user_message(input_parts, messages)
+    messages.append(user_msg)
+
+    _dbg("[CHAT ▶ REQUEST · claude]", {
+        "model": llm_provider.CLAUDE_MODEL,
+        "conv_id": conv_id,
+        "history_messages": len(messages),
+        "allow_tools": allow_tools,
+        "input_parts": _summarize_input_parts(input_parts),
+    })
+
+    try:
+        client = llm_provider.get_async_anthropic_client()
+        kwargs = {
+            "model": llm_provider.CLAUDE_MODEL,
+            "max_tokens": llm_provider.CLAUDE_MAX_TOKENS,
+            "system": get_chat_system_instruction(),
+            "messages": messages,
+        }
+        if allow_tools:
+            kwargs["tools"] = get_claude_chat_tools()
+        th = llm_provider._thinking_param()
+        if th:
+            kwargs["thinking"] = th
+
+        thinking_started = False
+        async with client.messages.stream(**kwargs) as stream:
+            async for event in stream:
+                etype = getattr(event, "type", None)
+                if etype == "content_block_delta":
+                    delta = getattr(event, "delta", None)
+                    dtype = getattr(delta, "type", None) if delta else None
+                    if dtype == "thinking_delta":
+                        if not thinking_started:
+                            thinking_started = True
+                            yield _sse({"type": "thinking_delta", "text": ""})
+                        chunk = getattr(delta, "thinking", "") or ""
+                        if chunk:
+                            yield _sse({"type": "thinking_delta", "text": chunk})
+                    elif dtype == "text_delta":
+                        chunk = getattr(delta, "text", "") or ""
+                        if chunk:
+                            yield _sse({"type": "text_delta", "text": chunk})
+            final = await stream.get_final_message()
+
+        # Persist the assistant turn (preserving thinking + tool_use blocks).
+        messages.append({"role": "assistant", "content": llm_provider.serialize_content(final)})
+        _CLAUDE_HISTORY[conv_id] = _trim_history(messages)
+
+        # Emit any tool calls the model requested.
+        for tu in llm_provider.tool_use_blocks(final):
+            call_id = tu.get("id") or f"{tu.get('name') or 'tool'}:{uuid.uuid4().hex[:8]}"
+            _dbg("[CHAT ◀ TOOL CALL · claude]", {"id": call_id, "name": tu.get("name")})
+            yield _sse({
+                "type": "tool_call",
+                "id":   call_id,
+                "name": tu.get("name"),
+                "args": tu.get("input") or {},
+            })
+
+    except Exception as exc:
+        logger.exception("Claude chat agent error")
+        _dbg("[CHAT ✖ ERROR · claude]", repr(exc))
+        yield _sse_error(str(exc))
+        return
+
+    _dbg("[CHAT ▶ DONE · claude]", {"interaction_id": conv_id})
+    yield _sse({"type": "done", "interaction_id": conv_id})

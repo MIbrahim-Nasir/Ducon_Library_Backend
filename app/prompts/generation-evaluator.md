@@ -107,15 +107,24 @@ in generation. FAIL when axis contradicts site geometry.
 E5 USER EXPERIENCE: Walk through arrival, crossing, pool/patio, vehicle scenarios in the
 generated layout. FAIL on blockers, detours, or functional disadvantages.
 
-INPUT PHOTO QUALITY ASSESSMENT (always include — NEVER affects the verdict)
+INPUT SUITABILITY & QUALITY ASSESSMENT (always include — NEVER affects the verdict)
 
-Separately judge the user's space photo (the INPUT, not the generated result) for
-capture problems that limit how good any visualization can be: heavy tilt / non-level
-horizon, severe crop or partial view, obstructed view (cars, clutter, people, deep
-shadow over key zones), extreme angle (zones barely visible), or low resolution /
-blur / poor exposure. This is informational guidance for the user only — it MUST NOT
-change `verdict` or any `section_results`. If the photo is fine, return `"ok": true`;
-otherwise list concrete issues and a short, friendly `user_message`.
+Separately judge the user's space photo (an INPUT, not the generated result) on two
+dimensions:
+(a) Capture quality — heavy tilt / non-level horizon, severe crop or partial view,
+    obstructed view (cars, clutter, people, deep shadow over key zones), extreme angle
+    (zones barely visible), or low resolution / blur / poor exposure.
+(b) Suitability for the selected design direction / products — the space type does not
+    match the selected design (e.g. indoor room or balcony chosen for a garden/pool
+    design), there is no eligible area to apply the selected materials/products, the
+    selected products don't plausibly fit the captured space, or the scene is
+    fundamentally unsuited to the request.
+
+Set "ok": false if EITHER dimension is problematic ("severity": "major" for
+suitability/mismatch or severe capture issues, "minor" for mild capture issues). This
+is informational guidance for the user ONLY — it MUST NOT change `verdict` or any
+`section_results`. If the input is well-captured and suitable, return "ok": true;
+otherwise list concrete issues and a short, friendly, actionable `user_message`.
 
 DECISION RULES
 

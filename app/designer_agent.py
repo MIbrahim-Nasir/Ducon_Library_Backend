@@ -42,6 +42,7 @@ from app.ml import GeminiEmbeddingModel
 from app.tool_generate_image import ImageDescriptor, generate_multi_image
 from app.prompt_generator_session import DesignerPromptSession
 from app import prompt_loader
+from app import llm_provider
 
 
 DESIGNER_AGENT_MODEL = os.getenv("DESIGNER_AGENT_MODEL", "gemini-3.5-flash")
@@ -475,19 +476,25 @@ async def _analyze_and_plan(user_image: Image.Image, user_prompt: str) -> dict[s
             "response_mime_type": "application/json",
         },
     )
-    response = await client.aio.models.generate_content(
-        model=DESIGNER_AGENT_MODEL,
-        contents=[user_image, prompt],
-        config=GenerateContentConfig(response_mime_type="application/json"),
-    )
-    text = response.text or "{}"
-    _dbg(
-        "[DESIGNER ◀ GEMINI analyze_plan]",
-        {"usage": _usage(response), "text_chars": len(text), "text_preview": text[:1200]},
-    )
+    if llm_provider.use_claude():
+        text = await llm_provider.agenerate_text(
+            "",
+            [llm_provider.pil_image_block(user_image), llm_provider.text_block(prompt)],
+        ) or "{}"
+    else:
+        response = await client.aio.models.generate_content(
+            model=DESIGNER_AGENT_MODEL,
+            contents=[user_image, prompt],
+            config=GenerateContentConfig(response_mime_type="application/json"),
+        )
+        text = response.text or "{}"
+        _dbg(
+            "[DESIGNER ◀ GEMINI analyze_plan]",
+            {"usage": _usage(response), "text_chars": len(text), "text_preview": text[:1200]},
+        )
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
+        return llm_provider.parse_json_text(text) if llm_provider.use_claude() else json.loads(text)
+    except (json.JSONDecodeError, ValueError):
         return {
             "space_analysis": text[:1000],
             "design_direction": user_prompt or "Create a refined Ducon outdoor concept.",
@@ -631,19 +638,28 @@ async def _evaluate_generation(
             "response_mime_type": "application/json",
         },
     )
-    response = await client.aio.models.generate_content(
-        model=DESIGNER_AGENT_MODEL,
-        contents=[user_image, generated_image, *reference_images, eval_prompt],
-        config=GenerateContentConfig(response_mime_type="application/json"),
-    )
-    text = response.text or "{}"
-    _dbg(
-        "[DESIGNER ◀ GEMINI evaluate]",
-        {"usage": _usage(response), "text_chars": len(text), "text_preview": text[:1200]},
-    )
+    if llm_provider.use_claude():
+        blocks = [
+            llm_provider.pil_image_block(user_image),
+            llm_provider.pil_image_block(generated_image),
+        ]
+        blocks += [llm_provider.pil_image_block(img) for img in reference_images]
+        blocks.append(llm_provider.text_block(eval_prompt))
+        text = await llm_provider.agenerate_text("", blocks) or "{}"
+    else:
+        response = await client.aio.models.generate_content(
+            model=DESIGNER_AGENT_MODEL,
+            contents=[user_image, generated_image, *reference_images, eval_prompt],
+            config=GenerateContentConfig(response_mime_type="application/json"),
+        )
+        text = response.text or "{}"
+        _dbg(
+            "[DESIGNER ◀ GEMINI evaluate]",
+            {"usage": _usage(response), "text_chars": len(text), "text_preview": text[:1200]},
+        )
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
+        data = llm_provider.parse_json_text(text) if llm_provider.use_claude() else json.loads(text)
+    except (json.JSONDecodeError, ValueError):
         data = {"score": 6, "passed": False, "strengths": [], "issues": [text[:500]], "improvements": ""}
     data["passed"] = _passes_quality_gate(data)
     return data
@@ -662,15 +678,20 @@ async def _summarize_final(plan: dict[str, Any], best: dict[str, Any], attempts:
         "[DESIGNER ▶ GEMINI final_summary]",
         {"model": DESIGNER_AGENT_MODEL, "prompt_chars": len(prompt), "prompt_preview": prompt[:1200]},
     )
-    response = await client.aio.models.generate_content(
-        model=DESIGNER_AGENT_MODEL,
-        contents=prompt,
-    )
-    text = response.text or "Your Ducon design preview is ready."
-    _dbg(
-        "[DESIGNER ◀ GEMINI final_summary]",
-        {"usage": _usage(response), "text_chars": len(text), "text_preview": text[:1200]},
-    )
+    if llm_provider.use_claude():
+        text = await llm_provider.agenerate_text(
+            "", [llm_provider.text_block(prompt)], thinking=False,
+        ) or "Your Ducon design preview is ready."
+    else:
+        response = await client.aio.models.generate_content(
+            model=DESIGNER_AGENT_MODEL,
+            contents=prompt,
+        )
+        text = response.text or "Your Ducon design preview is ready."
+        _dbg(
+            "[DESIGNER ◀ GEMINI final_summary]",
+            {"usage": _usage(response), "text_chars": len(text), "text_preview": text[:1200]},
+        )
     return text
 
 
