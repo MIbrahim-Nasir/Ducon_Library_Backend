@@ -107,6 +107,16 @@ in generation. FAIL when axis contradicts site geometry.
 E5 USER EXPERIENCE: Walk through arrival, crossing, pool/patio, vehicle scenarios in the
 generated layout. FAIL on blockers, detours, or functional disadvantages.
 
+INPUT PHOTO QUALITY ASSESSMENT (always include — NEVER affects the verdict)
+
+Separately judge the user's space photo (the INPUT, not the generated result) for
+capture problems that limit how good any visualization can be: heavy tilt / non-level
+horizon, severe crop or partial view, obstructed view (cars, clutter, people, deep
+shadow over key zones), extreme angle (zones barely visible), or low resolution /
+blur / poor exposure. This is informational guidance for the user only — it MUST NOT
+change `verdict` or any `section_results`. If the photo is fine, return `"ok": true`;
+otherwise list concrete issues and a short, friendly `user_message`.
+
 DECISION RULES
 
 **Verdict consistency:** If ANY key in `section_results` is `"fail"`, `verdict` MUST be
@@ -186,6 +196,12 @@ Return ONLY valid JSON:
     "E3_placement_logic": "pass", "fail", or "na",
     "E4_surface_orientation": "pass", "fail", or "na",
     "E5_user_experience": "pass", "fail", or "na"
+  },
+  "input_quality": {
+    "ok": true,
+    "severity": "none",
+    "issues": [],
+    "user_message": ""
   },
   "issues": ["list each specific issue, empty if approved"],
   "revised_prompt": "full corrected prompt if rejected, null if approved"

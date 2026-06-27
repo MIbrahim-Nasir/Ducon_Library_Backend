@@ -165,58 +165,37 @@ def _eval_section_fails(value: object) -> bool:
 
 def finalize_evaluation(data: dict) -> tuple[bool, list[str], str | None]:
     """
-    Normalize model QC JSON into a strict approve/reject decision.
-    Overrides lenient model verdicts when section_results or analysis disagree.
-    """
-    issues: list[str] = list(data.get("issues") or [])
-    section_results = data.get("section_results") or {}
-    section_analysis = data.get("section_analysis") or {}
+    Normalize model QC JSON into an approve/reject decision.
 
+    Trust-the-model gate: the verdict is authoritative, and we only OVERRIDE an
+    "approved" verdict when the model itself explicitly marked one or more
+    sections as ``"fail"`` (an internal inconsistency we must catch).
+
+    We deliberately DO NOT treat missing/omitted sections as failures. The model
+    legitimately omits sections that are N/A, and the previous behaviour —
+    requiring all 14 critical keys to be present *and* "pass" — caused chronic
+    false rejections and excessive regeneration retries even on good output.
+    """
+    issues: list[str] = [str(i) for i in (data.get("issues") or [])]
+    section_results = data.get("section_results") or {}
     if not isinstance(section_results, dict):
         section_results = {}
 
-    failed_critical = [
-        key for key in _EVAL_CRITICAL_SECTIONS
-        if not _eval_section_passes(section_results.get(key))
-    ]
-    if failed_critical:
-        issues.append(
-            f"Critical QC sections failed or missing: {', '.join(failed_critical)}"
-        )
-
-    for key, value in section_results.items():
-        if _eval_section_fails(value):
-            issues.append(f"Section {key} marked fail in section_results")
-
-    if isinstance(section_analysis, dict):
-        for key in _EVAL_SECTION_ORDER:
-            if key not in section_results:
-                continue
-            entry = section_analysis.get(key)
-            if not isinstance(entry, dict):
-                continue
-            analysis_verdict = str(entry.get("verdict") or "").strip().lower()
-            result_verdict = str(section_results.get(key) or "").strip().lower()
-            if analysis_verdict == "fail" and _eval_section_passes(result_verdict):
-                issues.append(
-                    f"Section {key}: section_analysis verdict is fail but section_results is not fail"
-                )
-            if (
-                analysis_verdict in {"pass", "fail", "na", "n/a"}
-                and result_verdict
-                and analysis_verdict not in {"na", "n/a", "not_applicable", "not applicable"}
-                and analysis_verdict != result_verdict
-            ):
-                issues.append(
-                    f"Section {key}: verdict mismatch (analysis={analysis_verdict}, results={result_verdict})"
-                )
-
     verdict = str(data.get("verdict") or "").strip().lower()
-    if verdict == "approved" and failed_critical:
-        issues.append("Model returned approved but critical sections did not pass")
+
+    # Explicit per-section failures are the authoritative reject signal.
+    explicit_fails = [
+        key for key, value in section_results.items() if _eval_section_fails(value)
+    ]
+    for key in explicit_fails:
+        issues.append(f"Section {key} failed quality check")
+
+    # Approve only when the model approved AND did not contradict itself with an
+    # explicit section fail. A "rejected" verdict (with or without section data)
+    # is always honoured.
+    approved = verdict == "approved" and not explicit_fails
 
     issues = list(dict.fromkeys(issues))
-    approved = verdict == "approved" and not issues
 
     revised_prompt = data.get("revised_prompt")
     if approved:
@@ -227,6 +206,64 @@ def finalize_evaluation(data: dict) -> tuple[bool, list[str], str | None]:
         revised_prompt = revised_prompt.strip()
 
     return approved, issues, revised_prompt
+
+
+def extract_input_quality(data: dict) -> dict | None:
+    """
+    Pull the optional ``input_quality`` assessment out of an evaluation JSON.
+
+    The evaluator inspects the user's space photo (NOT the generated result) for
+    capture problems — heavy tilt, severe crop, partial/obstructed view, extreme
+    angle, very low resolution/blur — that limit how good ANY visualization can
+    be. This never affects approval of the generated image; it is surfaced to the
+    user as a gentle "your input photo could be improved" notice.
+
+    Returns a normalized dict ``{ok, severity, issues, user_message}`` or None
+    when the model did not provide an assessment.
+    """
+    raw = data.get("input_quality")
+    if not isinstance(raw, dict):
+        return None
+
+    ok_raw = raw.get("ok")
+    issues = [str(i).strip() for i in (raw.get("issues") or []) if str(i).strip()]
+    message = str(raw.get("user_message") or raw.get("message") or "").strip()
+    severity = str(raw.get("severity") or "").strip().lower()
+
+    # Coerce robustly — models sometimes return strings ("false"/"no") which
+    # bool() would treat as truthy and wrongly suppress the notice.
+    if ok_raw is None:
+        ok = not issues
+    elif isinstance(ok_raw, str):
+        ok = ok_raw.strip().lower() not in ("false", "no", "0", "not_ok", "fail")
+    else:
+        ok = bool(ok_raw)
+
+    # Treat a non-"none" severity or explicit issues as a flag even if ok was true.
+    if ok and (issues or severity in ("minor", "major")):
+        ok = False
+
+    if ok:
+        return {"ok": True, "severity": "none", "issues": [], "user_message": ""}
+
+    if severity not in ("minor", "major"):
+        severity = "major" if len(issues) >= 2 else "minor"
+    if not message:
+        if issues:
+            message = (
+                "Your input photo could be improved for sharper results: "
+                + "; ".join(issues)
+                + ". For the best visualization, retake it straight-on, holding "
+                "the camera level and capturing the full space."
+            )
+        else:
+            message = (
+                "Your input photo may limit result quality. For the best "
+                "visualization, retake it straight-on, holding the camera level "
+                "and capturing the full space."
+            )
+
+    return {"ok": False, "severity": severity, "issues": issues, "user_message": message}
 
 
 def log_section_analysis(

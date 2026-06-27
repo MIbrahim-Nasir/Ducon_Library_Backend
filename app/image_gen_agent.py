@@ -22,16 +22,22 @@ from app.gemini import (
     PROMPT_GEN_MODEL,
     _PROMPT_THINKING_LEVEL,
     _parse_json_response,
+    extract_input_quality,
     finalize_evaluation,
     get_gemini_client,
     log_section_analysis,
 )
 from app import prompt_loader
 
-_AUTO_LEARN_ENABLED = os.getenv("IMAGE_GEN_AGENT_AUTO_LEARN", "true").lower() not in (
-    "0",
-    "false",
-    "no",
+# Auto-learn rewrites image-gen-agent.md after successful (post-retry) runs.
+# It is OFF by default: an unconstrained "improve your own system prompt" loop
+# previously summarised the detailed evaluation rubric down to placeholders
+# (e.g. "[Evaluation sections A-E remain as defined previously]"), which broke
+# QC and caused chronic false rejections. Only enable it deliberately.
+_AUTO_LEARN_ENABLED = os.getenv("IMAGE_GEN_AGENT_AUTO_LEARN", "false").lower() in (
+    "1",
+    "true",
+    "yes",
 )
 
 
@@ -70,6 +76,9 @@ class ImageGenAgent:
         self.image2_is_user_space = image2_is_user_space
         self.rejection_count: int = 0
         self.successful_round: int = 0
+        # Captured once on the first evaluation; the input photo does not change
+        # between retries, so we keep the first assessment to surface to the user.
+        self.input_quality: dict | None = None
 
         if labels:
             self.labels = labels
@@ -280,6 +289,8 @@ Return POST-SUCCESS IMPROVEMENT JSON only.
             "product reference separately (N/A only if no product images). "
             "For every section: fill section_analysis then section_results. "
             "If ANY section_results value is fail, verdict MUST be rejected. "
+            "ALSO assess the user's space photo capture quality and return the "
+            "input_quality object (this never affects the verdict). "
             "Return evaluation JSON only."
         )
 
@@ -305,6 +316,23 @@ Return POST-SUCCESS IMPROVEMENT JSON only.
         )
 
         approved, issues, _inline_revised = finalize_evaluation(data)
+
+        # Capture the input-photo quality assessment once (it does not change
+        # across retries). Surfaced to the user as a non-blocking notice.
+        if self.input_quality is None:
+            iq = extract_input_quality(data)
+            if iq is not None:
+                self.input_quality = iq
+                if iq.get("ok"):
+                    print("[ImageGenAgent] input_quality: ok (input photo looks fine)")
+                else:
+                    print(
+                        f"[ImageGenAgent] input_quality FLAGGED ({iq.get('severity')}): "
+                        f"{iq.get('issues')}"
+                    )
+            else:
+                print("[ImageGenAgent] input_quality: model returned no assessment")
+
         if approved:
             self.successful_round = gen_round
         else:

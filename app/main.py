@@ -385,13 +385,17 @@ async def auto_generate_images(
             await db.commit()
 
             signed_url = storage.get_guest_generation_url(db_generation.id, stored_key)
-            return {
+            guest_result = {
                 "id": db_generation.id,
                 "generation_name": generation_filename,
                 "signed_url": signed_url,
                 "ducon_image_id": ducon_db_image.id if ducon_db_image else None,
                 "expires_at": expires_at.isoformat(),
             }
+            if image_gen_agent is not None and image_gen_agent.input_quality \
+                    and not image_gen_agent.input_quality.get("ok"):
+                guest_result["input_quality"] = image_gen_agent.input_quality
+            return guest_result
 
         stored_key = storage.save_generation(current_user.id, generation_filename)
 
@@ -406,13 +410,17 @@ async def auto_generate_images(
         await db.commit()
 
         signed_url = storage.get_generation_url(db_generation.id, stored_key)
-        return {
+        user_result = {
             "id": db_generation.id,
             "generation_name": generation_filename,
             "url": stored_key,
             "signed_url": signed_url,
             "ducon_image_id": ducon_db_image.id if ducon_db_image else None,
         }
+        if image_gen_agent is not None and image_gen_agent.input_quality \
+                and not image_gen_agent.input_quality.get("ok"):
+            user_result["input_quality"] = image_gen_agent.input_quality
+        return user_result
 
     async def stream_autogeneration():
         queue: asyncio.Queue[tuple[str, object]] = asyncio.Queue()

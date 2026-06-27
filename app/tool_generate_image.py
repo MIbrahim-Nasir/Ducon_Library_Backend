@@ -534,16 +534,15 @@ async def generate_multi_image(
 
             # ── Rejected ─────────────────────────────────────────────────────
             if gen_round + 1 >= max_rounds:
-                # All rounds exhausted — refuse to return a rejected image.
+                # All rounds exhausted — keep and return the LAST generation as a
+                # best-effort result rather than failing the request. The user
+                # prefers seeing the closest attempt over an error message.
                 logger.warning(
-                    "[MultiImageGen] Generation rejected on final round %d — "
-                    "refusing to return rejected output",
+                    "[MultiImageGen] Generation still rejected on final round %d — "
+                    "returning last attempt as best-effort result",
                     gen_round + 1,
                 )
-                raise RuntimeError(
-                    f"Image generation quality check failed after {max_rounds} attempt(s). "
-                    "Please try rephrasing your request or using different reference images."
-                )
+                break
 
             logger.info(
                 "[MultiImageGen] Generation rejected on round %d (%d issues) — retrying",
@@ -571,15 +570,14 @@ async def generate_multi_image(
             elif revised_prompt:
                 next_prompt = revised_prompt
             else:
+                # No improved prompt could be produced — stop retrying and keep
+                # the last generation as a best-effort result instead of erroring.
                 logger.info(
                     "[MultiImageGen] Generation rejected on round %d — "
-                    "no revised prompt available, skipping remaining retries",
+                    "no revised prompt available, returning last attempt",
                     gen_round + 1,
                 )
-                raise RuntimeError(
-                    f"Image generation quality check failed after {gen_round + 1} attempt(s) "
-                    "and no improved prompt could be produced."
-                )
+                break
 
             # Verify the new prompt against the inputs (non-agent path only)
             if image_gen_agent is None:
@@ -638,7 +636,7 @@ async def generate_multi_image(
         {"id": db_gen.id, "generation_name": generation_name, "url": stored_key, "signed_url": signed_url},
     )
 
-    return {
+    result: dict = {
         "id":              db_gen.id,
         "generation_name": generation_name,
         "url":             stored_key,
@@ -646,6 +644,13 @@ async def generate_multi_image(
         "model_used":      model_id,
         "images_used":     images_used,
     }
+
+    # Non-blocking notice about the user's input photo quality (tilt/crop/etc.).
+    if image_gen_agent is not None and image_gen_agent.input_quality:
+        if not image_gen_agent.input_quality.get("ok"):
+            result["input_quality"] = image_gen_agent.input_quality
+
+    return result
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
