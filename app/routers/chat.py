@@ -38,12 +38,16 @@ import logging
 import os
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user
-from app.db.models import User
+from app.auth import get_current_user, get_optional_user
+from app.db.database import get_db
+from app.db.models import GuestSession, User
+from app.guest_usage import GuestUsageKind, increment_guest_usage
+from app.routers.guest import get_or_create_guest_session, verify_turnstile
 from app import chat_agent
 from app import chat_session
 from app import llm_provider
@@ -119,20 +123,23 @@ class ToolResultRequest(BaseModel):
 
 # ── Shared SSE response config ────────────────────────────────────────────────
 
-_SSE_HEADERS = {
-    "Cache-Control":     "no-cache",
-    "Connection":        "keep-alive",
-    "Content-Encoding":  "identity",   # prevent any intermediate compression
-    "X-Accel-Buffering": "no",         # disable nginx / Cloudflare buffering
-}
+from app.sse import SSE_HEADERS as _SSE_HEADERS
 
 
 async def _stream_with_session_save(
-    user_id: int,
+    user_id: int | None,
     generator,
+    *,
+    guest_session_id: str | None = None,
+    guest_session_row: GuestSession | None = None,
+    db: AsyncSession | None = None,
+    user_text: str | None = None,
+    record_transcript: bool = True,
+    increment_guest_on_done: bool = False,
 ):
-    """Persist interaction_id and emit keepalive pings to prevent proxy timeouts."""
+    """Persist interaction_id, optional transcript turns, and emit keepalive pings."""
     KEEPALIVE_INTERVAL = 15.0  # seconds — resets Cloudflare's 100 s idle timeout
+    assistant_parts: list[str] = []
 
     async def _next_or_timeout(aiter, timeout):
         """Return (chunk, False) or (None, True) on timeout."""
@@ -154,8 +161,35 @@ async def _stream_with_session_save(
         if chunk.startswith("data:"):
             try:
                 payload = json.loads(chunk[5:].strip())
+                if payload.get("type") == "text_delta":
+                    delta = payload.get("text") or ""
+                    if delta:
+                        assistant_parts.append(delta)
                 if payload.get("type") == "done" and payload.get("interaction_id"):
-                    chat_session.set_interaction_id(user_id, payload["interaction_id"])
+                    iid = payload["interaction_id"]
+                    if user_id is not None:
+                        chat_session.set_interaction_id(user_id, iid)
+                    elif guest_session_id:
+                        chat_session.set_guest_interaction_id(guest_session_id, iid)
+                    if record_transcript:
+                        model_text = "".join(assistant_parts).strip()
+                        memory_user = (user_text or "").strip()
+                        if memory_user or model_text:
+                            if user_id is not None:
+                                chat_session.append_turn(user_id, memory_user, model_text)
+                            elif guest_session_id:
+                                chat_session.append_guest_turn(
+                                    guest_session_id, memory_user, model_text,
+                                )
+                    if (
+                        increment_guest_on_done
+                        and guest_session_row is not None
+                        and db is not None
+                    ):
+                        await increment_guest_usage(
+                            db, guest_session_row, GuestUsageKind.CHAT,
+                        )
+                        await db.commit()
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
         yield chunk
@@ -164,21 +198,40 @@ async def _stream_with_session_save(
 # ── GET /chat/session ─────────────────────────────────────────────────────────
 
 @router.get("/session")
-async def get_chat_session(current_user: User = Depends(get_current_user)):
-    """Return the persisted Interactions API chain id for this user (voice + text share it)."""
-    return {"interaction_id": chat_session.get_interaction_id(current_user.id)}
+async def get_chat_session(
+    current_user: User | None = Depends(get_optional_user),
+    x_guest_session_id: str | None = Header(None, alias="X-Guest-Session-Id"),
+):
+    """Return the persisted Interactions API chain id (voice + text share it)."""
+    if current_user is not None:
+        return {"interaction_id": chat_session.get_interaction_id(current_user.id)}
+    if x_guest_session_id:
+        return {
+            "interaction_id": chat_session.get_guest_interaction_id(x_guest_session_id),
+        }
+    raise HTTPException(status_code=401, detail="Authentication required.")
 
 
 @router.delete("/session", status_code=204)
-async def clear_chat_session(current_user: User = Depends(get_current_user)):
+async def clear_chat_session(
+    current_user: User | None = Depends(get_optional_user),
+    x_guest_session_id: str | None = Header(None, alias="X-Guest-Session-Id"),
+):
     """Clear the stored chat session (e.g. when user clears the conversation)."""
-    chat_session.clear_session(current_user.id)
+    if current_user is not None:
+        chat_session.clear_session(current_user.id)
+        return
+    if x_guest_session_id:
+        chat_session.clear_guest_session(x_guest_session_id)
+        return
+    raise HTTPException(status_code=401, detail="Authentication required.")
 
 
 # ── POST /chat/message ────────────────────────────────────────────────────────
 
 @router.post("/message")
 async def chat_message(
+    request: Request,
     message: Optional[str] = Form(
         None,
         description="User's text message. May be omitted when only files are sent.",
@@ -190,11 +243,13 @@ async def chat_message(
             "Omit or pass null to start a new conversation."
         ),
     ),
+    cf_turnstile_token: Optional[str] = Form(None),
     files: List[UploadFile] = File(
         default=[],
         description="Images or documents to attach to this message.",
     ),
-    current_user: User = Depends(get_current_user),
+    current_user: User | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Send a user message and receive a streaming SSE response.
@@ -212,10 +267,31 @@ async def chat_message(
     """
     if not message and not files:
         raise HTTPException(status_code=422, detail="Provide at least a message or a file.")
+
+    guest_session_id: str | None = None
+    guest_session_row: GuestSession | None = None
+    if current_user is None:
+        guest_session_id = request.headers.get("x-guest-session-id")
+        if not guest_session_id:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required. Provide a Bearer token or X-Guest-Session-Id header.",
+            )
+        client_ip = request.client.host if request.client else "unknown"
+        if not await verify_turnstile(cf_turnstile_token or "", client_ip):
+            raise HTTPException(
+                status_code=403,
+                detail="Bot verification failed. Please try again.",
+            )
+        guest_session_row = await get_or_create_guest_session(
+            db, guest_session_id, client_ip, usage_kind=GuestUsageKind.CHAT,
+        )
+
     chat_agent._dbg(
         "[CHAT ROUTER ▶ MESSAGE]",
         {
-            "user_id": current_user.id,
+            "user_id": current_user.id if current_user else None,
+            "guest_session_id": guest_session_id,
             "message_chars": len(message or ""),
             "message_preview": (message or "")[:500],
             "previous_interaction_id": previous_interaction_id,
@@ -306,15 +382,27 @@ async def chat_message(
 
     # Prefer server-persisted session (updated by voice_context injects) over a
     # possibly stale client previous_interaction_id.
-    session_prev = chat_session.get_interaction_id(current_user.id)
+    if current_user is not None:
+        session_prev = chat_session.get_interaction_id(current_user.id)
+    else:
+        session_prev = chat_session.get_guest_interaction_id(guest_session_id)
     effective_prev = session_prev or previous_interaction_id
+    memory_user = (message or "").strip()
+    if not memory_user and file_parts:
+        memory_user = "[User sent image attachment(s)]"
+    stream_user_id = current_user.id if current_user else None
     return StreamingResponse(
         _stream_with_session_save(
-            current_user.id,
+            stream_user_id,
             chat_agent.stream_chat(
                 input_parts=input_parts,
                 previous_interaction_id=effective_prev or None,
             ),
+            guest_session_id=guest_session_id,
+            guest_session_row=guest_session_row,
+            db=db if guest_session_row else None,
+            user_text=memory_user or None,
+            increment_guest_on_done=guest_session_row is not None,
         ),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
@@ -325,8 +413,9 @@ async def chat_message(
 
 @router.post("/tool_result")
 async def chat_tool_result(
+    request: Request,
     body: ToolResultRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User | None = Depends(get_optional_user),
 ):
     """
     Submit tool execution results and receive the model's follow-up response.
@@ -352,10 +441,30 @@ async def chat_tool_result(
     """
     if not body.results:
         raise HTTPException(status_code=422, detail="results must not be empty.")
+
+    guest_session_id: str | None = None
+    if current_user is None:
+        guest_session_id = request.headers.get("x-guest-session-id")
+        if not guest_session_id:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required. Provide a Bearer token or X-Guest-Session-Id header.",
+            )
+
+    stream_user_id = current_user.id if current_user else None
+    if current_user is not None:
+        chain_prev = chat_session.get_interaction_id(current_user.id) or body.previous_interaction_id
+    else:
+        chain_prev = (
+            chat_session.get_guest_interaction_id(guest_session_id)
+            or body.previous_interaction_id
+        )
+
     chat_agent._dbg(
         "[CHAT ROUTER ▶ TOOL RESULT]",
         {
-            "user_id": current_user.id,
+            "user_id": stream_user_id,
+            "guest_session_id": guest_session_id,
             "previous_interaction_id": body.previous_interaction_id,
             "results": [
                 {
@@ -389,14 +498,14 @@ async def chat_tool_result(
 
     return StreamingResponse(
         _stream_with_session_save(
-            current_user.id,
+            stream_user_id,
             chat_agent.stream_chat(
                 input_parts=input_parts,
-                previous_interaction_id=(
-                    chat_session.get_interaction_id(current_user.id)
-                    or body.previous_interaction_id
-                ),
+                previous_interaction_id=chain_prev,
             ),
+            guest_session_id=guest_session_id,
+            user_text=", ".join(f"[Tool: {item.name}]" for item in body.results),
+            record_transcript=False,
         ),
         media_type="text/event-stream",
         headers=_SSE_HEADERS,
@@ -628,6 +737,13 @@ async def inject_voice_context(
     session_prev = chat_session.get_interaction_id(current_user.id)
     chain_prev = session_prev or body.previous_interaction_id
 
+    # Normal voice turns are already stored by GeminiLiveSession._commit_turn.
+    # Only async designer-job memory injects need an extra transcript row here.
+    record_transcript = body.tool_name == "start_designer_job"
+    memory_user = None
+    if record_transcript:
+        memory_user = (input_parts[0].get("text") if input_parts else None)
+
     interaction_id: Optional[str] = None
     async for raw in _stream_with_session_save(
         current_user.id,
@@ -636,6 +752,8 @@ async def inject_voice_context(
             previous_interaction_id=chain_prev,
             allow_tools=False,
         ),
+        user_text=memory_user,
+        record_transcript=record_transcript,
     ):
         # The SSE stream contains JSON events — we only care about `done`
         if not raw.startswith("data:"):
@@ -763,6 +881,7 @@ async def inject_browse_context(
             previous_interaction_id=chain_prev,
             allow_tools=False,
         ),
+        user_text=(input_parts[0].get("text") if input_parts else None),
     ):
         if not raw.startswith("data:"):
             continue
@@ -874,6 +993,7 @@ async def inject_studio_context(
             previous_interaction_id=chain_prev,
             allow_tools=False,
         ),
+        user_text=(input_parts[0].get("text") if input_parts else None),
     ):
         if not raw.startswith("data:"):
             continue

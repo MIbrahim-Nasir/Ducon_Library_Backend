@@ -62,6 +62,7 @@ from app.gemini import (
     evaluate_generation_multi,
     PROMPT_VERIFY_MAX_ROUNDS,
     GEN_EVAL_MAX_ROUNDS,
+    build_quality_notice,
 )
 from app.image_gen_agent import ImageGenAgent
 from app.image_utils import normalize_user_image
@@ -197,16 +198,62 @@ class ImageDescriptor:
 
 # ── Source resolution ─────────────────────────────────────────────────────────
 
+async def _assert_public_url(url: str) -> None:
+    """SSRF guard: only allow http(s) URLs that resolve to public IP addresses.
+
+    Blocks loopback, private, link-local and other reserved ranges (e.g. cloud
+    metadata endpoints) so an attacker-supplied `url` source can't be used to
+    reach internal services.
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {parsed.scheme!r}")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("URL has no host.")
+
+    try:
+        infos = await asyncio.to_thread(socket.getaddrinfo, host, parsed.port or 0)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve host: {host}") from exc
+
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise ValueError("URL resolves to a non-public address and is not allowed.")
+
+
 async def _fetch_url(url: str) -> Image.Image:
-    async with httpx.AsyncClient(timeout=30) as client:
+    await _assert_public_url(url)
+    async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
         resp = await client.get(url)
     if resp.status_code != 200:
         raise ValueError(f"Failed to fetch image from URL (HTTP {resp.status_code}): {url}")
     return Image.open(io.BytesIO(resp.content)).convert("RGB")
 
 
-async def _resolve_descriptor(desc: ImageDescriptor, db: AsyncSession) -> Image.Image:
-    """Resolve one ImageDescriptor to a PIL Image."""
+async def _resolve_descriptor(
+    desc: ImageDescriptor,
+    db: AsyncSession,
+    *,
+    user_id: Optional[int] = None,
+) -> Image.Image:
+    """Resolve one ImageDescriptor to a PIL Image.
+
+    ``user_id`` scopes generation_id lookups to the requesting user so a caller
+    cannot pull another user's generation into their own composition.
+    """
     if desc.type == "file":
         if desc.pil_image is None:
             raise ValueError(f"Image '{desc.label}': type=file but no pil_image provided.")
@@ -238,9 +285,10 @@ async def _resolve_descriptor(desc: ImageDescriptor, db: AsyncSession) -> Image.
             gen_id = int(desc.source)
         except (ValueError, TypeError):
             raise ValueError(f"Image '{desc.label}': invalid generation ID '{desc.source}'.")
-        row = (await db.execute(
-            select(Generation).where(Generation.id == gen_id)
-        )).scalar_one_or_none()
+        gen_q = select(Generation).where(Generation.id == gen_id)
+        if user_id is not None:
+            gen_q = gen_q.where(Generation.user_id == user_id)
+        row = (await db.execute(gen_q)).scalar_one_or_none()
         if not row:
             raise ValueError(f"Image '{desc.label}': generation {gen_id} not found.")
         if row.url.startswith("http://") or row.url.startswith("https://"):
@@ -386,7 +434,7 @@ async def generate_multi_image(
     labels:     list[str]         = []
 
     for desc in descriptors:
-        img = await _resolve_descriptor(desc, db)
+        img = await _resolve_descriptor(desc, db, user_id=user_id)
         # Normalise: cap size + ensure RGB
         img = normalize_user_image(_pil_to_bytes(img))
         pil_images.append(img)
@@ -471,6 +519,7 @@ async def generate_multi_image(
 
     image_bytes: bytes | None = None
     generation_approved = False   # track whether any round was approved
+    last_eval_issues: list[str] = []
 
     for gen_round in range(max_rounds):
         image_bytes = await asyncio.to_thread(
@@ -533,6 +582,7 @@ async def generate_multi_image(
                 break
 
             # ── Rejected ─────────────────────────────────────────────────────
+            last_eval_issues = list(issues or [])
             if gen_round + 1 >= max_rounds:
                 # All rounds exhausted — keep and return the LAST generation as a
                 # best-effort result rather than failing the request. The user
@@ -645,10 +695,23 @@ async def generate_multi_image(
         "images_used":     images_used,
     }
 
-    # Non-blocking notice about the user's input photo quality (tilt/crop/etc.).
+    # Non-blocking notice about the user's input photo quality (tilt/crop/suitability).
     if image_gen_agent is not None and image_gen_agent.input_quality:
         if not image_gen_agent.input_quality.get("ok"):
             result["input_quality"] = image_gen_agent.input_quality
+
+    # Best-effort result after QC retries — surface remaining issues to the user.
+    if not generation_approved and last_eval_issues:
+        gen_notice = build_quality_notice(
+            last_eval_issues,
+            default_message=(
+                "We saved the closest result, but some quality checks were not fully met. "
+                "You can continue in chat to refine, try another direction, or retake your space photo."
+            ),
+            title_prefix="Visualization quality",
+        )
+        if gen_notice:
+            result["generation_warnings"] = gen_notice
 
     return result
 

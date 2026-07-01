@@ -5,6 +5,7 @@ from app.ml import GeminiEmbeddingModel
 import asyncio
 import io
 import json
+import logging
 import os
 import httpx
 from PIL import Image
@@ -30,6 +31,8 @@ load_dotenv()
 from app.prompt_loader import load_prompts
 from app.studio_directions_agent import curate_studio_directions, stream_studio_directions_events
 
+logger = logging.getLogger(__name__)
+
 load_prompts()
 
 from app.routers.auth import router as auth_router
@@ -51,6 +54,8 @@ from app.routers.designer_jobs import router as designer_jobs_router
 from app.db.database import get_db
 from app.db.models import Generation, GuestGeneration, Image as DBImage
 from app.auth import get_current_user, get_optional_user
+from app.rate_limiter import require_rate_limit
+from app.sse import SSE_HEADERS
 from app.image_utils import (
     load_ducon_image as _load_ducon_image,
     normalize_user_image as _normalize_user_image,
@@ -83,11 +88,14 @@ app.include_router(designer_jobs_router)
 # Serve public library images statically
 app.mount("/public/images", StaticFiles(directory="data/images"), name="public_images")
 
+from app.config import get_cors_origins
+
+_cors_origins = get_cors_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, replace "*" with ["http://localhost:3000"]
+    allow_origins=_cors_origins,
     allow_credentials=True,
-    allow_methods=["*"], # Allow GET, POST, OPTIONS, etc.
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -104,23 +112,43 @@ def _mime_type(filename: str) -> str:
     return mime_type(filename)
 
 
+# Upper bound on catalog search results to prevent scraping the whole index.
+_SEARCH_MAX_LIMIT = 50
+# Cap uploaded search/curation images to protect memory and the embedding model.
+_MAX_SEARCH_IMAGE_BYTES = 15 * 1024 * 1024  # 15 MB
+
+
 @app.post("/search")
 async def search(
+    request: Request,
     query: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
     limit: int = 5,
 ):
+    # Public (guest-accessible) but expensive: rate limit per IP so it can't be
+    # used to hammer the embedding model or scrape the catalog.
+    require_rate_limit(request, max_requests=30, window_seconds=60, key_prefix="search")
+
+    limit = max(1, min(limit, _SEARCH_MAX_LIMIT))
     model: GeminiEmbeddingModel = app.state.embedding_model
     collection = app.state.collection
 
+    # Embedding calls are blocking SDK calls — run them off the event loop so
+    # they don't stall other requests.
     if query and file:
         image_bytes = await file.read()
-        embedding = model.get_multimodal_embedding(query, image_bytes, _mime_type(file.filename))
+        _guard_image_size(image_bytes)
+        embedding = await asyncio.to_thread(
+            model.get_multimodal_embedding, query, image_bytes, _mime_type(file.filename)
+        )
     elif query:
-        embedding = model.get_text_embedding(query)
+        embedding = await asyncio.to_thread(model.get_text_embedding, query)
     elif file:
         image_bytes = await file.read()
-        embedding = model.get_image_embedding(image_bytes, _mime_type(file.filename))
+        _guard_image_size(image_bytes)
+        embedding = await asyncio.to_thread(
+            model.get_image_embedding, image_bytes, _mime_type(file.filename)
+        )
     else:
         return {"results": []}
 
@@ -128,12 +156,12 @@ async def search(
     return {"results": results["ids"]}
 
 
-_STUDIO_SSE_HEADERS = {
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "Content-Encoding": "identity",
-    "X-Accel-Buffering": "no",
-}
+def _guard_image_size(image_bytes: bytes) -> None:
+    if len(image_bytes) > _MAX_SEARCH_IMAGE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image too large. Maximum size is {_MAX_SEARCH_IMAGE_BYTES // (1024 * 1024)} MB.",
+        )
 
 
 @app.post("/studio/directions")
@@ -148,6 +176,9 @@ async def studio_directions(
     """
     Step 4 curator: AI search agent picks 9 catalog directions for the studio wizard.
     """
+    # Public (guest-accessible) but very expensive (embeddings + LLM curation).
+    require_rate_limit(request, max_requests=15, window_seconds=60, key_prefix="studio_directions")
+
     try:
         space_data = json.loads(space)
         style_data = json.loads(style)
@@ -160,6 +191,7 @@ async def studio_directions(
     image_bytes = await file.read()
     if not image_bytes:
         raise HTTPException(status_code=422, detail="User space photo is required.")
+    _guard_image_size(image_bytes)
 
     user_mime = _mime_type(file.filename or "space.jpg")
     collection = request.app.state.collection
@@ -177,7 +209,7 @@ async def studio_directions(
                 style=style_data,
             ),
             media_type="text/event-stream",
-            headers=_STUDIO_SSE_HEADERS,
+            headers=SSE_HEADERS,
         )
 
     try:
@@ -191,11 +223,28 @@ async def studio_directions(
             style=style_data,
         )
     except Exception as exc:
-        print(f"[StudioDirections] endpoint error: {exc}")
+        logger.exception("[StudioDirections] endpoint error")
         raise HTTPException(
             status_code=500,
-            detail=str(exc) or "Studio direction curation failed.",
+            detail="Studio direction curation failed.",
         ) from exc
+
+
+_VALID_ASPECT_RATIOS = {"1:1", "4:3", "3:4", "16:9", "9:16"}
+
+
+def _infer_aspect_ratio(width: int, height: int) -> str | None:
+    """Snap raw pixel dimensions to the nearest supported generation ratio.
+
+    Used as a server-side fallback when the client does not send an explicit
+    aspect_ratio, so the output matches the user's space photo instead of
+    whatever ratio Nano Banana picks on its own.
+    """
+    if not width or not height:
+        return None
+    target = width / height
+    candidates = {"1:1": 1.0, "4:3": 4 / 3, "3:4": 3 / 4, "16:9": 16 / 9, "9:16": 9 / 16}
+    return min(candidates, key=lambda r: abs(candidates[r] - target))
 
 
 @app.post("/autogenerate-images")
@@ -210,6 +259,7 @@ async def auto_generate_images(
     prompt: str = Form(None),
     enhance_prompt: bool = Form(True),
     use_image_info: bool = Form(True),
+    aspect_ratio: Optional[str] = Form(None),
     cf_turnstile_token: Optional[str] = Form(None),
     current_user=Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
@@ -254,6 +304,8 @@ async def auto_generate_images(
         raise HTTPException(status_code=422, detail="Provide either 'user_image' (file upload) or 'second_image_id' (Ducon image id).")
     if user_image is not None and second_image_id is not None:
         raise HTTPException(status_code=422, detail="Provide only one of 'user_image' or 'second_image_id', not both.")
+    if aspect_ratio and aspect_ratio not in _VALID_ASPECT_RATIOS:
+        raise HTTPException(status_code=422, detail=f"aspect_ratio must be one of: {_VALID_ASPECT_RATIOS}.")
 
     # ── Resolve primary Ducon image ───────────────────────────────────────────
     if image_id is not None:
@@ -282,6 +334,10 @@ async def auto_generate_images(
             raise HTTPException(status_code=404, detail=f"Second image with id {second_image_id} not found")
         user_img = await _load_ducon_image(second_db_image)
         second_image_name = second_db_image.name or second_db_image.filename
+
+    # Lock the output ratio to the user's space photo: prefer the client-sent
+    # value, else infer it from the second (user-space) image dimensions.
+    active_aspect_ratio = aspect_ratio or _infer_aspect_ratio(*user_img.size)
 
     async def run_generation() -> dict:
         # ── Step 1: Build Nano Banana prompt ─────────────────────────────────
@@ -320,6 +376,8 @@ async def auto_generate_images(
 
         local_output = Path("outputs") / subfolder / generation_filename
         max_gen_rounds = gemini.GEN_EVAL_MAX_ROUNDS if enhance_prompt else 1
+        generation_approved = False
+        last_eval_issues: list[str] = []
 
         for gen_round in range(max_gen_rounds):
             # gemini.combine_images is blocking. Run it off the event loop so
@@ -331,6 +389,7 @@ async def auto_generate_images(
                 user_img,
                 prompt=active_prompt,
                 subfolder=subfolder,
+                aspect_ratio=active_aspect_ratio,
             )
 
             if not enhance_prompt:
@@ -343,27 +402,29 @@ async def auto_generate_images(
                     gen_round=gen_round + 1,
                 )
                 if approved:
-                    print(f"[ImageGenAgent] Approved on generation round {gen_round + 1}")
+                    generation_approved = True
+                    logger.info("[ImageGenAgent] Approved on generation round %d", gen_round + 1)
                     image_gen_agent.schedule_post_success_improvement()
                     break
+                last_eval_issues = list(issues or [])
                 if gen_round + 1 < max_gen_rounds:
-                    print(
-                        f"[ImageGenAgent] Rejected on round {gen_round + 1} "
-                        f"({len(issues)} issue(s)) — requesting improved prompt"
+                    logger.info(
+                        "[ImageGenAgent] Rejected on round %d (%d issue(s)) — requesting improved prompt",
+                        gen_round + 1, len(issues),
                     )
                     active_prompt = await image_gen_agent.generate_retry_prompt(
                         gen_round=gen_round + 1,
                         issues=issues,
                     )
                 else:
-                    print(
-                        f"[ImageGenAgent] Rejected on round {gen_round + 1} — "
-                        f"max rounds reached, keeping last output"
+                    logger.info(
+                        "[ImageGenAgent] Rejected on round %d — max rounds reached, keeping last output",
+                        gen_round + 1,
                     )
                     break
             except Exception as e:
                 # Evaluation failure must not block the response — proceed with current image
-                print(f"[ImageGenAgent] Skipped on generation round {gen_round + 1} due to error: {e}")
+                logger.warning("[ImageGenAgent] Skipped on generation round %d due to error: %s", gen_round + 1, e)
                 break
 
         # ── Step 3: Persist & respond ─────────────────────────────────────────
@@ -395,6 +456,17 @@ async def auto_generate_images(
             if image_gen_agent is not None and image_gen_agent.input_quality \
                     and not image_gen_agent.input_quality.get("ok"):
                 guest_result["input_quality"] = image_gen_agent.input_quality
+            if enhance_prompt and not generation_approved and last_eval_issues:
+                gen_notice = gemini.build_quality_notice(
+                    last_eval_issues,
+                    default_message=(
+                        "We saved the closest result, but some quality checks were not fully met. "
+                        "You can continue in chat to refine or try another direction."
+                    ),
+                    title_prefix="Visualization quality",
+                )
+                if gen_notice:
+                    guest_result["generation_warnings"] = gen_notice
             return guest_result
 
         stored_key = storage.save_generation(current_user.id, generation_filename)
@@ -420,6 +492,17 @@ async def auto_generate_images(
         if image_gen_agent is not None and image_gen_agent.input_quality \
                 and not image_gen_agent.input_quality.get("ok"):
             user_result["input_quality"] = image_gen_agent.input_quality
+        if enhance_prompt and not generation_approved and last_eval_issues:
+            gen_notice = gemini.build_quality_notice(
+                last_eval_issues,
+                default_message=(
+                    "We saved the closest result, but some quality checks were not fully met. "
+                    "You can continue in chat to refine or try another direction."
+                ),
+                title_prefix="Visualization quality",
+            )
+            if gen_notice:
+                user_result["generation_warnings"] = gen_notice
         return user_result
 
     async def stream_autogeneration():
@@ -431,9 +514,9 @@ async def auto_generate_images(
                 await queue.put(("done", result))
             except HTTPException as exc:
                 await queue.put(("error", exc.detail or "Generation failed."))
-            except Exception as exc:
-                print(f"[AutoGenerate] stream error: {exc}")
-                await queue.put(("error", str(exc) or "Generation failed."))
+            except Exception:
+                logger.exception("[AutoGenerate] stream error")
+                await queue.put(("error", "Generation failed. Please try again."))
 
         task = asyncio.create_task(worker())
         try:
@@ -456,7 +539,7 @@ async def auto_generate_images(
     return StreamingResponse(
         stream_autogeneration(),
         media_type="text/event-stream",
-        headers=_STUDIO_SSE_HEADERS,
+        headers=SSE_HEADERS,
     )
 
 

@@ -17,7 +17,15 @@ from app.db.database import get_db
 from app.db.models import User
 
 # ── Config ─────────────────────────────────────────────
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "changeme-use-env-var-in-production")
+from app.config import IS_PRODUCTION
+
+_DEFAULT_SECRET = "changeme-use-env-var-in-production"
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", _DEFAULT_SECRET)
+if IS_PRODUCTION and (not SECRET_KEY or SECRET_KEY == _DEFAULT_SECRET):
+    raise RuntimeError(
+        "JWT_SECRET_KEY must be set to a strong secret in production "
+        "(the default value is not allowed)."
+    )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 week
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -83,11 +91,15 @@ def verify_google_token(token: str) -> dict:
 
 
 # ── Current user dependency ────────────────────────────
-async def get_optional_user(
-    token: Optional[str] = Depends(oauth2_scheme_optional),
-    db: AsyncSession = Depends(get_db),
+async def resolve_user_from_token(
+    token: Optional[str],
+    db: AsyncSession,
 ) -> Optional[User]:
-    """Returns the authenticated User if a valid Bearer token is present, None otherwise."""
+    """Decode a token and return the User row, or None on any failure.
+
+    Single source of truth for the "optional auth" paths (REST optional-user
+    dependency and the voice WebSocket). Honors the in-memory revocation list.
+    """
     if not token:
         return None
     try:
@@ -100,8 +112,16 @@ async def get_optional_user(
             return None
         result = await db.execute(select(User).where(User.id == int(user_id)))
         return result.scalar_one_or_none()
-    except JWTError:
+    except (JWTError, ValueError):
         return None
+
+
+async def get_optional_user(
+    token: Optional[str] = Depends(oauth2_scheme_optional),
+    db: AsyncSession = Depends(get_db),
+) -> Optional[User]:
+    """Returns the authenticated User if a valid Bearer token is present, None otherwise."""
+    return await resolve_user_from_token(token, db)
 
 
 async def get_current_user(

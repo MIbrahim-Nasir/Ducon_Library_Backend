@@ -75,6 +75,8 @@ class GuestSession(Base):
     session_id       = Column(String, nullable=False, unique=True, index=True)  # UUID from X-Guest-Session-Id
     ip_hash          = Column(String, nullable=True)                            # SHA-256 of client IP (non-reversible)
     generation_count = Column(Integer, nullable=False, server_default='0')
+    chat_turn_count  = Column(Integer, nullable=False, server_default='0')
+    voice_turn_count = Column(Integer, nullable=False, server_default='0')
     created_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     last_used_at     = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
 

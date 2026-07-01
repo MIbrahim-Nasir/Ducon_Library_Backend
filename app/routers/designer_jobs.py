@@ -34,12 +34,7 @@ from app.designer_agent import (
 
 router = APIRouter(prefix="/designer/jobs", tags=["designer-jobs"])
 
-_SSE_HEADERS = {
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "Content-Encoding": "identity",
-    "X-Accel-Buffering": "no",
-}
+from app.sse import SSE_HEADERS as _SSE_HEADERS
 _LIVE_DEBUG: bool = os.getenv("LIVE_DEBUG", "").lower() in ("1", "true", "yes")
 
 

@@ -86,6 +86,7 @@ from app.auth import get_current_user
 from app.db.database import get_db
 from app.db.models import User
 from app.image_utils import normalize_user_image
+from app.sse import SSE_HEADERS
 from app.tool_generate_image import (
     MAX_IMAGES,
     ImageDescriptor,
@@ -100,12 +101,6 @@ _VALID_TYPES    = {"catalog_id", "catalog_name", "generation_id", "url", "file"}
 _VALID_MODELS   = {"pro", "flash"}
 _VALID_RATIOS   = {"1:1", "4:3", "3:4", "16:9", "9:16"}
 
-_GEN_SSE_HEADERS = {
-    "Cache-Control":     "no-cache",
-    "Connection":        "keep-alive",
-    "Content-Encoding":  "identity",
-    "X-Accel-Buffering": "no",  # disable nginx / Cloudflare buffering
-}
 _KEEPALIVE_INTERVAL = 10.0  # seconds — well under Cloudflare's 100 s idle timeout
 
 
@@ -313,7 +308,7 @@ async def create_multi_image_generation(
             db=db,
         ),
         media_type="text/event-stream",
-        headers=_GEN_SSE_HEADERS,
+        headers=SSE_HEADERS,
     )
 
 

@@ -533,11 +533,13 @@ class GeminiLiveSession:
         self,
         *,
         user_id: Optional[int] = None,
+        guest_session_id: Optional[str] = None,
         system_instruction: Optional[str] = None,
         resumption_handle: Optional[str] = None,
         model: str = LIVE_MODEL,
     ) -> None:
         self.user_id = user_id
+        self.guest_session_id = guest_session_id
         self.system_instruction = system_instruction or get_live_system_instruction()
         self.resumption_handle = resumption_handle
         self.model = model
@@ -588,6 +590,17 @@ class GeminiLiveSession:
         # Saved at turn_complete so _maybe_retry_tool_call can read it after
         # _pending_audio_bytes has been reset for the next turn.
         self._last_turn_audio_bytes: int = 0
+
+    def seed_history(self, turns: list[dict]) -> None:
+        """
+        Pre-load chat transcript turns before the first Live connect.
+
+        Used to sync text-chat context into a new voice session (chat → voice).
+        Each turn must be a Gemini Content dict: {role, parts: [{text}]}. 
+        """
+        if not turns:
+            return
+        self._conversation_history = list(turns)[-_MAX_HISTORY_TURNS:]
 
     # ── Config ────────────────────────────────────────────────────────────────
 
@@ -1077,22 +1090,26 @@ class GeminiLiveSession:
                     # model speaks its greeting immediately without waiting for
                     # the user to say something first.
                     # On reconnects _conversation_history is already populated,
-                    # so this block is skipped and the model resumes normally.
+                    # so use a resume trigger instead of the fresh-session greeting.
                     if not self._conversation_history:
-                        try:
-                            await session.send_realtime_input(  # type: ignore[attr-defined]
-                                text="[session_start]"
-                            )
-                            logger.info(
-                                "Auto-greeting trigger sent — user=%s", self.user_id
-                            )
-                            _dbg(f"[LIVE ▶ SEND] greeting trigger → [session_start]  (user={self.user_id})")
-                        except Exception as greet_exc:
-                            logger.warning(
-                                "Auto-greeting trigger failed: %s — user=%s",
-                                greet_exc, self.user_id,
-                            )
-                            _dbg(f"[LIVE ✗ SEND] greeting trigger FAILED: {greet_exc}  (user={self.user_id})")
+                        trigger = "[session_start]"
+                    else:
+                        trigger = "[session_resume]"
+                    try:
+                        await session.send_realtime_input(  # type: ignore[attr-defined]
+                            text=trigger,
+                        )
+                        logger.info(
+                            "Session trigger sent (%s) — user=%s history_turns=%d",
+                            trigger, self.user_id, len(self._conversation_history),
+                        )
+                        _dbg(f"[LIVE ▶ SEND] trigger → {trigger}  history={len(self._conversation_history)}  (user={self.user_id})")
+                    except Exception as greet_exc:
+                        logger.warning(
+                            "Session trigger failed: %s — user=%s",
+                            greet_exc, self.user_id,
+                        )
+                        _dbg(f"[LIVE ✗ SEND] trigger FAILED: {greet_exc}  (user={self.user_id})")
 
                     # ── Multi-turn receive loop ───────────────────────────────
                     # Per the docs, session.receive() processes ONE complete
@@ -1417,6 +1434,18 @@ class GeminiLiveSession:
                 "role": "model",
                 "parts": [{"text": model_text}],
             })
+
+        # Mirror completed voice turns into the shared chat transcript so a
+        # later voice session can seed chat context (chat ↔ voice sync).
+        if user_text or model_text:
+            if self.user_id is not None:
+                from app import chat_session
+                chat_session.append_turn(self.user_id, user_text, model_text)
+            elif self.guest_session_id:
+                from app import chat_session
+                chat_session.append_guest_turn(
+                    self.guest_session_id, user_text, model_text,
+                )
 
         # Trim oldest turns to stay within _MAX_HISTORY_TURNS.
         if len(self._conversation_history) > _MAX_HISTORY_TURNS:

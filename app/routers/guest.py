@@ -3,70 +3,76 @@ app/routers/guest.py
 ────────────────────
 Guest-user endpoints:
 
-  GET  /guest/gen-count                 — returns { used, limit } for a guest session
+  GET  /guest/usage                     — { generations, chat, voice } used/limit
+  GET  /guest/gen-count                 — legacy { used, limit } for generations
   POST /auth/claim-guest-generations    — migrates guest generations to an authenticated user
   POST /guest/cleanup                   — deletes expired, unclaimed records (run via cron)
   GET  /guest/generations/{id}/image    — serves a local guest generation (local mode only)
 
-Rate limiting strategy:
-  - Cloudflare Turnstile token required on every guest generation request.
-    The token is verified server-to-server — bots and scripts cannot generate
-    valid tokens. This replaces the previous IP-based rate limiting.
-  - Session-based limit (GUEST_GEN_LIMIT) is still enforced as a business rule:
-    each guest session gets N free generations before being asked to sign up.
+Rate limiting:
+  - Cloudflare Turnstile on guest generation and chat requests.
+  - Per-feature session limits (generation / chat / voice).
+  - IP total cap across all features (GUEST_IP_TOTAL_LIMIT).
+
+Generation limits count one completed output image per pipeline run — internal
+eval/retry rounds do not increment the counter.
 """
 
-import hashlib
+import hmac
 import os
-from datetime import datetime, timezone
+import uuid
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import storage
 from app.auth import get_current_user
+from app.config import IS_PRODUCTION
 from app.db.database import get_db
+from app.hashing import sha256_hex
+from app.rate_limiter import require_rate_limit
+from app.signed_urls import verify_guest_generation
 from app.db.models import Generation, GuestConsentAudit, GuestGeneration, GuestSession
+from app.guest_usage import (
+    GuestUsageKind,
+    enforce_guest_limit,
+    increment_guest_usage,
+    usage_snapshot,
+)
 
 router = APIRouter(tags=["guest"])
 
-GUEST_GEN_LIMIT      = int(os.getenv("GUEST_GEN_LIMIT",    "3"))
-# Higher than session limit to allow a few legitimate session resets (cleared cookies,
-# different browser) while still blocking the most obvious abuse.
-GUEST_IP_GEN_LIMIT   = int(os.getenv("GUEST_IP_GEN_LIMIT", "6"))
 TURNSTILE_SECRET     = os.getenv("TURNSTILE_SECRET_KEY", "")
 TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+# Shared secret required to run the cleanup job (set in the cron environment).
+CLEANUP_CRON_SECRET  = os.getenv("GUEST_CLEANUP_SECRET", "")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _hash(value: str) -> str:
-    return hashlib.sha256(value.encode()).hexdigest()
-
-
-_LIMIT_EXCEEDED = {
-    "detail": "Guest generation limit reached. Sign up to continue.",
-    "code": "GUEST_LIMIT_REACHED",
-}
+    return sha256_hex(value)
 
 
 async def verify_turnstile(token: str, ip: str) -> bool:
     """
     Verifies a Cloudflare Turnstile token server-to-server.
 
-    - If TURNSTILE_SECRET_KEY is not set: skips verification (local dev only).
+    - If TURNSTILE_SECRET_KEY is not set:
+        • production → fail closed (verification cannot be trusted).
+        • local dev  → skip verification.
     - If TURNSTILE_SECRET_KEY is set: token MUST be present and valid.
-      A missing or empty token is an immediate failure — the frontend must
-      always include the token when a site key is configured.
     """
     if not TURNSTILE_SECRET:
-        return True  # Dev mode — no secret configured, skip
+        # Fail closed in production: a missing secret must not silently disable
+        # bot protection on paid AI endpoints.
+        return not IS_PRODUCTION
     if not token:
-        return False  # Secret is configured but token was not sent — reject
+        return False
     async with httpx.AsyncClient(timeout=10) as client:
         r = await client.post(
             TURNSTILE_VERIFY_URL,
@@ -79,51 +85,23 @@ async def get_or_create_guest_session(
     db: AsyncSession,
     session_id: str,
     ip: str,
+    *,
+    usage_kind: GuestUsageKind = GuestUsageKind.GENERATION,
 ) -> GuestSession:
     """
-    Fetch or create the GuestSession row, enforcing two limits:
-
-    1. IP limit (primary gate) — total generations across ALL sessions from this IP.
-       Stops the most common bypass: clearing cookies to get a fresh session ID.
-       Turnstile stops bots; IP limit stops humans who clear site data.
-       Set GUEST_IP_GEN_LIMIT slightly above GUEST_GEN_LIMIT so a legitimate user
-       who accidentally clears cookies still gets a couple of retries.
-
-    2. Session limit (secondary) — generations on this specific session ID.
-       This is the counter the frontend UI shows to the user.
+    Fetch/create guest session and enforce limits for the requested feature.
+    Used by generation, chat, and voice entry points.
     """
-    ip_hash = _hash(ip)
-
-    # ── Primary gate: IP total (single aggregate query, not fetching all rows) ──
-    ip_result = await db.execute(
-        select(func.coalesce(func.sum(GuestSession.generation_count), 0))
-        .where(GuestSession.ip_hash == ip_hash)
-    )
-    ip_total = ip_result.scalar()
-    if ip_total >= GUEST_IP_GEN_LIMIT:
-        raise HTTPException(status_code=429, detail=_LIMIT_EXCEEDED)
-
-    # ── Session lookup / creation ─────────────────────────────────────────────
-    result = await db.execute(
-        select(GuestSession).where(GuestSession.session_id == session_id)
-    )
-    session = result.scalar_one_or_none()
-
-    if session is None:
-        session = GuestSession(session_id=session_id, ip_hash=ip_hash, generation_count=0)
-        db.add(session)
-        await db.flush()
-    elif session.generation_count >= GUEST_GEN_LIMIT:
-        raise HTTPException(status_code=429, detail=_LIMIT_EXCEEDED)
-
-    return session
+    try:
+        uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid X-Guest-Session-Id. Must be a valid UUID.")
+    return await enforce_guest_limit(db, session_id, _hash(ip), usage_kind)
 
 
 async def increment_guest_count(db: AsyncSession, session: GuestSession) -> None:
-    """Increment the generation counter and update last_used_at."""
-    session.generation_count += 1
-    session.last_used_at = datetime.now(timezone.utc)
-    await db.flush()
+    """Increment generation counter after a saved output image (legacy name)."""
+    await increment_guest_usage(db, session, GuestUsageKind.GENERATION)
 
 
 async def log_guest_consent(
@@ -142,23 +120,35 @@ async def log_guest_consent(
     await db.flush()
 
 
-# ── GET /guest/gen-count ───────────────────────────────────────────────────────
+# ── GET /guest/usage ───────────────────────────────────────────────────────────
 
-@router.get("/guest/gen-count")
-async def guest_gen_count(
-    x_guest_session_id: str = Header(...),
+@router.get("/guest/usage")
+async def guest_usage(
+    x_guest_session_id: str = Header(..., alias="X-Guest-Session-Id"),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Returns the current usage count for a guest session.
-    Allows the frontend to re-sync the counter if localStorage was cleared.
-    """
+    """Returns per-feature usage for a guest session."""
     result = await db.execute(
         select(GuestSession).where(GuestSession.session_id == x_guest_session_id)
     )
     session = result.scalar_one_or_none()
-    used = session.generation_count if session else 0
-    return {"used": used, "limit": GUEST_GEN_LIMIT}
+    return usage_snapshot(session)
+
+
+# ── GET /guest/gen-count (legacy) ──────────────────────────────────────────────
+
+@router.get("/guest/gen-count")
+async def guest_gen_count(
+    x_guest_session_id: str = Header(..., alias="X-Guest-Session-Id"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Legacy endpoint — generation counts only."""
+    result = await db.execute(
+        select(GuestSession).where(GuestSession.session_id == x_guest_session_id)
+    )
+    session = result.scalar_one_or_none()
+    snap = usage_snapshot(session)
+    return {"used": snap["generations"]["used"], "limit": snap["generations"]["limit"]}
 
 
 # ── POST /auth/claim-guest-generations ────────────────────────────────────────
@@ -170,18 +160,19 @@ class ClaimRequest(BaseModel):
 @router.post("/auth/claim-guest-generations")
 async def claim_guest_generations(
     body: ClaimRequest,
+    request: Request,
     current_user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Migrates unexpired guest generations to the authenticated user's account:
-      1. Moves each file in R2: guests/{session_id}/… → generations/{user_id}/…
-      2. Creates a permanent Generation record in the generations table
-      3. Deletes the GuestGeneration record
-
-    Called by the frontend immediately after login / signup.
-    Returns { "claimed": N } — gracefully returns 0 if TTL already expired.
+    Migrates unexpired guest generations to the authenticated user's account.
     """
+    from datetime import datetime, timezone
+
+    # Defense-in-depth: session ids are random UUIDs, but rate-limit anyway so a
+    # client can't brute-force-scan guest sessions to claim someone else's work.
+    require_rate_limit(request, max_requests=20, window_seconds=60, key_prefix="claim_guest")
+
     now = datetime.now(timezone.utc)
 
     result = await db.execute(
@@ -202,7 +193,7 @@ async def claim_guest_generations(
                 user_id=current_user.id,
             )
         except Exception:
-            continue  # File already gone — skip silently
+            continue
 
         db.add(Generation(
             user_id=current_user.id,
@@ -224,7 +215,8 @@ async def claim_guest_generations(
 # ── POST /guest/cleanup ────────────────────────────────────────────────────────
 
 async def _run_cleanup(db: AsyncSession) -> int:
-    """Deletes expired, unclaimed guest generations from R2 and the DB."""
+    from datetime import datetime, timezone
+
     now = datetime.now(timezone.utc)
 
     result = await db.execute(
@@ -253,11 +245,18 @@ async def _run_cleanup(db: AsyncSession) -> int:
 
 
 @router.post("/guest/cleanup")
-async def guest_cleanup(db: AsyncSession = Depends(get_db)):
-    """
-    Deletes expired, unclaimed guest generations.
-    No auth — safe to call from an external daily cron.
-    """
+async def guest_cleanup(
+    x_cron_secret: str = Header("", alias="X-Cron-Secret"),
+    db: AsyncSession = Depends(get_db),
+):
+    # Protect the destructive cleanup job. When a secret is configured it must
+    # match; in production a secret is mandatory.
+    if CLEANUP_CRON_SECRET:
+        if not hmac.compare_digest(x_cron_secret or "", CLEANUP_CRON_SECRET):
+            raise HTTPException(status_code=403, detail="Forbidden.")
+    elif IS_PRODUCTION:
+        raise HTTPException(status_code=403, detail="Cleanup secret not configured.")
+
     deleted = await _run_cleanup(db)
     return {"deleted": deleted}
 
@@ -267,9 +266,13 @@ async def guest_cleanup(db: AsyncSession = Depends(get_db)):
 @router.get("/guest/generations/{generation_id}/image")
 async def serve_guest_generation(
     generation_id: int,
+    token: str = "",
     db: AsyncSession = Depends(get_db),
 ):
-    """Serves a guest generation image from local disk (local storage mode only)."""
+    # Signed-URL check: prevents enumerating other guests' generations by id.
+    if not verify_guest_generation(generation_id, token):
+        raise HTTPException(status_code=403, detail="Invalid or missing signature.")
+
     result = await db.execute(
         select(GuestGeneration).where(GuestGeneration.id == generation_id)
     )

@@ -3,6 +3,27 @@ IMAGES_FOLDER = path to images folder
 DATABASE_URL = postgresql+asyncpg://user:password@localhost/Ducon_Library
 JWT_SECRET_KEY = ducon_industries_fzco_jwt_key
 GOOGLE_CLIENT_ID = your-google-oauth-client-id.apps.googleusercontent.com
+
+# ─── Deployment / security (REQUIRED in production) ───────────────────────────
+# ENV=production enables fail-closed behaviour:
+#   • JWT_SECRET_KEY must be set to a strong non-default value
+#   • DATABASE_URL must be set (no fallback)
+#   • Turnstile verification fails closed if TURNSTILE_SECRET_KEY is unset
+#   • CORS blocks all cross-origin requests unless CORS_ALLOW_ORIGINS is set
+ENV = development
+# Comma-separated allowed browser origins for CORS (production must set this).
+CORS_ALLOW_ORIGINS = https://app.your-domain.com
+# Secret required to trigger POST /guest/cleanup (send as X-Cron-Secret header).
+GUEST_CLEANUP_SECRET =
+# Secret used to sign local-mode guest image URLs (defaults to JWT_SECRET_KEY).
+URL_SIGNING_SECRET =
+# DB connection pool tuning (optional; sensible defaults applied).
+DB_POOL_SIZE = 10
+DB_MAX_OVERFLOW = 20
+DB_POOL_RECYCLE = 1800
+
+# Cloudflare Turnstile (bot protection on guest AI endpoints).
+TURNSTILE_SECRET_KEY =
 METADATA_PATH = data/images/metadata.json
 IMAGES_BASE_URL = https://your-vps-domain.com/images
 METADATA_CACHE_TTL = 86400
@@ -33,3 +54,23 @@ MODEL_DEVICE = auto
 TEXT_COLLECTION_BASE = text_store
 IMAGE_COLLECTION_BASE = image_store
 FUSED_COLLECTION_BASE = fused_store
+
+# ─── Image generation QC (Studio, chat generate_multi_image, autogenerate) ───
+# Optional — defaults apply if omitted (GEN_EVAL_MAX_ROUNDS=3, PROMPT_VERIFY_MAX_ROUNDS=2)
+GEN_EVAL_MAX_ROUNDS = 3
+PROMPT_VERIFY_MAX_ROUNDS = 2
+IMAGE_GEN_AGENT_AUTO_LEARN = false
+MULTI_IMAGE_PRO_MODEL = gemini-3-pro-image-preview
+MULTI_IMAGE_FLASH_MODEL = gemini-3.1-flash-image-preview
+MULTI_IMAGE_THINKING_LEVEL = High
+
+# ─── Guest (unauthenticated) usage limits ─────────────────────────────────────
+# Generation counts one saved output image per pipeline run (retries do not count).
+# Chat counts one /chat/message turn through SSE done (tool_result continuations do not).
+# Voice counts one completed voice turn (turn_complete).
+GUEST_GEN_LIMIT = 3
+GUEST_CHAT_LIMIT = 10
+GUEST_VOICE_LIMIT = 5
+GUEST_IP_TOTAL_LIMIT = 15
+# Legacy alias — used as GUEST_IP_TOTAL_LIMIT fallback if unset
+GUEST_IP_GEN_LIMIT = 6

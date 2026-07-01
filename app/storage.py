@@ -175,7 +175,8 @@ def get_guest_generation_url(generation_id: int, stored_key: str) -> str:
             Params={"Bucket": _R2_PRIVATE_BUCKET, "Key": stored_key},
             ExpiresIn=_PRESIGNED_URL_EXPIRY,
         )
-    return f"/guest/generations/{generation_id}/image"
+    from app.signed_urls import sign_guest_generation
+    return f"/guest/generations/{generation_id}/image?token={sign_guest_generation(generation_id)}"
 
 
 def move_guest_to_user(session_id: str, filename: str, user_id: int) -> str:

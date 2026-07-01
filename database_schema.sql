@@ -48,14 +48,24 @@ CREATE INDEX idx_bookmarks_image_id ON bookmarks(image_id);
 CREATE INDEX idx_generations_ducon_image_id ON generations(ducon_image_id);
 
 -- ── Guest tables ───────────────────────────────────────────────────────────────
+-- Guest usage limits (per session_id UUID from X-Guest-Session-Id):
+--   generation_count — one saved pipeline output (internal retries do not count)
+--   chat_turn_count  — one /chat/message SSE done (tool_result continuations do not)
+--   voice_turn_count — one voice turn_complete
+-- IP cap (GUEST_IP_TOTAL_LIMIT) sums all three columns across rows sharing ip_hash.
 
 CREATE TABLE guest_sessions (
   id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY NOT NULL,
-  session_id       varchar NOT NULL UNIQUE,
-  ip_hash          varchar,
+  session_id       varchar NOT NULL UNIQUE,   -- UUID from X-Guest-Session-Id (unique index implicit)
+  ip_hash          varchar,                   -- SHA-256 of client IP (non-reversible)
   generation_count integer NOT NULL DEFAULT 0,
+  chat_turn_count  integer NOT NULL DEFAULT 0,
+  voice_turn_count integer NOT NULL DEFAULT 0,
   created_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL,
-  last_used_at     TIMESTAMPTZ DEFAULT NOW() NOT NULL
+  last_used_at     TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+  CONSTRAINT guest_sessions_generation_count_nonneg CHECK (generation_count >= 0),
+  CONSTRAINT guest_sessions_chat_turn_count_nonneg CHECK (chat_turn_count >= 0),
+  CONSTRAINT guest_sessions_voice_turn_count_nonneg CHECK (voice_turn_count >= 0)
 );
 
 CREATE TABLE guest_generations (
@@ -77,14 +87,49 @@ CREATE TABLE guest_consent_audit (
   logged_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL
 );
 
-CREATE INDEX idx_guest_sessions_session_id   ON guest_sessions (session_id);
-CREATE INDEX idx_guest_sessions_ip_hash      ON guest_sessions (ip_hash);
-CREATE INDEX idx_guest_generations_session   ON guest_generations (guest_session_id);
-CREATE INDEX idx_guest_generations_user_id   ON guest_generations (user_id);
-CREATE INDEX idx_guest_generations_expires   ON guest_generations (expires_at);
+-- guest_sessions: ip_hash — IP total cap (sum of usage columns WHERE ip_hash = ?)
+CREATE INDEX idx_guest_sessions_ip_hash ON guest_sessions (ip_hash)
+  WHERE ip_hash IS NOT NULL;
 
--- ── ALTER queries for existing databases (run these if tables above don't exist yet) ──
--- CREATE TABLE guest_sessions ( ... );   -- run full CREATE above
--- CREATE TABLE guest_generations ( ... );
--- CREATE TABLE guest_consent_audit ( ... );
+-- guest_sessions: stale-session / cleanup sweeps by last activity
+CREATE INDEX idx_guest_sessions_last_used_at ON guest_sessions (last_used_at);
+
+-- guest_generations: claim + list by guest session
+CREATE INDEX idx_guest_generations_session ON guest_generations (guest_session_id);
+
+-- guest_generations: claim after login
+CREATE INDEX idx_guest_generations_user_id ON guest_generations (user_id)
+  WHERE user_id IS NOT NULL;
+
+-- guest_generations: /guest/cleanup cron (expires_at < now)
+CREATE INDEX idx_guest_generations_expires ON guest_generations (expires_at)
+  WHERE expires_at IS NOT NULL;
+
+-- guest_consent_audit: time-range audit queries
+CREATE INDEX idx_guest_consent_audit_logged_at ON guest_consent_audit (logged_at);
+
+-- ── Migrations for existing databases ───────────────────────────────────────────
+
+-- Guest tables missing entirely — run the CREATE TABLE blocks above, then indexes.
+
+-- guest_sessions exists but predates chat/voice limits:
+-- ALTER TABLE guest_sessions ADD COLUMN IF NOT EXISTS chat_turn_count integer NOT NULL DEFAULT 0;
+-- ALTER TABLE guest_sessions ADD COLUMN IF NOT EXISTS voice_turn_count integer NOT NULL DEFAULT 0;
+-- ALTER TABLE guest_sessions DROP CONSTRAINT IF EXISTS guest_sessions_generation_count_nonneg;
+-- ALTER TABLE guest_sessions ADD CONSTRAINT guest_sessions_generation_count_nonneg CHECK (generation_count >= 0);
+-- ALTER TABLE guest_sessions DROP CONSTRAINT IF EXISTS guest_sessions_chat_turn_count_nonneg;
+-- ALTER TABLE guest_sessions ADD CONSTRAINT guest_sessions_chat_turn_count_nonneg CHECK (chat_turn_count >= 0);
+-- ALTER TABLE guest_sessions DROP CONSTRAINT IF EXISTS guest_sessions_voice_turn_count_nonneg;
+-- ALTER TABLE guest_sessions ADD CONSTRAINT guest_sessions_voice_turn_count_nonneg CHECK (voice_turn_count >= 0);
+-- CREATE INDEX IF NOT EXISTS idx_guest_sessions_last_used_at ON guest_sessions (last_used_at);
+-- CREATE INDEX IF NOT EXISTS idx_guest_consent_audit_logged_at ON guest_consent_audit (logged_at);
+-- DROP INDEX IF EXISTS idx_guest_sessions_session_id;  -- redundant with UNIQUE(session_id)
+-- DROP INDEX IF EXISTS idx_guest_generations_user_id;
+-- CREATE INDEX IF NOT EXISTS idx_guest_generations_user_id ON guest_generations (user_id) WHERE user_id IS NOT NULL;
+-- DROP INDEX IF EXISTS idx_guest_generations_expires;
+-- CREATE INDEX IF NOT EXISTS idx_guest_generations_expires ON guest_generations (expires_at) WHERE expires_at IS NOT NULL;
+
+-- Replace non-partial ip_hash index if upgrading from an older schema:
+-- DROP INDEX IF EXISTS idx_guest_sessions_ip_hash;
+-- CREATE INDEX IF NOT EXISTS idx_guest_sessions_ip_hash ON guest_sessions (ip_hash) WHERE ip_hash IS NOT NULL;
 

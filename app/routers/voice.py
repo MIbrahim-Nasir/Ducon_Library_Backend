@@ -12,11 +12,10 @@ Endpoint
 
   Session lifetime
   ----------------
-  Each WebSocket connection maps to exactly one fresh Gemini Live session.
-  There is no history from a previous conversation — closing the browser tab
-  / voice modal and reopening it always starts clean.
-
-  Within a single connection, the backend transparently handles:
+    Each WebSocket connection maps to exactly one fresh Gemini Live session.
+    Text-chat history (when the user has an active chat session) is seeded
+    into the Live session so voice can continue where text left off.
+    Within a single connection, the backend transparently handles:
     • The Gemini ~10-minute WSS connection limit (reconnects with a
       server-issued resumption handle, context preserved).
     • Transient keepalive drops (reconnect with exponential back-off).
@@ -108,40 +107,40 @@ Error codes
 from __future__ import annotations
 
 import asyncio
+from app.hashing import sha256_hex
 import json
 import logging
 import uuid
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
-from jose import JWTError, jwt
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
 
 from app.db.database import get_db
 from app.db.models import User
 from app.live_session import GeminiLiveSession, LiveEvent, LiveEventType, _dbg
-from app.auth import SECRET_KEY, ALGORITHM
+from app.auth import resolve_user_from_token
+from app import chat_session
+from app.guest_usage import (
+    GuestUsageKind,
+    enforce_guest_limit,
+    increment_guest_usage,
+)
+from app.routers.guest import get_or_create_guest_session
 
 router = APIRouter(tags=["voice"])
 logger = logging.getLogger(__name__)
+
+
+def _hash_ip(ip: str) -> str:
+    return sha256_hex(ip)
 
 
 # ── Auth helper ───────────────────────────────────────────────────────────────
 
 async def _resolve_user(token: Optional[str], db: AsyncSession) -> Optional[User]:
     """Decode an optional JWT and return the User row (or None for guests)."""
-    if not token:
-        return None
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            return None
-        result = await db.execute(select(User).where(User.id == int(user_id)))
-        return result.scalar_one_or_none()
-    except (JWTError, ValueError):
-        return None
+    return await resolve_user_from_token(token, db)
 
 
 # ── WebSocket endpoint ─────────────────────────────────────────────────────────
@@ -150,6 +149,10 @@ async def _resolve_user(token: Optional[str], db: AsyncSession) -> Optional[User
 async def voice_ws(
     websocket: WebSocket,
     token: Optional[str] = Query(default=None, description="JWT access token"),
+    guest_session_id: Optional[str] = Query(
+        default=None,
+        description="Guest session UUID (required for unauthenticated voice)",
+    ),
 ):
     """
     Bidirectional WebSocket bridge between the client and Gemini Live API.
@@ -160,9 +163,12 @@ async def voice_ws(
     """
     await websocket.accept()
     session_id = str(uuid.uuid4())
+    client_ip = websocket.client.host if websocket.client else "unknown"
 
-    # ── Resolve user (best-effort — reject only if token is explicitly wrong) ─
+    # ── Resolve user or guest session ─────────────────────────────────────────
     user: Optional[User] = None
+    guest_db_session_id: Optional[str] = None
+
     if token:
         async for db in get_db():
             user = await _resolve_user(token, db)
@@ -170,14 +176,86 @@ async def voice_ws(
                 await websocket.close(code=4001, reason="Invalid or expired token")
                 logger.warning("Voice WS rejected — invalid token (session %s)", session_id)
                 return
-            break  # single DB iteration
+            break
+
+    elif guest_session_id:
+        guest_db_session_id = guest_session_id
+        try:
+            async for db in get_db():
+                await get_or_create_guest_session(
+                    db,
+                    guest_session_id,
+                    client_ip,
+                    usage_kind=GuestUsageKind.VOICE,
+                )
+                await db.commit()
+                break
+        except Exception as exc:
+            from fastapi import HTTPException
+            if isinstance(exc, HTTPException) and exc.status_code == 429:
+                await _send_json(
+                    websocket,
+                    {
+                        "type": "error",
+                        "message": "Guest limit reached. Sign up to continue.",
+                        "code": "GUEST_LIMIT_REACHED",
+                    },
+                )
+                await websocket.close(code=4003, reason="Guest limit reached")
+                return
+            raise
+    else:
+        await websocket.close(code=4001, reason="Authentication required")
+        logger.warning("Voice WS rejected — no token or guest_session_id (session %s)", session_id)
+        return
 
     user_id = user.id if user else None
-    user_label = f"user={user_id}" if user_id else "guest"
+    user_label = f"user={user_id}" if user_id else f"guest={guest_db_session_id}"
     logger.info("Voice WS connected — %s session=%s", user_label, session_id)
 
-    # ── Create a fresh Gemini Live session — no handle, no prior history ──────
-    gemini_session = GeminiLiveSession(user_id=user_id)
+    async def _increment_guest_voice() -> bool:
+        """Count one completed voice turn; return False when guest limit is exhausted."""
+        if not guest_db_session_id:
+            return True
+        try:
+            async for db in get_db():
+                row = await enforce_guest_limit(
+                    db,
+                    guest_db_session_id,
+                    _hash_ip(client_ip),
+                    GuestUsageKind.VOICE,
+                )
+                await increment_guest_usage(db, row, GuestUsageKind.VOICE)
+                await db.commit()
+                return True
+        except Exception as exc:
+            from fastapi import HTTPException
+            if isinstance(exc, HTTPException) and exc.status_code == 429:
+                return False
+            logger.exception("Voice WS guest usage increment failed — session=%s", session_id)
+            return True
+
+    # ── Create Gemini Live session — seed chat transcript when available ───────
+    gemini_session = GeminiLiveSession(
+        user_id=user_id,
+        guest_session_id=guest_db_session_id,
+    )
+    if user_id is not None:
+        seed_turns = chat_session.get_voice_seed_turns(user_id)
+        if seed_turns:
+            gemini_session.seed_history(seed_turns)
+            logger.info(
+                "Voice WS seeding %d chat turn(s) — user=%s session=%s",
+                len(seed_turns), user_id, session_id,
+            )
+    elif guest_db_session_id:
+        seed_turns = chat_session.get_guest_voice_seed_turns(guest_db_session_id)
+        if seed_turns:
+            gemini_session.seed_history(seed_turns)
+            logger.info(
+                "Voice WS seeding %d chat turn(s) — guest=%s session=%s",
+                len(seed_turns), guest_db_session_id, session_id,
+            )
     event_queue: asyncio.Queue[LiveEvent] = asyncio.Queue()
 
     try:
@@ -196,7 +274,12 @@ async def voice_ws(
         name=f"client→gemini-{session_id[:8]}",
     )
     gemini_to_client_task = asyncio.create_task(
-        _relay_gemini_to_client(websocket, event_queue, session_id),
+        _relay_gemini_to_client(
+            websocket,
+            event_queue,
+            session_id,
+            on_turn_complete=_increment_guest_voice if guest_db_session_id else None,
+        ),
         name=f"gemini→client-{session_id[:8]}",
     )
 
@@ -330,6 +413,7 @@ async def _relay_gemini_to_client(
     ws: WebSocket,
     event_queue: asyncio.Queue[LiveEvent],
     session_id: str,
+    on_turn_complete: Optional[Callable[[], Awaitable[bool]]] = None,
 ) -> None:
     """
     Drain the LiveEvent queue and forward each event as JSON to the client.
@@ -352,24 +436,39 @@ async def _relay_gemini_to_client(
             try:
                 await _send_json(ws, payload)
             except (WebSocketDisconnect, RuntimeError) as exc:
-                # WebSocket closed or in a terminal state — stop relaying.
                 logger.info(
                     "Voice WS write failed (client gone): %s — session=%s",
                     exc, session_id,
                 )
                 return
             except Exception:
-                # Unexpected error (e.g. JSON serialisation) — log it clearly
-                # and keep the relay alive so other events still reach the client.
                 logger.exception(
                     "Voice WS send error (event_type=%s) — session=%s",
                     payload.get("type"), session_id,
                 )
                 continue
 
-            # Fatal error — close the WebSocket.
-            # RECONNECTING is informational; the session runner will restore
-            # itself, so we keep the WebSocket open.
+            if event.type == LiveEventType.TURN_COMPLETE and on_turn_complete:
+                try:
+                    allowed = await on_turn_complete()
+                except Exception:
+                    logger.exception(
+                        "Voice WS guest usage increment failed — session=%s",
+                        session_id,
+                    )
+                    allowed = True
+                if not allowed:
+                    await _send_json(
+                        ws,
+                        {
+                            "type": "error",
+                            "message": "Guest limit reached. Sign up to continue.",
+                            "code": "GUEST_LIMIT_REACHED",
+                        },
+                    )
+                    await ws.close(code=4003, reason="Guest limit reached")
+                    return
+
             if event.type == LiveEventType.ERROR:
                 await ws.close(code=1011, reason=event.message or "Gemini error")
                 return

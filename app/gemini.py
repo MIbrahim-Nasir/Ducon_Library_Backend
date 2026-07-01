@@ -40,7 +40,8 @@ _PROMPT_THINKING_LEVEL = os.getenv("PROMPT_THINKING_LEVEL", "High")
 # After this many rounds the pipeline proceeds regardless.
 PROMPT_VERIFY_MAX_ROUNDS: int = int(os.getenv("PROMPT_VERIFY_MAX_ROUNDS", "2"))
 
-# Maximum generation+evaluation rounds in the post-gen loop.
+# Maximum generation+evaluation rounds in the post-gen loop (Studio, chat multi-image, autogenerate).
+# Override in .env: GEN_EVAL_MAX_ROUNDS=5
 GEN_EVAL_MAX_ROUNDS: int = int(os.getenv("GEN_EVAL_MAX_ROUNDS", "3"))
 
 # Nano Banana 2 only — controls reasoning depth before image generation.
@@ -292,6 +293,28 @@ def extract_input_quality(data: dict) -> dict | None:
             )
 
     return {"ok": False, "severity": severity, "issues": issues, "user_message": message}
+
+
+def build_quality_notice(
+    issues: list[str],
+    *,
+    default_message: str,
+    title_prefix: str = "",
+) -> dict | None:
+    """
+    Build a user-facing notice dict from a list of QC issue strings.
+    Used for input-photo flags and best-effort generation warnings.
+    """
+    clean = [str(i).strip() for i in issues if str(i).strip()]
+    if not clean:
+        return None
+    severity = "major" if len(clean) >= 3 else "minor"
+    joined = "; ".join(clean[:5])
+    if title_prefix:
+        message = f"{title_prefix}: {joined}"
+    else:
+        message = default_message if not joined else f"{default_message} ({joined})"
+    return {"ok": False, "severity": severity, "issues": clean, "user_message": message}
 
 
 def log_section_analysis(
@@ -573,6 +596,7 @@ def combine_images(
     image2: Image.Image,
     prompt: str,
     subfolder: str = None,
+    aspect_ratio: str | None = None,
 ):
     """
     Sends both images and the generated prompt to the configured image generation
@@ -585,14 +609,20 @@ def combine_images(
     When Nano Banana 2 is active, ThinkingConfig is applied and thoughts are
     captured (see commented block below). Thinking level is controlled by the
     THINKING_LEVEL env variable ("Minimal" or "High").
+
+    aspect_ratio: optional hard ImageConfig lock (e.g. "16:9", "4:3"). When
+    omitted the model picks its own ratio, which often mismatches the user's
+    space photo — callers should pass the ratio inferred from the input.
     """
     client = get_gemini_client()
 
     is_nano_banana_2 = IMAGE_GEN_MODEL == _NANO_BANANA_2
-    print(f"[ImageGen] model={IMAGE_GEN_MODEL!r}  is_nano_banana_2={is_nano_banana_2}  image_thinking_level={_IMAGE_THINKING_LEVEL!r}")
+    print(f"[ImageGen] model={IMAGE_GEN_MODEL!r}  is_nano_banana_2={is_nano_banana_2}  "
+          f"image_thinking_level={_IMAGE_THINKING_LEVEL!r}  aspect_ratio={aspect_ratio!r}")
 
     config = GenerateContentConfig(
         response_modalities=[Modality.TEXT, Modality.IMAGE],
+        image_config=ImageConfig(aspect_ratio=aspect_ratio) if aspect_ratio else None,
         thinking_config=ThinkingConfig(
             thinking_level=_IMAGE_THINKING_LEVEL,
             include_thoughts=True,

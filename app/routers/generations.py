@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -21,14 +23,24 @@ def _to_response(gen: Generation) -> GenerationResponse:
 
 @router.get("", response_model=list[GenerationResponse])
 async def list_generations(
+    limit: Optional[int] = Query(None, ge=1, le=500, description="Max rows to return (omit for all)."),
+    offset: int = Query(0, ge=0, description="Rows to skip (for pagination)."),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
+    # Pagination is opt-in: omitting `limit` preserves the original
+    # return-everything behaviour so existing clients keep working.
+    stmt = (
         select(Generation)
         .where(Generation.user_id == current_user.id)
         .order_by(Generation.generated_at.desc())
     )
+    if limit is not None:
+        stmt = stmt.offset(offset).limit(limit)
+    elif offset:
+        stmt = stmt.offset(offset)
+
+    result = await db.execute(stmt)
     return [_to_response(g) for g in result.scalars().all()]
 
 

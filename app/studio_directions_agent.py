@@ -435,6 +435,25 @@ def _format_sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+def _selection_search_phrase(sel: dict) -> str:
+    """Label plus distinctive tokens for embedding / text search queries."""
+    label = (sel.get("label") or "").strip()
+    tokens = [str(t or "").strip() for t in (sel.get("tokens") or []) if str(t or "").strip()]
+    if not label and not tokens:
+        return ""
+    label_lower = label.lower()
+    extra = [t for t in tokens if t.lower() not in label_lower][:6]
+    if label and extra:
+        return f"{label} ({', '.join(extra)})"
+    if label:
+        return label
+    return ", ".join(extra)
+
+
+def _format_selections_for_search(selections: list[dict]) -> list[str]:
+    return [p for p in (_selection_search_phrase(s) for s in selections if isinstance(s, dict)) if p]
+
+
 def _normalize_picker(data: dict) -> dict:
     """Support single or multi (OR) picker payloads from the studio wizard."""
     if not isinstance(data, dict):
@@ -548,14 +567,14 @@ def _build_presearch_queries(space: dict, style: dict) -> list[str]:
     queries: list[str] = []
     for st in styles[:3]:
         for sp in spaces[:3]:
-            s = (sp.get("label") or "outdoor space").strip()
-            st_l = (st.get("label") or "").strip()
+            s = _selection_search_phrase(sp) or "outdoor space"
+            st_l = _selection_search_phrase(st)
             q = f"{st_l} {s}".strip()
             if q and q not in queries:
                 queries.append(q)
 
-    s0 = (spaces[0].get("label") or "outdoor space").strip()
-    st0 = (styles[0].get("label") or "").strip()
+    s0 = _selection_search_phrase(spaces[0]) or "outdoor space"
+    st0 = _selection_search_phrase(styles[0]) if styles else ""
     extras = [
         f"Ducon luxury {s0} outdoor {st0} design".strip(),
         f"{st0} {s0} premium landscaping finished project outdoor living".strip(),
@@ -701,6 +720,12 @@ async def curate_studio_directions(
     brief = {
         "space_type": space,
         "style_direction": style,
+        "space_search_phrases": _format_selections_for_search(
+            [s for s in (space.get("selections") or []) if isinstance(s, dict)]
+        ),
+        "style_search_phrases": _format_selections_for_search(
+            [s for s in (style.get("selections") or []) if isinstance(s, dict)]
+        ),
         "goal": f"Curate exactly {_DIRECTION_COUNT} Ducon design directions for visualization.",
         "pre_search_done": True,
         "candidate_pool_size": len(session.candidate_pool),
@@ -932,16 +957,14 @@ async def stream_studio_directions_events(
 def build_legacy_query(space: dict, style: dict) -> str:
     spaces = space.get("selections") or ([space] if space.get("label") else [])
     styles = style.get("selections") or ([style] if style.get("label") else [])
+    space_phrases = _format_selections_for_search([s for s in spaces if isinstance(s, dict)])
+    style_phrases = _format_selections_for_search([s for s in styles if isinstance(s, dict)])
     space_part = ""
-    if spaces:
-        labels = [str(s.get("label") or "").lower() for s in spaces if s.get("label")]
-        if labels:
-            space_part = f" for {' or '.join(f'a {l}' for l in labels)}"
+    if space_phrases:
+        space_part = f" for {' or '.join(p.lower() for p in space_phrases)}"
     style_part = ""
-    if styles:
-        labels = [str(s.get("label") or "").lower() for s in styles if s.get("label")]
-        if labels:
-            style_part = f" in {' or '.join(labels)} style"
+    if style_phrases:
+        style_part = f" in {' or '.join(p.lower() for p in style_phrases)} style"
     return (
         "Ducon premium outdoor living design inspiration"
         + space_part
