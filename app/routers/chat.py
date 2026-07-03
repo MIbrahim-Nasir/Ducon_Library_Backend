@@ -55,9 +55,23 @@ from app import llm_provider
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
-_MAX_TOOL_RESULT_CHARS = int(os.getenv("CHAT_TOOL_RESULT_MAX_CHARS", "12000"))
-_MAX_AISEARCH_ITEMS = int(os.getenv("CHAT_AISEARCH_MAX_ITEMS", "8"))
-_MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_SIZE_MB", "50")) * 1024 * 1024
+from app.admin.settings_store import cfg
+
+_MAX_TOOL_RESULT_CHARS = 12000      # default; live value via cfg("CHAT_TOOL_RESULT_MAX_CHARS", _MAX_TOOL_RESULT_CHARS)
+_MAX_AISEARCH_ITEMS = 8
+_MAX_UPLOAD_MB_DEFAULT = 50
+
+
+def _max_tool_result_chars() -> int:
+    return int(cfg("CHAT_TOOL_RESULT_MAX_CHARS", _MAX_TOOL_RESULT_CHARS))
+
+
+def _max_aisearch_items() -> int:
+    return int(cfg("CHAT_AISEARCH_MAX_ITEMS", _MAX_AISEARCH_ITEMS))
+
+
+def _max_upload_bytes() -> int:
+    return int(cfg("MAX_UPLOAD_SIZE_MB", _MAX_UPLOAD_MB_DEFAULT)) * 1024 * 1024
 
 # Magic-byte signatures for allowed file types
 _ALLOWED_MIME_PREFIXES = (
@@ -93,10 +107,11 @@ def _sniff_mime(data: bytes) -> str | None:
 
 def _validate_upload(filename: str, data: bytes) -> None:
     """Raise 400/413 if the upload violates size or MIME policy."""
-    if len(data) > _MAX_UPLOAD_BYTES:
+    _max_up = _max_upload_bytes()
+    if len(data) > _max_up:
         raise HTTPException(
             status_code=413,
-            detail=f"File too large. Maximum allowed size is {_MAX_UPLOAD_BYTES // (1024*1024)} MB.",
+            detail=f"File too large. Maximum allowed size is {_max_up // (1024*1024)} MB.",
         )
     ext = os.path.splitext(filename.lower())[1]
     if ext in _BLOCKED_EXTENSIONS:
@@ -397,6 +412,8 @@ async def chat_message(
             chat_agent.stream_chat(
                 input_parts=input_parts,
                 previous_interaction_id=effective_prev or None,
+                user_id=stream_user_id,
+                guest_session_id=guest_session_id,
             ),
             guest_session_id=guest_session_id,
             guest_session_row=guest_session_row,
@@ -502,6 +519,8 @@ async def chat_tool_result(
             chat_agent.stream_chat(
                 input_parts=input_parts,
                 previous_interaction_id=chain_prev,
+                user_id=stream_user_id,
+                guest_session_id=guest_session_id,
             ),
             guest_session_id=guest_session_id,
             user_text=", ".join(f"[Tool: {item.name}]" for item in body.results),
@@ -517,16 +536,20 @@ def _compact_tool_result(tool_name: str, result: object) -> object:
     if tool_name == "AISearch":
         return _compact_ai_search_result(result)
 
+    if tool_name == "KeywordSearch":
+        return _compact_keyword_search_result(result)
+
     if tool_name in ("open_ai_generations", "show_image_generations"):
         return _compact_generations_list(result)
 
     raw = json.dumps(result, ensure_ascii=False)
-    if len(raw) <= _MAX_TOOL_RESULT_CHARS:
+    _mtc = _max_tool_result_chars()
+    if len(raw) <= _mtc:
         return result
     return {
         "_truncated": True,
         "_original_chars": len(raw),
-        "summary": raw[:_MAX_TOOL_RESULT_CHARS],
+        "summary": raw[:_mtc],
     }
 
 
@@ -559,8 +582,9 @@ def _compact_generations_list(result: object) -> object:
 
 def _compact_ai_search_result(result: object) -> object:
     items = result if isinstance(result, list) else []
+    _mai = _max_aisearch_items()
     compact_items: list[dict] = []
-    for item in items[:_MAX_AISEARCH_ITEMS]:
+    for item in items[:_mai]:
         if not isinstance(item, dict):
             continue
         compact_items.append({
@@ -582,9 +606,57 @@ def _compact_ai_search_result(result: object) -> object:
         "_original_count": len(items),
         "items": compact_items,
         "instruction": (
-            "Results are already shown to the user in the chat image slider. "
-            "Do NOT call get_image or run additional AISearch/KeywordSearch unless "
-            "the user asks for more. Catalog ids require plain id; AI generations use gen:ID."
+            "Results are already shown to the user in a labeled chat slider. "
+            "If you also ran KeywordSearch for products, both sliders are visible — "
+            "do NOT repeat searches. Do NOT call get_image unless the user asks."
+        ),
+    }
+
+
+def _compact_keyword_search_result(result: object) -> object:
+    """Compact keyword search JSON from chat executor."""
+    parsed = result
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except json.JSONDecodeError:
+            parsed = result
+
+    if isinstance(parsed, dict) and "designs" in parsed:
+        items = parsed.get("designs") or []
+        return {
+            "_type": "KeywordSearchResult",
+            "_compacted_for_model": True,
+            "found": parsed.get("found", len(items)),
+            "mode": parsed.get("mode", "keyword"),
+            "items": items[:_max_aisearch_items()],
+            "instruction": (
+                "Catalog filter results are shown in a separate labeled slider. "
+                "If AISearch was also called, both result sets are already visible."
+            ),
+        }
+
+    items = parsed if isinstance(parsed, list) else []
+    compact_items: list[dict] = []
+    for item in items[:_max_aisearch_items()]:
+        if not isinstance(item, dict):
+            continue
+        compact_items.append({
+            "id": item.get("id"),
+            "name": item.get("name"),
+            "filename": item.get("filename"),
+            "class": item.get("class"),
+            "level": item.get("level"),
+            "_type": item.get("_type") or "catalog_image",
+        })
+    return {
+        "_type": "KeywordSearchResult",
+        "_compacted_for_model": True,
+        "_original_count": len(items),
+        "items": compact_items,
+        "instruction": (
+            "Catalog filter results are shown in a separate labeled slider. "
+            "If AISearch was also called, both result sets are already visible."
         ),
     }
 
@@ -751,6 +823,7 @@ async def inject_voice_context(
             input_parts=input_parts,
             previous_interaction_id=chain_prev,
             allow_tools=False,
+            user_id=current_user.id,
         ),
         user_text=memory_user,
         record_transcript=record_transcript,
@@ -880,6 +953,7 @@ async def inject_browse_context(
             input_parts=input_parts,
             previous_interaction_id=chain_prev,
             allow_tools=False,
+            user_id=current_user.id,
         ),
         user_text=(input_parts[0].get("text") if input_parts else None),
     ):
@@ -992,6 +1066,7 @@ async def inject_studio_context(
             input_parts=input_parts,
             previous_interaction_id=chain_prev,
             allow_tools=False,
+            user_id=current_user.id,
         ),
         user_text=(input_parts[0].get("text") if input_parts else None),
     ):

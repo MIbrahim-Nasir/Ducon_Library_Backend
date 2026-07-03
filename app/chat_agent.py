@@ -40,20 +40,22 @@ from typing import AsyncGenerator, Optional
 from google import genai
 
 from app import llm_provider
+from app.search_tools import ai_search_interactions_tool, keyword_search_interactions_tool
 
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
+from app.admin.settings_store import cfg, cfg_str
 
-CHAT_MODEL = os.getenv("CHAT_MODEL", "gemini-3.5-flash")
-CHAT_THINKING_LEVEL = os.getenv("CHAT_THINKING_LEVEL", "low")
+CHAT_MODEL = "gemini-3.5-flash"                      # default; live value via cfg("CHAT_MODEL", CHAT_MODEL)
+CHAT_THINKING_LEVEL = "low"
 # Set CHAT_STREAM to "false" to disable streaming (useful for debugging).
-CHAT_STREAM: bool = os.getenv("CHAT_STREAM", "true").lower() not in ("0", "false", "no")
-_LIVE_DEBUG: bool = os.getenv("LIVE_DEBUG", "").lower() in ("1", "true", "yes")
+CHAT_STREAM: bool = True
+_LIVE_DEBUG: bool = False
 
 
 def _dbg(*args) -> None:
-    if _LIVE_DEBUG:
+    if cfg("LIVE_DEBUG", _LIVE_DEBUG):
         print(*args)
 
 
@@ -107,6 +109,33 @@ def _interaction_usage(interaction) -> dict | None:
         return None
     return usage.model_dump(exclude_none=True) if hasattr(usage, "model_dump") else usage
 
+
+def _record_usage(usage: dict | None, *, model: str, provider: str = "gemini",
+                  user_id: Optional[int] = None, guest_session_id: Optional[str] = None,
+                  status: str = "success", error_message: Optional[str] = None) -> None:
+    """Non-blocking usage/cost recording. Best-effort; never raises."""
+    if usage is None:
+        # Still record a zero-token event so call volume is tracked.
+        try:
+            from app.admin.usage_recorder import record
+            record(agent="chat", model=model, provider=provider,
+                   user_id=user_id, guest_session_id=guest_session_id,
+                   status=status, error_message=error_message)
+        except Exception:
+            pass
+        return
+    try:
+        from app.admin.usage_recorder import record
+        record(
+            agent="chat", model=model, provider=provider,
+            user_id=user_id, guest_session_id=guest_session_id,
+            input_tokens=int(usage.get("input_tokens") or usage.get("prompt_tokens") or 0),
+            output_tokens=int(usage.get("output_tokens") or usage.get("candidates_tokens") or 0),
+            status=status, error_message=error_message,
+        )
+    except Exception:
+        pass
+
 # ── Gemini client (shared singleton) ─────────────────────────────────────────
 
 _client: Optional[genai.Client] = None
@@ -131,81 +160,9 @@ def get_chat_system_instruction() -> str:
 
 
 # ── Tool declarations (Interactions API format) ───────────────────────────────
-# Format: flat list of {"type":"function","name":...,"description":...,"parameters":...}
-
 CHAT_TOOLS: list[dict] = [
-    {
-        "type": "function",
-        "name": "AISearch",
-        "description": (
-            "Semantic visual search of the Ducon project catalog. "
-            "Use for any catalog search — natural-language descriptions, specific project "
-            "names, product types, themes, tags, or any keyword the user mentions. "
-            "Returns Array<CatalogImage> shown inline in chat as an image slider. "
-            "For browse/inspiration requests: call ONCE, then reply briefly — do not "
-            "chain extra searches or get_image. Treat results as records/metadata."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query — describe what to find",
-                },
-                "show_user": {
-                    "type": "boolean",
-                    "description": (
-                        "True when the user should see the AI search results UI. "
-                        "False when searching only for internal reference gathering."
-                    ),
-                },
-                "presentation": {
-                    "type": "string",
-                    "enum": ["show_user", "internal"],
-                    "description": "Legacy alias for show_user. Prefer show_user boolean.",
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "type": "function",
-        "name": "KeywordSearch",
-        "description": (
-            "Apply exact filters to the Ducon catalog grid immediately. Use when the user asks "
-            "to filter/browse by class, theme, level, project, tags, or tag logic rather than "
-            "asking for semantic design discovery. Returns void."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Keyword text to apply to the catalog grid.",
-                },
-                "opts": {
-                    "type": "object",
-                    "description": "Optional exact catalog filters.",
-                    "properties": {
-                        "class": {"type": "string"},
-                        "theme": {"type": "string"},
-                        "level": {"type": "string"},
-                        "project": {"type": "string"},
-                        "tags": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                        "tagLogic": {
-                            "type": "string",
-                            "enum": ["and", "or"],
-                            "description": "How multiple tags should be combined.",
-                        },
-                    },
-                },
-            },
-            "required": ["query"],
-        },
-    },
+    ai_search_interactions_tool(),
+    keyword_search_interactions_tool(require_query=False, for_chat=True),
     {
         "type": "function",
         "name": "get_selected_image",
@@ -540,6 +497,8 @@ async def stream_chat(
     previous_interaction_id: Optional[str] = None,
     *,
     allow_tools: bool = True,
+    user_id: Optional[int] = None,
+    guest_session_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """
     Async generator that runs one chat turn and yields SSE-formatted strings.
@@ -573,9 +532,13 @@ async def stream_chat(
 
     client = get_client()
 
+    _chat_model = cfg_str("CHAT_MODEL", CHAT_MODEL)
+    _chat_thinking = cfg_str("CHAT_THINKING_LEVEL", CHAT_THINKING_LEVEL)
+    _chat_stream = cfg("CHAT_STREAM", CHAT_STREAM)
+
     generation_config: dict = {}
-    if CHAT_THINKING_LEVEL and CHAT_THINKING_LEVEL.lower() not in ("none", ""):
-        generation_config["thinking_level"] = CHAT_THINKING_LEVEL
+    if _chat_thinking and _chat_thinking.lower() not in ("none", ""):
+        generation_config["thinking_level"] = _chat_thinking
 
     interaction_id: Optional[str] = None
     tool_calls: list[dict] = []
@@ -585,9 +548,9 @@ async def stream_chat(
         _dbg(
             "[CHAT ▶ REQUEST]",
             {
-                "model": CHAT_MODEL,
-                "stream": CHAT_STREAM,
-                "thinking_level": CHAT_THINKING_LEVEL,
+                "model": _chat_model,
+                "stream": _chat_stream,
+                "thinking_level": _chat_thinking,
                 "previous_interaction_id": previous_interaction_id,
                 "input_parts": _summarize_input_parts(input_parts),
                 "tools": [tool.get("name") for tool in CHAT_TOOLS],
@@ -597,13 +560,13 @@ async def stream_chat(
                 ),
             },
         )
-        if CHAT_STREAM:
+        if _chat_stream:
             # Track function call steps as they stream in, keyed by step index.
             fc_by_index: dict[int, dict] = {}
             thinking_started = False
 
             stream = await client.aio.interactions.create(
-                model=CHAT_MODEL,
+                model=_chat_model,
                 system_instruction=get_chat_system_instruction(),
                 input=input_parts,
                 tools=CHAT_TOOLS,
@@ -617,6 +580,7 @@ async def stream_chat(
                 usage = _event_usage(event)
                 if usage:
                     _dbg("[CHAT ◀ USAGE]", usage)
+                    _record_usage(usage, model=_chat_model, user_id=user_id, guest_session_id=guest_session_id)
                 else:
                     _dbg("[CHAT ◀ EVENT]", etype, {"index": getattr(event, "index", None)})
 
@@ -715,7 +679,7 @@ async def stream_chat(
         else:
             # ── Non-streaming mode ──────────────────────────────────────────
             interaction = await client.aio.interactions.create(
-                model=CHAT_MODEL,
+                model=_chat_model,
                 system_instruction=get_chat_system_instruction(),
                 input=input_parts,
                 tools=CHAT_TOOLS,
@@ -796,7 +760,7 @@ async def stream_chat(
 
 # conversation_id → list[message dict]  (in-process; mirrors chat_session lifetime)
 _CLAUDE_HISTORY: dict[str, list[dict]] = {}
-_CLAUDE_HISTORY_MAX_MESSAGES = int(os.getenv("CLAUDE_CHAT_MAX_MESSAGES", "60"))
+_CLAUDE_HISTORY_MAX_MESSAGES = int(cfg("CLAUDE_CHAT_MAX_MESSAGES", 60))
 
 _claude_chat_tools_cache: Optional[list[dict]] = None
 

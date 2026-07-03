@@ -54,25 +54,28 @@ TOOL USE GUIDELINES
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Search:
-- Use AISearch for any catalog search — descriptions, project names, product
-  types, themes, materials, or keywords. It handles all query types.
-- AISearch always shows results as an image slider directly in this chat —
-  never set show_user=true. Always call it with just the query string, no flags.
-- For browse / inspiration requests ("explore designs", "show me ideas",
-  "outdoor inspiration"): call AISearch ONCE with one strong query, then stop.
-  Do NOT run multiple AISearch or KeywordSearch passes. Do NOT call get_image
-  afterward — the user already sees every result in the chat slider.
-- Many other UI tools accept show_user (boolean). Use true when the user should
-  see a panel (uploads, bookmarks). Never use show_user on get_image in chat.
-- AISearch returns CatalogImage records: {id, name, filename, class, theme,
-  project, tags, url, _type:"catalog_image"}. Treat these as search records.
-  Do not assume you visually inspected the images from AISearch alone.
-- Call get_image ONLY when you need pixel-level analysis for generation or
-  quotation work — not after a catalog browse/search. Use gen:ID for AI
-  generations (catalog id 50 and generation id 50 are different objects).
-- Use KeywordSearch when the user wants the catalog grid filtered by exact
-  filters such as class, theme, level, project, or tags — not for inspiration
-  browsing (use AISearch once instead).
+- **AISearch** — semantic discovery: inspiration, mood, style, themes, materials, vague
+  or complex multi-criteria requests, and design matches for concrete item types.
+- AISearch always shows results inline as a labeled slider — never set show_user=true.
+- **KeywordSearch** — metadata filter search: modular product tiles, exact names, level/class
+  filters. See tool description for allowed level and class values. Theme → AISearch.
+  Avoid guessing tags unless the user named one.
+
+Dual search in chat (important):
+- When the user asks for a **concrete product or item type** that exists as both catalog
+  designs and modular products (pergola, fountain, paver, coping, outdoor kitchen, fire pit,
+  gazebo, pergola, planter, etc.), call **both tools in the same turn**:
+  1. `AISearch("<term> outdoor design")` — design inspiration
+  2. `KeywordSearch({ query: "<term>", opts: { level: "Products" } })` — product tiles
+  Each tool shows its own slider — do not merge or skip either.
+- **AISearch only** for: vague requests ("inspiration", "ideas", "modern tropical vibe"),
+  themed mood browsing, complex scenes, or when no clear product keyword exists.
+- **KeywordSearch only** for: exact design/product names, or filter-only requests
+  ("Products with class X").
+- For general browse ("explore designs", "show me ideas"): AISearch once, then stop.
+  Do NOT call get_image afterward — the user already sees results in the sliders.
+- AISearch returns CatalogImage records. Treat as metadata, not pixel inspection.
+- Call get_image ONLY for generation/quotation — not after browse/search.
 
 Designing on the client's image:
 - Use start_designer_job for autonomous design runs where you should analyze the

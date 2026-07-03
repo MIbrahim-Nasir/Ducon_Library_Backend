@@ -25,12 +25,16 @@ from app.db.models import Image as DBImage
 from app.designer_agent import _filename_candidates, _single_filename_candidates
 from app.gemini import get_gemini_client
 from app.image_utils import get_image_metadata, load_ducon_image, normalize_user_image
+from app.catalog_keyword_search import keyword_search_catalog
+from app.search_tools import AI_SEARCH_WHEN, keyword_search_studio_spec
 from app.ml import GeminiEmbeddingModel
 
 # ── Studio directions curator (Step 4) — configure via .env ───────────────────
 # STUDIO_DIRECTIONS_MODEL          — Gemini model id (default: gemini-3-flash-preview)
 # STUDIO_DIRECTIONS_THINKING_LEVEL — none | minimal | low | medium | high (default: High)
-STUDIO_DIRECTIONS_MAX_TURNS = int(os.getenv("STUDIO_DIRECTIONS_MAX_TURNS", "8"))
+from app.admin.settings_store import cfg, cfg_str
+
+STUDIO_DIRECTIONS_MAX_TURNS = 8
 STUDIO_DIRECTIONS_MAX_SEARCHES = int(os.getenv("STUDIO_DIRECTIONS_MAX_SEARCHES", "6"))
 STUDIO_DIRECTIONS_SEARCH_LIMIT = int(os.getenv("STUDIO_DIRECTIONS_SEARCH_LIMIT", "8"))
 STUDIO_DIRECTIONS_INSPECT_LIMIT = int(os.getenv("STUDIO_DIRECTIONS_INSPECT_LIMIT", "8"))
@@ -41,12 +45,12 @@ _DIRECTION_COUNT = 9
 
 
 def studio_directions_model() -> str:
-    return os.getenv("STUDIO_DIRECTIONS_MODEL", "gemini-3-flash-preview").strip()
+    return cfg_str("STUDIO_DIRECTIONS_MODEL", "gemini-3-flash-preview").strip()
 
 
 def studio_directions_thinking_level() -> str | None:
     """Return thinking level string, or None when thinking is disabled."""
-    raw = (os.getenv("STUDIO_DIRECTIONS_THINKING_LEVEL", "High") or "").strip()
+    raw = cfg_str("STUDIO_DIRECTIONS_THINKING_LEVEL", "High").strip()
     if not raw or raw.lower() in ("none", "off", "false", "0", "disabled"):
         return None
     return raw
@@ -73,8 +77,10 @@ def _studio_directions_generate_config() -> GenerateContentConfig:
 _SEARCH_TOOL = FunctionDeclaration(
     name="ai_search",
     description=(
-        "Semantic AI search of the Ducon catalog. Uses the user's space photo plus your "
-        "text query to find visually and semantically relevant designs."
+        "Semantic AI search of the Ducon catalog (PREFERRED for direction curation). "
+        f"{AI_SEARCH_WHEN} "
+        "Uses the user's space photo plus your text query to find visually and semantically "
+        "relevant designs. Always include space-type and style keywords from the payload."
     ),
     parameters={
         "type": "object",
@@ -165,7 +171,15 @@ _SHORTLIST_TOOL = FunctionDeclaration(
     },
 )
 
-_AGENT_TOOLS = Tool(function_declarations=[_SEARCH_TOOL, _INSPECT_TOOL, _SHORTLIST_TOOL, _SUBMIT_TOOL])
+_KEYWORD_TOOL = FunctionDeclaration(**keyword_search_studio_spec())
+
+_AGENT_TOOLS = Tool(function_declarations=[
+    _SEARCH_TOOL,
+    _KEYWORD_TOOL,
+    _INSPECT_TOOL,
+    _SHORTLIST_TOOL,
+    _SUBMIT_TOOL,
+])
 
 
 def _pil_part(img: Image.Image) -> Part:
@@ -218,6 +232,35 @@ async def _resolve_rows_by_filenames(
             row_by_filename[candidate] = row
         row_by_filename[row.filename] = row
     return row_by_filename
+
+
+async def _run_keyword_search(
+    *,
+    db: AsyncSession,
+    session: StudioDirectionsSession,
+    query: str,
+    opts: dict[str, Any] | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    opts = opts or {}
+    print(f"[StudioDirections] keyword_search: {query!r} opts={opts}")
+    result = await keyword_search_catalog(
+        db,
+        query=str(query or ""),
+        level=opts.get("level"),
+        class_=opts.get("class"),
+        category=opts.get("category"),
+        tags=opts.get("tags"),
+        tag_logic=str(opts.get("tagLogic") or opts.get("matchMode") or opts.get("tag_logic") or "OR"),
+        cross_tab=bool(opts.get("crossTab") or opts.get("cross_tab")),
+        limit=limit,
+    )
+    for record in result.get("hits") or []:
+        cid = int(record["id"])
+        if cid in session.rejected_ids:
+            continue
+        session.candidate_pool[cid] = record
+    return result
 
 
 async def _run_ai_search(
@@ -752,7 +795,7 @@ async def curate_studio_directions(
 
     agent_notes: list[str] = []
 
-    for turn in range(1, STUDIO_DIRECTIONS_MAX_TURNS + 1):
+    for turn in range(1, int(cfg("STUDIO_DIRECTIONS_MAX_TURNS", STUDIO_DIRECTIONS_MAX_TURNS)) + 1):
         if session.submitted:
             break
 
@@ -802,6 +845,17 @@ async def curate_studio_directions(
                     limit=int(args.get("limit") or STUDIO_DIRECTIONS_SEARCH_LIMIT),
                     user_image_bytes=user_image_bytes,
                     user_mime=user_mime,
+                )
+            elif name == "keyword_search":
+                if on_event:
+                    await on_event({"type": "status", "phase": "keyword_search"})
+                opts = args.get("opts") if isinstance(args.get("opts"), dict) else {}
+                result = await _run_keyword_search(
+                    db=db,
+                    session=session,
+                    query=str(args.get("query") or ""),
+                    opts=opts,
+                    limit=int(args.get("limit") or 20),
                 )
             elif name == "inspect_designs":
                 if on_event:

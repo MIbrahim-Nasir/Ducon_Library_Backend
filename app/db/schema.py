@@ -54,6 +54,88 @@ class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
+
+class OtpMessageResponse(BaseModel):
+    message: str
+    cooldown_seconds: int | None = None
+
+
+class SignupVerifyRequest(BaseModel):
+    email: EmailStr
+    otp: str
+
+    @field_validator("email", mode="after")
+    @classmethod
+    def email_trusted_domain(cls, v: str) -> str:
+        return validate_email_domain(v)
+
+    @field_validator("otp")
+    @classmethod
+    def otp_not_empty(cls, v: str) -> str:
+        code = v.strip()
+        if not code:
+            raise ValueError("Verification code is required.")
+        return code
+
+
+class PasswordForgotRequest(BaseModel):
+    email: EmailStr
+
+    @field_validator("email", mode="after")
+    @classmethod
+    def email_trusted_domain(cls, v: str) -> str:
+        return validate_email_domain(v)
+
+
+class PasswordVerifyOtpRequest(BaseModel):
+    email: EmailStr
+    otp: str
+
+    @field_validator("email", mode="after")
+    @classmethod
+    def email_trusted_domain(cls, v: str) -> str:
+        return validate_email_domain(v)
+
+    @field_validator("otp")
+    @classmethod
+    def otp_not_empty(cls, v: str) -> str:
+        code = v.strip()
+        if not code:
+            raise ValueError("Verification code is required.")
+        return code
+
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+    otp: str
+    new_password: str
+
+    @field_validator("email", mode="after")
+    @classmethod
+    def email_trusted_domain(cls, v: str) -> str:
+        return validate_email_domain(v)
+
+    @field_validator("otp")
+    @classmethod
+    def otp_not_empty(cls, v: str) -> str:
+        code = v.strip()
+        if not code:
+            raise ValueError("Verification code is required.")
+        return code
+
+    @field_validator("new_password")
+    @classmethod
+    def password_min_length(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("Password must be at least 6 characters.")
+        return v
+
+
+class PasswordResetTokenResponse(BaseModel):
+    reset_token: str
+    token_type: str = "bearer"
+
+
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"

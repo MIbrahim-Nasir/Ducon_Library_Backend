@@ -29,13 +29,14 @@ from app.gemini import (
 )
 from app import prompt_loader
 from app import llm_provider
+from app.admin.settings_store import cfg
 
 # Auto-learn rewrites image-gen-agent.md after successful (post-retry) runs.
 # It is OFF by default: an unconstrained "improve your own system prompt" loop
 # previously summarised the detailed evaluation rubric down to placeholders
 # (e.g. "[Evaluation sections A-E remain as defined previously]"), which broke
 # QC and caused chronic false rejections. Only enable it deliberately.
-_AUTO_LEARN_ENABLED = os.getenv("IMAGE_GEN_AGENT_AUTO_LEARN", "false").lower() in (
+_AUTO_LEARN_ENABLED = str(cfg("IMAGE_GEN_AGENT_AUTO_LEARN", "false")).lower() in (
     "1",
     "true",
     "yes",

@@ -74,3 +74,29 @@ GUEST_VOICE_LIMIT = 5
 GUEST_IP_TOTAL_LIMIT = 15
 # Legacy alias — used as GUEST_IP_TOTAL_LIMIT fallback if unset
 GUEST_IP_GEN_LIMIT = 6
+
+# ─── Admin panel ──────────────────────────────────────────────────────────────
+# bcrypt hash of the admin re-auth password (generate with: python -m scripts.hash_admin_password)
+ADMIN_PASSWORD_HASH =
+# How long an X-Admin-Session token remains valid after password verification (minutes)
+ADMIN_SESSION_TTL_MINUTES = 30
+
+# ─── Transactional email (Resend) ─────────────────────────────────────────────
+# Signup OTP + forgot-password OTP. Get API key at https://resend.com/api-keys
+# From address must use a domain verified in Resend.
+RESEND_API_KEY =
+RESEND_FROM_EMAIL = noreply@your-verified-domain.com
+# Inbound routing for contact forms (designer consultation + customer service)
+DESIGNER_CONTACT_EMAIL =
+CUSTOMER_SERVICE_EMAIL =
+OTP_EXPIRY_MINUTES = 10
+OTP_LENGTH = 6
+OTP_MAX_ATTEMPTS = 5
+OTP_RESEND_COOLDOWN_SECONDS = 60
+
+# ─── Image watermark (post-processing on every generated image) ───────────────
+# Set to false to save images without diagonal + corner marks.
+ENABLE_WATERMARK = true
+# Admin panel equivalent: watermark.WATERMARK_ENABLED (ENABLE_WATERMARK wins when set)
+# WATERMARK_OPACITY = 0.4
+# WATERMARK_CORNER_PATH = app/static/corner watermark.jpeg

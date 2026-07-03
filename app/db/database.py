@@ -14,6 +14,9 @@ if not DATABASE_URL:
 _POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "10"))
 _MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "20"))
 _POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "1800"))
+# Fail fast when Postgres is down or unreachable instead of hanging at startup.
+_CONNECT_TIMEOUT = float(os.getenv("DB_CONNECT_TIMEOUT", "10"))
+_COMMAND_TIMEOUT = float(os.getenv("DB_COMMAND_TIMEOUT", "30"))
 
 engine = create_async_engine(
     DATABASE_URL,
@@ -22,6 +25,10 @@ engine = create_async_engine(
     pool_size=_POOL_SIZE,
     max_overflow=_MAX_OVERFLOW,
     pool_recycle=_POOL_RECYCLE,
+    connect_args={
+        "timeout": _CONNECT_TIMEOUT,
+        "command_timeout": _COMMAND_TIMEOUT,
+    },
 )
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
 

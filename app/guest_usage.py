@@ -14,13 +14,29 @@ from fastapi import HTTPException
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.admin.settings_store import cfg
 from app.db.models import GuestSession
 
-GUEST_GEN_LIMIT = int(os.getenv("GUEST_GEN_LIMIT", "3"))
-GUEST_CHAT_LIMIT = int(os.getenv("GUEST_CHAT_LIMIT", "10"))
-GUEST_VOICE_LIMIT = int(os.getenv("GUEST_VOICE_LIMIT", "5"))
-# Total usage across all guest sessions from one IP (generations + chat + voice).
-GUEST_IP_TOTAL_LIMIT = int(os.getenv("GUEST_IP_TOTAL_LIMIT", os.getenv("GUEST_IP_GEN_LIMIT", "15")))
+GUEST_GEN_LIMIT = 3
+GUEST_CHAT_LIMIT = 10
+GUEST_VOICE_LIMIT = 5
+GUEST_IP_TOTAL_LIMIT = 15
+
+
+def _guest_gen_limit() -> int:
+    return int(cfg("GUEST_GEN_LIMIT", GUEST_GEN_LIMIT))
+
+
+def _guest_chat_limit() -> int:
+    return int(cfg("GUEST_CHAT_LIMIT", GUEST_CHAT_LIMIT))
+
+
+def _guest_voice_limit() -> int:
+    return int(cfg("GUEST_VOICE_LIMIT", GUEST_VOICE_LIMIT))
+
+
+def _guest_ip_total_limit() -> int:
+    return int(cfg("GUEST_IP_TOTAL_LIMIT", GUEST_IP_TOTAL_LIMIT))
 
 _LIMIT_EXCEEDED = {
     "detail": "Guest limit reached. Sign up to continue.",
@@ -36,10 +52,10 @@ class GuestUsageKind(str, Enum):
 
 def _limit_for(kind: GuestUsageKind) -> int:
     if kind == GuestUsageKind.GENERATION:
-        return GUEST_GEN_LIMIT
+        return _guest_gen_limit()
     if kind == GuestUsageKind.CHAT:
-        return GUEST_CHAT_LIMIT
-    return GUEST_VOICE_LIMIT
+        return _guest_chat_limit()
+    return _guest_voice_limit()
 
 
 def _count_column(kind: GuestUsageKind) -> str:
@@ -103,7 +119,7 @@ async def enforce_guest_limit(
     Raises HTTP 429 when session or IP totals are exhausted.
     """
     ip_total = await _ip_total_usage(db, ip_hash)
-    if ip_total >= GUEST_IP_TOTAL_LIMIT:
+    if ip_total >= _guest_ip_total_limit():
         raise HTTPException(status_code=429, detail=_LIMIT_EXCEEDED)
 
     session = await get_guest_session_row(db, session_id, ip_hash)
@@ -150,10 +166,10 @@ def usage_snapshot(session: Optional[GuestSession]) -> dict:
     chat_used = int(session.chat_turn_count or 0) if session else 0
     voice_used = int(session.voice_turn_count or 0) if session else 0
     return {
-        "generations": {"used": gen_used, "limit": GUEST_GEN_LIMIT},
-        "chat": {"used": chat_used, "limit": GUEST_CHAT_LIMIT},
-        "voice": {"used": voice_used, "limit": GUEST_VOICE_LIMIT},
+        "generations": {"used": gen_used, "limit": _guest_gen_limit()},
+        "chat": {"used": chat_used, "limit": _guest_chat_limit()},
+        "voice": {"used": voice_used, "limit": _guest_voice_limit()},
         # Legacy field for older clients
         "used": gen_used,
-        "limit": GUEST_GEN_LIMIT,
+        "limit": _guest_gen_limit(),
     }

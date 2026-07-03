@@ -11,6 +11,11 @@ application mapping. Produce that same level of context here.
 If the user gave suggestions, respect them. If not, choose a tasteful Ducon-style
 direction yourself.
 
+For catalog lookup in the plan:
+- `search_queries` — semantic AI-style phrases for overall design direction references (preferred).
+- `keyword_search_queries` — only when you need exact modular **product** images, a named
+  catalog design/product, or a specific filter (level/class/tags). Omit or use [] when not needed.
+
 Return ONLY valid JSON with:
 {
   "space_analysis": "what you see in the client's image",
@@ -28,7 +33,10 @@ Return ONLY valid JSON with:
   "design_direction": "recommended concept",
   "preserve": ["elements to keep unchanged"],
   "opportunities": ["specific improvements"],
-  "search_queries": ["3-5 Ducon catalog searches for references/products"],
+  "search_queries": ["3-5 semantic Ducon catalog searches (ai_search style) for reference directions"],
+  "keyword_search_queries": [
+    {"query": "optional exact product or design name", "opts": {"level": "Products", "class": "", "tags": [], "tagLogic": "OR"}}
+  ],
   "reference_needs": ["what kind of Ducon references are needed and why"],
   "zone_mapping_intent": ["how reference types should map onto eligible zones"],
   "generation_prompt": "precise prompt seed referencing image 1 as the client space and later images as Ducon references",

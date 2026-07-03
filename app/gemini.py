@@ -14,40 +14,41 @@ from app import llm_provider
 
 load_dotenv()
 
+from app.admin.settings_store import cfg
+
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 # ── Image generation model ────────────────────────────────────────────────────
-# Set IMAGE_GEN_MODEL in .env to switch between:
-#   gemini-3-pro-image-preview   → Nano Banana Pro  (default, no thinking)
-#   gemini-3.1-flash-image-preview → Nano Banana 2  (thinking model)
-IMAGE_GEN_MODEL = os.getenv("IMAGE_GEN_MODEL", "gemini-3-pro-image-preview")
+IMAGE_GEN_MODEL_DEFAULT = "gemini-3-pro-image-preview"
+QUOTATION_MODEL_DEFAULT = "gemini-3.1-pro-preview"
 
-# ── Quotation analysis model ───────────────────────────────────────────────────
-# Uses Gemini 3.1 Pro for deep multi-image analysis.
-# Set QUOTATION_MODEL in .env to override.
-QUOTATION_MODEL = os.getenv("QUOTATION_MODEL", "gemini-3.1-pro-preview")
 
-# Thinking depth for the quotation analyser.  High is recommended — accurate
-# area measurements require careful multi-step spatial reasoning.
-# Options: Minimal | Low | Medium | High
-_QUOTATION_THINKING_LEVEL = os.getenv("QUOTATION_THINKING_LEVEL", "High")
+def image_gen_model() -> str:
+    return cfg("IMAGE_GEN_MODEL", IMAGE_GEN_MODEL_DEFAULT)
 
-# Controls reasoning depth for the prompt generator (Flash-Lite).
-# Set PROMPT_THINKING_LEVEL in .env to "Minimal" or "High" (default: "High").
-_PROMPT_THINKING_LEVEL = os.getenv("PROMPT_THINKING_LEVEL", "High")
 
-# Maximum verification rounds in the prompt-verify loop.
-# After this many rounds the pipeline proceeds regardless.
-PROMPT_VERIFY_MAX_ROUNDS: int = int(os.getenv("PROMPT_VERIFY_MAX_ROUNDS", "2"))
+def quotation_model() -> str:
+    return cfg("QUOTATION_MODEL", QUOTATION_MODEL_DEFAULT)
 
-# Maximum generation+evaluation rounds in the post-gen loop (Studio, chat multi-image, autogenerate).
-# Override in .env: GEN_EVAL_MAX_ROUNDS=5
-GEN_EVAL_MAX_ROUNDS: int = int(os.getenv("GEN_EVAL_MAX_ROUNDS", "3"))
 
-# Nano Banana 2 only — controls reasoning depth before image generation.
-# Set IMAGE_THINKING_LEVEL in .env to "Minimal" or "High" (default: "High").
-# Has no effect when IMAGE_GEN_MODEL is Nano Banana Pro.
-_IMAGE_THINKING_LEVEL = os.getenv("IMAGE_THINKING_LEVEL", "High")
+def quotation_thinking_level() -> str:
+    return cfg("QUOTATION_THINKING_LEVEL", "High")
+
+
+def prompt_thinking_level() -> str:
+    return cfg("PROMPT_THINKING_LEVEL", "High")
+
+
+def prompt_verify_max_rounds() -> int:
+    return int(cfg("PROMPT_VERIFY_MAX_ROUNDS", 2))
+
+
+def gen_eval_max_rounds() -> int:
+    return int(cfg("GEN_EVAL_MAX_ROUNDS", 3))
+
+
+def image_thinking_level() -> str:
+    return cfg("IMAGE_THINKING_LEVEL", "High")
 
 _NANO_BANANA_2 = "gemini-3.1-flash-image-preview"
 
@@ -85,7 +86,7 @@ def _vision_json(system_instruction: str, images: list, context: str) -> dict:
         config=GenerateContentConfig(
             system_instruction=system_instruction,
             response_mime_type="application/json",
-            thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
+            thinking_config=ThinkingConfig(thinking_level=prompt_thinking_level()),
         ),
     )
     return _parse_json_response(response.text)
@@ -616,31 +617,34 @@ def combine_images(
     """
     client = get_gemini_client()
 
-    is_nano_banana_2 = IMAGE_GEN_MODEL == _NANO_BANANA_2
-    print(f"[ImageGen] model={IMAGE_GEN_MODEL!r}  is_nano_banana_2={is_nano_banana_2}  "
-          f"image_thinking_level={_IMAGE_THINKING_LEVEL!r}  aspect_ratio={aspect_ratio!r}")
+    _model = image_gen_model()
+    is_nano_banana_2 = _model == _NANO_BANANA_2
+    _think = image_thinking_level()
+    print(f"[ImageGen] model={_model!r}  is_nano_banana_2={is_nano_banana_2}  "
+          f"image_thinking_level={_think!r}  aspect_ratio={aspect_ratio!r}")
 
     config = GenerateContentConfig(
         response_modalities=[Modality.TEXT, Modality.IMAGE],
         image_config=ImageConfig(aspect_ratio=aspect_ratio) if aspect_ratio else None,
         thinking_config=ThinkingConfig(
-            thinking_level=_IMAGE_THINKING_LEVEL,
+            thinking_level=_think,
             include_thoughts=True,
         ) if is_nano_banana_2 else None,
     )
 
     response = client.models.generate_content(
-        model=IMAGE_GEN_MODEL,
+        model=_model,
         contents=[image1, image2, prompt],
         config=config,
     )
 
-    # ── Uncomment to inspect Nano Banana 2 reasoning thoughts ────────────────
+    from app.admin.usage_helpers import record_from_response
+    record_from_response(response, agent="image_gen", model=_model, image_count=1)
+
     if is_nano_banana_2:
         for part in response.candidates[0].content.parts:
             if getattr(part, "thought", False) and part.text:
                 print(f"[NB2 Thought]\n{part.text}\n")
-    # ─────────────────────────────────────────────────────────────────────────
 
     return save_image(filename, response=response, subfolder=subfolder)
 
@@ -665,7 +669,7 @@ def generate_image(prompt: str = None):
         return
     client = get_gemini_client()
     response = client.models.generate_content(
-        model=IMAGE_GEN_MODEL,
+        model=image_gen_model(),
         contents=prompt,
         config=GenerateContentConfig(
             response_modalities=[Modality.TEXT, Modality.IMAGE],
@@ -690,16 +694,18 @@ async def _single_quotation_call(
     """One independent analysis pass. Runs fully async against the Gemini API."""
     prompt_loader.ensure_prompts_loaded()
     response = await client.aio.models.generate_content(
-        model=QUOTATION_MODEL,
+        model=quotation_model(),
         contents=[*images, context],
         config=GenerateContentConfig(
             system_instruction=prompt_loader.QUOTATION_SYSTEM_INSTRUCTION,
             response_mime_type="application/json",
-            thinking_config=ThinkingConfig(thinking_level=_QUOTATION_THINKING_LEVEL),
+            thinking_config=ThinkingConfig(thinking_level=quotation_thinking_level()),
         ),
     )
     try:
         result = _parse_json_response(response.text)
+        from app.admin.usage_helpers import record_from_response
+        record_from_response(response, agent="quotation", model=quotation_model())
         print(
             f"[Quotation {pass_label}] "
             f"area_items={len(result.get('area_measurements', []))}  "
@@ -840,12 +846,12 @@ async def analyze_quotation(
     print(f"[Quotation] running synthesis pass over {len(labelled)} results…")
     prompt_loader.ensure_prompts_loaded()
     synthesis_response = await client.aio.models.generate_content(
-        model=QUOTATION_MODEL,
+        model=quotation_model(),
         contents=[*images, synthesis_context],
         config=GenerateContentConfig(
             system_instruction=prompt_loader.QUOTATION_SYNTHESIS_INSTRUCTION,
             response_mime_type="application/json",
-            thinking_config=ThinkingConfig(thinking_level=_QUOTATION_THINKING_LEVEL),
+            thinking_config=ThinkingConfig(thinking_level=quotation_thinking_level()),
         ),
     )
 
@@ -862,6 +868,23 @@ async def analyze_quotation(
         f"fixed_items={len(final.get('fixed_items', []))}"
     )
     return final
+
+
+def __getattr__(name: str):
+    """Lazy backward-compatible aliases (read live config via cfg())."""
+    _aliases = {
+        "IMAGE_GEN_MODEL": image_gen_model,
+        "QUOTATION_MODEL": quotation_model,
+        "PROMPT_VERIFY_MAX_ROUNDS": prompt_verify_max_rounds,
+        "GEN_EVAL_MAX_ROUNDS": gen_eval_max_rounds,
+        "_PROMPT_THINKING_LEVEL": prompt_thinking_level,
+        "_IMAGE_THINKING_LEVEL": image_thinking_level,
+        "_QUOTATION_THINKING_LEVEL": quotation_thinking_level,
+    }
+    fn = _aliases.get(name)
+    if fn is not None:
+        return fn()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 if __name__ == "__main__":

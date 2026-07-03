@@ -38,6 +38,7 @@ from app.gemini import (
 )
 from app.image_utils import get_image_metadata, normalize_user_image
 from app.image_utils import load_ducon_image
+from app.catalog_keyword_search import keyword_search_catalog
 from app.ml import GeminiEmbeddingModel
 from app.tool_generate_image import ImageDescriptor, generate_multi_image
 from app.prompt_generator_session import DesignerPromptSession
@@ -45,15 +46,33 @@ from app import prompt_loader
 from app import llm_provider
 
 
-DESIGNER_AGENT_MODEL = os.getenv("DESIGNER_AGENT_MODEL", "gemini-3.5-flash")
-DESIGNER_AGENT_MAX_STEPS = int(os.getenv("DESIGNER_AGENT_MAX_STEPS", "12"))
-DESIGNER_AGENT_MAX_GENERATIONS = int(os.getenv("DESIGNER_AGENT_MAX_GENERATIONS", "3"))
+from app.admin.settings_store import cfg
+
+DESIGNER_AGENT_MODEL = "gemini-3.5-flash"           # default; live via cfg("DESIGNER_AGENT_MODEL", ...)
+DESIGNER_AGENT_MAX_STEPS = 12
+DESIGNER_AGENT_MAX_GENERATIONS = 3
 DESIGNER_AGENT_SEARCH_LIMIT = int(os.getenv("DESIGNER_AGENT_SEARCH_LIMIT", "5"))
 DESIGNER_AGENT_MAX_REFERENCES = int(os.getenv("DESIGNER_AGENT_MAX_REFERENCES", "6"))
 DESIGNER_AGENT_PASS_SCORE = float(os.getenv("DESIGNER_AGENT_PASS_SCORE", "7.5"))
-DESIGNER_AGENT_DEFAULT_IMAGE_MODEL = os.getenv("DESIGNER_AGENT_IMAGE_MODEL", "flash")
+DESIGNER_AGENT_DEFAULT_IMAGE_MODEL = "flash"
 DESIGNER_AGENT_DEFAULT_ASPECT_RATIO = os.getenv("DESIGNER_AGENT_ASPECT_RATIO", "16:9")
-_LIVE_DEBUG: bool = os.getenv("LIVE_DEBUG", "").lower() in ("1", "true", "yes")
+_LIVE_DEBUG: bool = False
+
+
+def _designer_model() -> str:
+    return cfg("DESIGNER_AGENT_MODEL", DESIGNER_AGENT_MODEL)
+
+
+def _designer_max_steps() -> int:
+    return int(cfg("DESIGNER_AGENT_MAX_STEPS", DESIGNER_AGENT_MAX_STEPS))
+
+
+def _designer_max_generations() -> int:
+    return int(cfg("DESIGNER_AGENT_MAX_GENERATIONS", DESIGNER_AGENT_MAX_GENERATIONS))
+
+
+def _designer_image_model() -> str:
+    return cfg("DESIGNER_AGENT_IMAGE_MODEL", DESIGNER_AGENT_DEFAULT_IMAGE_MODEL)
 
 _CRITICAL_SECTION_KEYS = (
     "A1_pov",
@@ -77,7 +96,7 @@ def _enrich_generation_record(gen: dict[str, Any]) -> dict[str, Any]:
 
 
 def _dbg(*args) -> None:
-    if _LIVE_DEBUG:
+    if cfg("LIVE_DEBUG", _LIVE_DEBUG):
         print(*args)
 
 
@@ -232,12 +251,19 @@ async def run_designer_job(
         _dbg("[DESIGNER ▶ INPUT IMAGE]", _image_summary(user_image))
         user_prompt = (user_prompt or "").strip()
 
-        plan = await _analyze_and_plan(user_image, user_prompt)
+        plan = await _analyze_and_plan(user_image, user_prompt, user_id=job.user_id)
         await emit(job, "plan", plan=plan)
 
         search_queries = plan.get("search_queries") or []
         if not search_queries:
             search_queries = _fallback_queries(user_prompt)
+
+        keyword_specs = plan.get("keyword_search_queries") or []
+        keyword_refs, keyword_pruned = await _search_references_by_keyword(
+            db=db,
+            specs=keyword_specs[:3],
+            job=job,
+        )
 
         references, pruned_references = await _search_references(
             db=db,
@@ -246,6 +272,15 @@ async def run_designer_job(
             queries=search_queries[:4],
             job=job,
         )
+
+        if keyword_refs:
+            seen_ids = {int(r["id"]) for r in references}
+            merged = list(keyword_refs)
+            for ref in references:
+                if int(ref["id"]) not in seen_ids:
+                    merged.append(ref)
+            references = merged[:DESIGNER_AGENT_MAX_REFERENCES]
+            pruned_references = keyword_pruned + pruned_references
         if not references:
             raise RuntimeError("No Ducon catalog references were found for this design run.")
         await emit(
@@ -395,6 +430,7 @@ async def run_designer_job(
                 references=chosen_refs,
                 reference_images=reference_images,
                 prompt=prompt,
+                user_id=job.user_id,
             )
             _dbg("[DESIGNER ◀ EVALUATION]", evaluation)
             attempt = {
@@ -431,7 +467,7 @@ async def run_designer_job(
         if best is None:
             raise RuntimeError("Designer job finished without a generated candidate.")
 
-        final_summary = await _summarize_final(plan=plan, best=best, attempts=attempts)
+        final_summary = await _summarize_final(plan=plan, best=best, attempts=attempts, user_id=job.user_id)
         _dbg("[DESIGNER ◀ FINAL SUMMARY]", final_summary)
         # UI shows the last generated candidate (final attempt), not highest-scored.
         last_generation = _enrich_generation_record(dict(attempts[-1]["generation"]))
@@ -459,7 +495,7 @@ async def run_designer_job(
         await job.queue.put(None)
 
 
-async def _analyze_and_plan(user_image: Image.Image, user_prompt: str) -> dict[str, Any]:
+async def _analyze_and_plan(user_image: Image.Image, user_prompt: str, *, user_id: Optional[int] = None) -> dict[str, Any]:
     client = get_gemini_client()
     prompt_loader.ensure_prompts_loaded()
     prompt = (
@@ -488,6 +524,13 @@ async def _analyze_and_plan(user_image: Image.Image, user_prompt: str) -> dict[s
             config=GenerateContentConfig(response_mime_type="application/json"),
         )
         text = response.text or "{}"
+        from app.admin.usage_helpers import record_from_response
+        record_from_response(
+            response,
+            agent="designer",
+            model=DESIGNER_AGENT_MODEL,
+            user_id=user_id,
+        )
         _dbg(
             "[DESIGNER ◀ GEMINI analyze_plan]",
             {"usage": _usage(response), "text_chars": len(text), "text_preview": text[:1200]},
@@ -501,9 +544,92 @@ async def _analyze_and_plan(user_image: Image.Image, user_prompt: str) -> dict[s
             "preserve": [],
             "opportunities": [],
             "search_queries": _fallback_queries(user_prompt),
+            "keyword_search_queries": [],
             "generation_prompt": _fallback_generation_prompt(user_prompt),
             "success_criteria": ["photorealistic", "fits the existing space", "uses Ducon references clearly"],
         }
+
+
+async def _search_references_by_keyword(
+    *,
+    db: AsyncSession,
+    specs: list[Any],
+    job: DesignerJob,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Exact name / filter lookups — modular products and named catalog items."""
+    refs: list[dict[str, Any]] = []
+    pruned: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    for raw in specs or []:
+        _check_cancelled(job)
+        if isinstance(raw, str):
+            spec = {"query": raw}
+        elif isinstance(raw, dict):
+            spec = raw
+        else:
+            continue
+
+        query = str(spec.get("query") or spec.get("name") or "").strip()
+        opts = spec.get("opts") if isinstance(spec.get("opts"), dict) else spec
+        level = opts.get("level") if isinstance(opts, dict) else None
+        class_ = opts.get("class") if isinstance(opts, dict) else None
+        category = opts.get("category") if isinstance(opts, dict) else None
+        tags = opts.get("tags") if isinstance(opts, dict) else None
+        tag_logic = (
+            opts.get("tagLogic") or opts.get("matchMode") or opts.get("tag_logic") or "OR"
+        ) if isinstance(opts, dict) else "OR"
+        cross_tab = bool(
+            (opts.get("crossTab") or opts.get("cross_tab")) if isinstance(opts, dict) else False
+        )
+
+        if not query and not level and not class_ and not category and not tags:
+            continue
+
+        label = query or " · ".join(
+            p for p in [level, class_, category, *(tags or [])] if p
+        )
+        await emit(job, "search_started", query=f"[keyword] {label}")
+        result = await keyword_search_catalog(
+            db,
+            query=query,
+            level=level,
+            class_=class_,
+            category=category,
+            tags=tags,
+            tag_logic=str(tag_logic),
+            cross_tab=cross_tab,
+            limit=DESIGNER_AGENT_SEARCH_LIMIT,
+        )
+        hits = result.get("hits") or []
+        ids = [h.get("id") for h in hits if h.get("id") is not None]
+        await emit(job, "search_done", query=f"[keyword] {label}", raw_ids=ids)
+
+        for hit in hits:
+            cid = int(hit["id"])
+            if cid in seen:
+                pruned.append({
+                    "id": cid,
+                    "name": hit.get("name"),
+                    "query": label,
+                    "reason": "Duplicate keyword hit.",
+                })
+                continue
+            seen.add(cid)
+            metadata = get_image_metadata(hit.get("filename") or "") or {}
+            refs.append({
+                "id": cid,
+                "name": hit.get("name"),
+                "filename": hit.get("filename"),
+                "url": hit.get("url"),
+                "label": hit.get("name"),
+                "metadata": metadata,
+                "source": "keyword",
+            })
+            if len(refs) >= DESIGNER_AGENT_MAX_REFERENCES:
+                return refs, pruned
+
+    return refs, pruned
 
 
 async def _search_references(
@@ -617,6 +743,7 @@ async def _evaluate_generation(
     references: list[dict[str, Any]],
     reference_images: list[Image.Image],
     prompt: str,
+    user_id: Optional[int] = None,
 ) -> dict[str, Any]:
     client = get_gemini_client()
     prompt_loader.ensure_prompts_loaded()
@@ -653,6 +780,13 @@ async def _evaluate_generation(
             config=GenerateContentConfig(response_mime_type="application/json"),
         )
         text = response.text or "{}"
+        from app.admin.usage_helpers import record_from_response
+        record_from_response(
+            response,
+            agent="designer",
+            model=DESIGNER_AGENT_MODEL,
+            user_id=user_id,
+        )
         _dbg(
             "[DESIGNER ◀ GEMINI evaluate]",
             {"usage": _usage(response), "text_chars": len(text), "text_preview": text[:1200]},
@@ -665,7 +799,13 @@ async def _evaluate_generation(
     return data
 
 
-async def _summarize_final(plan: dict[str, Any], best: dict[str, Any], attempts: list[dict[str, Any]]) -> str:
+async def _summarize_final(
+    plan: dict[str, Any],
+    best: dict[str, Any],
+    attempts: list[dict[str, Any]],
+    *,
+    user_id: Optional[int] = None,
+) -> str:
     client = get_gemini_client()
     prompt_loader.ensure_prompts_loaded()
     prompt = (
@@ -688,6 +828,13 @@ async def _summarize_final(plan: dict[str, Any], best: dict[str, Any], attempts:
             contents=prompt,
         )
         text = response.text or "Your Ducon design preview is ready."
+        from app.admin.usage_helpers import record_from_response
+        record_from_response(
+            response,
+            agent="designer",
+            model=DESIGNER_AGENT_MODEL,
+            user_id=user_id,
+        )
         _dbg(
             "[DESIGNER ◀ GEMINI final_summary]",
             {"usage": _usage(response), "text_chars": len(text), "text_preview": text[:1200]},

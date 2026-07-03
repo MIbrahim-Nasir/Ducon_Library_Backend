@@ -38,16 +38,21 @@ except Exception as exc:  # pragma: no cover - import guard
     _ANTHROPIC_IMPORT_ERROR = exc
 
 
+from app.admin.settings_store import cfg, cfg_bool, cfg_str
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 def use_claude() -> bool:
     """True when text-reasoning agents should use Claude instead of Gemini."""
-    return os.getenv("USE_CLAUDE", "false").strip().lower() in ("1", "true", "yes", "on")
+    return cfg_bool("USE_CLAUDE", False)
 
 
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-6")
-# Output cap. Adaptive thinking tokens count toward this; keep it generous.
-CLAUDE_MAX_TOKENS = int(os.getenv("CLAUDE_MAX_TOKENS", "16000"))
+def claude_model() -> str:
+    return cfg_str("CLAUDE_MODEL", "claude-sonnet-4-6")
+
+
+def claude_max_tokens() -> int:
+    return cfg_int("CLAUDE_MAX_TOKENS", 16000)
 
 
 def _thinking_param() -> Optional[dict]:
@@ -57,7 +62,7 @@ def _thinking_param() -> Optional[dict]:
 
     CLAUDE_THINKING overrides: 'adaptive' (default) | 'off' | '<int budget>'.
     """
-    val = os.getenv("CLAUDE_THINKING", "adaptive").strip().lower()
+    val = cfg_str("CLAUDE_THINKING", "adaptive").strip().lower()
     if val in ("off", "none", "0", "false", "no"):
         return None
     if val.isdigit():
@@ -252,8 +257,8 @@ def _build_kwargs(
     thinking: bool,
 ) -> dict:
     kwargs: dict[str, Any] = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": max_tokens or CLAUDE_MAX_TOKENS,
+        "model": claude_model(),
+        "max_tokens": max_tokens or claude_max_tokens(),
         "system": system or "",
         "messages": messages,
     }
@@ -280,7 +285,16 @@ def complete_message(
         max_tokens=max_tokens, thinking=thinking,
     )
     with client.messages.stream(**kwargs) as stream:
-        return stream.get_final_message()
+        msg = stream.get_final_message()
+    try:
+        from app.admin.usage_helpers import record_from_usage_dict
+        usage = getattr(msg, "usage", None)
+        if usage is not None:
+            u = usage.model_dump() if hasattr(usage, "model_dump") else usage
+            record_from_usage_dict(u, agent="chat", model=claude_model(), provider="claude")
+    except Exception:
+        pass
+    return msg
 
 
 async def acomplete_message(
@@ -298,7 +312,16 @@ async def acomplete_message(
         max_tokens=max_tokens, thinking=thinking,
     )
     async with client.messages.stream(**kwargs) as stream:
-        return await stream.get_final_message()
+        msg = await stream.get_final_message()
+    try:
+        from app.admin.usage_helpers import record_from_usage_dict
+        usage = getattr(msg, "usage", None)
+        if usage is not None:
+            u = usage.model_dump() if hasattr(usage, "model_dump") else usage
+            record_from_usage_dict(u, agent="chat", model=claude_model(), provider="claude")
+    except Exception:
+        pass
+    return msg
 
 
 # ── Convenience: single-turn text / JSON ─────────────────────────────────────────

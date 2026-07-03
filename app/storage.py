@@ -33,9 +33,13 @@ Public API
 
 import os
 import functools
+import logging
 from pathlib import Path
 
 import boto3
+from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 # ── Toggle ────────────────────────────────────────────────────────────────────
 # Flip this (or set USE_CLOUD_STORAGE in .env) to switch storage backends.
@@ -79,6 +83,29 @@ def _local_path(key: str) -> Path:
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
+def _apply_watermark_to_local(local: Path) -> None:
+    """Watermark a generated image file in place before it's uploaded/served.
+
+    This is the SINGLE insertion point for the watermark: every generation flow
+    (chat / studio / designer / guest / legacy two-image) writes its output to
+    ``outputs/.../<filename>`` and then calls ``save_generation`` or
+    ``save_guest_generation``. Watermarking here covers all of them exactly once
+    — no double-watermarking, because each generation is saved exactly once and
+    ``move_guest_to_user`` only renames/copies an already-watermarked file.
+
+    Failures are logged and swallowed so a watermark rendering glitch can never
+    block a generation from being saved.
+    """
+    try:
+        from app.watermark import apply_watermark
+        with Image.open(local) as im:
+            im.load()
+            marked = apply_watermark(im)
+        marked.save(local, format="PNG")
+    except Exception as exc:
+        logger.warning("[storage] watermark step skipped for %s: %s", local, exc)
+
+
 def save_generation(user_id: int, filename: str) -> str:
     """
     After Gemini saves outputs/{user_id}/{filename}:
@@ -88,6 +115,8 @@ def save_generation(user_id: int, filename: str) -> str:
     """
     key   = f"generations/{user_id}/{filename}"
     local = _OUTPUTS_DIR / str(user_id) / filename
+
+    _apply_watermark_to_local(local)
 
     if CLOUD_STORAGE:
         with open(local, "rb") as f:
@@ -135,6 +164,21 @@ def serve_local_path(stored_key: str) -> Path:
     return _local_path(stored_key)
 
 
+def read_generation_bytes(stored_key: str) -> bytes | None:
+    """Read generation image bytes from R2 or local disk (for email attachments)."""
+    try:
+        if CLOUD_STORAGE:
+            obj = _r2().get_object(Bucket=_R2_PRIVATE_BUCKET, Key=stored_key)
+            return obj["Body"].read()
+        path = serve_local_path(stored_key)
+        if not path.exists():
+            return None
+        return path.read_bytes()
+    except Exception as exc:
+        logger.warning("[storage] read_generation_bytes failed for %s: %s", stored_key, exc)
+        return None
+
+
 # ── Guest generation storage ───────────────────────────────────────────────────
 
 def save_guest_generation(session_id: str, filename: str) -> str:
@@ -146,6 +190,8 @@ def save_guest_generation(session_id: str, filename: str) -> str:
     """
     key   = f"guests/{session_id}/{filename}"
     local = _OUTPUTS_DIR / "guests" / session_id / filename
+
+    _apply_watermark_to_local(local)
 
     if CLOUD_STORAGE:
         with open(local, "rb") as f:

@@ -35,11 +35,14 @@ from app.designer_agent import (
 router = APIRouter(prefix="/designer/jobs", tags=["designer-jobs"])
 
 from app.sse import SSE_HEADERS as _SSE_HEADERS
-_LIVE_DEBUG: bool = os.getenv("LIVE_DEBUG", "").lower() in ("1", "true", "yes")
+from app.admin.settings_store import cfg_bool
+
+def _live_debug() -> bool:
+    return cfg_bool("LIVE_DEBUG", False)
 
 
 def _dbg(*args) -> None:
-    if _LIVE_DEBUG:
+    if _live_debug():
         print(*args)
 
 

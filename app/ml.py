@@ -26,6 +26,13 @@ class GeminiEmbeddingModel:
                 types.Content(parts=[types.Part(text=text)])
             ],
         )
+        try:
+            from app.admin.usage_recorder import record
+            meta = getattr(result, "usage_metadata", None)
+            inp = getattr(meta, "prompt_token_count", 0) or len(text.split()) * 2
+            record(agent="embedding", model=self.MODEL, provider="gemini", input_tokens=int(inp or 0))
+        except Exception:
+            pass
         return result.embeddings[0].values
 
     def get_image_embedding(self, image_bytes: bytes, mime_type: str = "image/jpeg") -> list[float]:

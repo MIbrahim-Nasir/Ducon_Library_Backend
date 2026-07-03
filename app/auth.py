@@ -28,6 +28,7 @@ if IS_PRODUCTION and (not SECRET_KEY or SECRET_KEY == _DEFAULT_SECRET):
     )
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 1 week
+RESET_TOKEN_EXPIRE_MINUTES = 15
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -71,6 +72,40 @@ def create_access_token(user_id: int, expires_delta: Optional[timedelta] = None)
         SECRET_KEY,
         algorithm=ALGORITHM,
     )
+
+
+def create_password_reset_token(email: str, expires_delta: Optional[timedelta] = None) -> str:
+    expire = datetime.now(timezone.utc) + (
+        expires_delta or timedelta(minutes=RESET_TOKEN_EXPIRE_MINUTES)
+    )
+    return jwt.encode(
+        {
+            "sub": email.strip().lower(),
+            "purpose": "password_reset",
+            "exp": expire,
+            "jti": str(uuid.uuid4()),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+
+def verify_password_reset_token(token: str) -> str:
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Invalid or expired reset token.",
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("purpose") != "password_reset":
+            raise credentials_exception
+        email = payload.get("sub")
+        jti = payload.get("jti", "")
+        if not email or (jti and _is_revoked(jti)):
+            raise credentials_exception
+        return str(email)
+    except JWTError:
+        raise credentials_exception
 
 
 # ── Google token verification ────────────────────────

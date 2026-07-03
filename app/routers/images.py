@@ -6,10 +6,20 @@ from pathlib import Path
 import httpx
 from fastapi import APIRouter, HTTPException
 
+from app.admin.settings_store import cfg
+
 router = APIRouter(prefix="/images", tags=["images"])
 
-METADATA_PATH = os.getenv("METADATA_PATH", "data/images/metadata.json")
-CACHE_TTL = int(os.getenv("METADATA_CACHE_TTL", str(60 * 60 * 24)))  # default 1 day in seconds
+METADATA_PATH_DEFAULT = "data/images/metadata.json"
+CACHE_TTL_DEFAULT = 60 * 60 * 24
+
+
+def metadata_path() -> str:
+    return cfg("METADATA_PATH", METADATA_PATH_DEFAULT)
+
+
+def cache_ttl() -> int:
+    return int(cfg("METADATA_CACHE_TTL", CACHE_TTL_DEFAULT))
 
 _cache: list[dict] | None = None
 _cache_loaded_at: float = 0.0
@@ -22,19 +32,20 @@ def _is_url(value: str) -> bool:
 def _load_metadata() -> list[dict]:
     global _cache, _cache_loaded_at
 
-    if _cache is not None and (time.time() - _cache_loaded_at) < CACHE_TTL:
+    if _cache is not None and (time.time() - _cache_loaded_at) < cache_ttl():
         return _cache
 
-    if _is_url(METADATA_PATH):
-        response = httpx.get(METADATA_PATH, timeout=30)
+    path = metadata_path()
+    if _is_url(path):
+        response = httpx.get(path, timeout=30)
         if response.status_code != 200:
             raise RuntimeError(
-                f"Failed to fetch metadata from {METADATA_PATH} "
+                f"Failed to fetch metadata from {path} "
                 f"(HTTP {response.status_code})"
             )
         data = response.json()
     else:
-        local = Path(METADATA_PATH)
+        local = Path(path)
         if not local.exists():
             raise FileNotFoundError(f"metadata.json not found at {local}")
         with open(local, "r", encoding="utf-8") as f:

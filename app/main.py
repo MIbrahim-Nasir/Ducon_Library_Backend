@@ -28,6 +28,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 from app.prompt_loader import load_prompts
 from app.studio_directions_agent import curate_studio_directions, stream_studio_directions_events
 
@@ -51,6 +57,7 @@ from app.routers.quotation import router as quotation_router
 from app.routers.chat import router as chat_router
 from app.routers.multi_image_gen import router as multi_image_gen_router
 from app.routers.designer_jobs import router as designer_jobs_router
+from app.routers.contact import router as contact_router
 from app.db.database import get_db
 from app.db.models import Generation, GuestGeneration, Image as DBImage
 from app.auth import get_current_user, get_optional_user
@@ -67,10 +74,47 @@ from datetime import datetime, timedelta, timezone
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("Startup: loading prompts")
     load_prompts()
+    logger.info("Startup: opening ChromaDB collection")
     app.state.collection = chromadb.get_db_collection()
+    logger.info("Startup: initializing embedding model")
     app.state.embedding_model = GeminiEmbeddingModel()
-    yield
+    # ── Admin / metrics subsystem startup ────────────────────────────────
+    from app.db.database import Base, async_session_maker, engine
+    import app.db.models  # noqa: F401 — register all tables on Base.metadata
+    from app.admin.settings_store import get_settings_store
+    from app.admin.usage_recorder import get_usage_recorder
+    # Auto-create any admin/metrics tables missing in the DB (idempotent).
+    logger.info("Startup: connecting to Postgres and ensuring schema")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    except Exception as exc:
+        logger.error(
+            "Startup failed: could not connect to Postgres or create schema "
+            "(check DATABASE_URL and that Postgres is running): %s",
+            exc,
+        )
+        raise RuntimeError(
+            "Database startup failed — verify DATABASE_URL and that Postgres is reachable"
+        ) from exc
+    logger.info("Startup: loading admin settings from database")
+    try:
+        async with async_session_maker() as _db:
+            await get_settings_store().load_all(_db)
+    except Exception as exc:
+        logger.warning(
+            "Startup: admin settings load failed — continuing with env/default values: %s",
+            exc,
+        )
+    logger.info("Startup: starting usage recorder")
+    get_usage_recorder().start()
+    logger.info("Startup complete")
+    try:
+        yield
+    finally:
+        await get_usage_recorder().stop()
 
 app = FastAPI(lifespan=lifespan)
 
@@ -84,6 +128,9 @@ app.include_router(quotation_router)
 app.include_router(chat_router)
 app.include_router(multi_image_gen_router)
 app.include_router(designer_jobs_router)
+app.include_router(contact_router)
+from app.routers.admin import router as admin_router
+app.include_router(admin_router)
 
 # Serve public library images statically
 app.mount("/public/images", StaticFiles(directory="data/images"), name="public_images")

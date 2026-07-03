@@ -72,21 +72,37 @@ logger = logging.getLogger(__name__)
 
 # ── Model config ──────────────────────────────────────────────────────────────
 
-MULTI_IMAGE_PRO_MODEL   = os.getenv("MULTI_IMAGE_PRO_MODEL",   "gemini-3-pro-image-preview")
-MULTI_IMAGE_FLASH_MODEL = os.getenv("MULTI_IMAGE_FLASH_MODEL", "gemini-3.1-flash-image-preview")
+from app.admin.settings_store import cfg
 
-_MODEL_MAP = {
-    "pro":   MULTI_IMAGE_PRO_MODEL,
-    "flash": MULTI_IMAGE_FLASH_MODEL,
-}
+MULTI_IMAGE_PRO_MODEL = "gemini-3-pro-image-preview"
+MULTI_IMAGE_FLASH_MODEL = "gemini-3.1-flash-image-preview"
+
+def _multi_image_pro_model() -> str:
+    return cfg("MULTI_IMAGE_PRO_MODEL", MULTI_IMAGE_PRO_MODEL)
+
+
+def _multi_image_flash_model() -> str:
+    return cfg("MULTI_IMAGE_FLASH_MODEL", MULTI_IMAGE_FLASH_MODEL)
+
+
+def _model_map() -> dict:
+    return {
+        "pro": _multi_image_pro_model(),
+        "flash": _multi_image_flash_model(),
+    }
+
 _NANO_BANANA_2 = "gemini-3.1-flash-image-preview"
 
-MULTI_IMAGE_THINKING_LEVEL = os.getenv("MULTI_IMAGE_THINKING_LEVEL", "High")
-_LIVE_DEBUG: bool = os.getenv("LIVE_DEBUG", "").lower() in ("1", "true", "yes")
+MULTI_IMAGE_THINKING_LEVEL = "High"
+_LIVE_DEBUG: bool = False
+
+
+def _multi_image_thinking() -> str:
+    return cfg("MULTI_IMAGE_THINKING_LEVEL", MULTI_IMAGE_THINKING_LEVEL)
 
 
 def _dbg(*args) -> None:
-    if _LIVE_DEBUG:
+    if cfg("LIVE_DEBUG", _LIVE_DEBUG):
         print(*args)
 
 
@@ -314,6 +330,7 @@ def _run_generation_sync(
     labels: list[str],
     prompt: str,
     aspect_ratio: Optional[str] = None,
+    user_id: Optional[int] = None,
 ) -> bytes:
     """
     Build the interleaved-label parts array, call Gemini, return raw PNG bytes.
@@ -338,7 +355,7 @@ def _run_generation_sync(
         response_modalities=[Modality.TEXT, Modality.IMAGE],
         image_config=image_cfg,
         thinking_config=ThinkingConfig(
-            thinking_level=MULTI_IMAGE_THINKING_LEVEL,
+            thinking_level=_multi_image_thinking(),
             include_thoughts=False,
         ) if is_flash else None,
     )
@@ -365,6 +382,8 @@ def _run_generation_sync(
         config=config,
     )
     _dbg("[MULTI_IMAGE ◀ GEMINI]", {"usage": _response_usage(response)})
+    from app.admin.usage_helpers import record_from_response
+    record_from_response(response, agent="multi_image", model=model_id, user_id=user_id, image_count=1)
 
     for part in response.candidates[0].content.parts:
         if part.text:
@@ -425,7 +444,7 @@ async def generate_multi_image(
     if not prompt.strip():
         raise ValueError("Prompt must not be empty.")
 
-    model_id = _MODEL_MAP.get(model)
+    model_id = _model_map().get(model)
     if model_id is None:
         raise ValueError(f"Unknown model '{model}'. Use 'pro' or 'flash'.")
 
@@ -529,6 +548,7 @@ async def generate_multi_image(
             labels,
             active_prompt,
             aspect_ratio,
+            user_id,
         )
 
         qc_roles = _select_qc_roles(labels)

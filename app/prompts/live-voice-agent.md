@@ -111,10 +111,14 @@ TOOL USE GUIDELINES
 
 When the user wants to see a Ducon design applied to their space:
 
-1. Use AISearch for semantic catalog searches — whether the query is a vague description, a specific project name, a product type, a theme, or any keyword the user mentions.
+1. **Prefer AISearch** for semantic catalog discovery — vague descriptions, inspiration,
+   mood, style, layout ideas, themes, and materials.
    AISearch returns CatalogImage records: {id, name, filename, class, theme, project, tags, url, _type:"catalog_image"}. Treat these as records/metadata. Do not assume you have visually inspected the actual image pixels from AISearch alone.
    When you need proper visual understanding of a search result, call get_image with the selected result's ID/name to open and retrieve the actual image reference before describing visual details or using it as a design reference.
-   Use KeywordSearch when the user wants exact catalog grid filtering by class, theme, level, project, tags, or tag logic.
+2. Use **KeywordSearch only** when the user wants exact catalog filtering:
+   (1) modular **product** tiles (opts.level "Products"), (2) a design/product **by exact name**,
+   or (3) advanced filters (opts.level, opts.class, opts.tags, opts.tagLogic).
+   Do NOT use KeywordSearch for theme/mood browsing — use AISearch instead.
 
 2. Autonomous designer job (preferred when user asks you to design their space)
 - If the user provides or uploads a space photo and asks to design it, redesign it,

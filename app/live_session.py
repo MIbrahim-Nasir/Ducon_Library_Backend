@@ -76,19 +76,21 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-LIVE_MODEL = os.getenv("LIVE_MODEL", "gemini-3.1-flash-live-preview")
+from app.admin.settings_store import cfg
+
+LIVE_MODEL = "gemini-3.1-flash-live-preview"        # default; live via cfg("LIVE_MODEL", LIVE_MODEL)
 
 # ── Voice ─────────────────────────────────────────────────────────────────────
-LIVE_VOICE = os.getenv("LIVE_VOICE", "Kore")
+LIVE_VOICE = "Kore"
 
 # ── Thinking level ────────────────────────────────────────────────────────────
 # gemini-3.1-flash-live uses thinkingLevel: minimal | low | medium | high
 # "minimal" keeps latency lowest (default).
-LIVE_THINKING_LEVEL = os.getenv("LIVE_THINKING_LEVEL", "minimal")
+LIVE_THINKING_LEVEL = "minimal"
 
 # ── Context-window compression ────────────────────────────────────────────────
-_COMPRESSION_TRIGGER_TOKENS: int = int(os.getenv("LIVE_COMPRESSION_TRIGGER", "100000"))
-_COMPRESSION_TARGET_TOKENS: int = int(os.getenv("LIVE_COMPRESSION_TARGET", "32000"))
+_COMPRESSION_TRIGGER_TOKENS = 100000
+_COMPRESSION_TARGET_TOKENS = 32000
 
 # ── Default system instruction ────────────────────────────────────────────────
 from app import prompt_loader
@@ -103,91 +105,26 @@ def get_live_system_instruction() -> str:
 
 
 # ── Debug printing ─────────────────────────────────────────────────────────────
-# Set LIVE_DEBUG=true in .env to enable verbose terminal prints of every message
-# sent to / received from Gemini Live.  Leave empty or false for production.
-_LIVE_DEBUG: bool = os.getenv("LIVE_DEBUG", "").lower() in ("1", "true", "yes")
+# Set LIVE_DEBUG=true in .env (or via admin panel) to enable verbose terminal prints
+# of every message sent to / received from Gemini Live. Leave empty or false for production.
+_LIVE_DEBUG: bool = False
 
 
 def _dbg(*args) -> None:
     """Print only when LIVE_DEBUG is enabled."""
-    if _LIVE_DEBUG:
+    if cfg("LIVE_DEBUG", _LIVE_DEBUG):
         print(*args)
 
 
+from app.search_tools import ai_search_live_declaration, keyword_search_live_declaration
+
 # ── Tool declarations ──────────────────────────────────────────────────────────
 # All tools execute on the frontend via window.__duconAPI.*.
-# The backend proxies TOOL_CALL events to the client and forwards
-# tool_result responses back to Gemini with submit_tool_result().
 _TOOLS: list[dict] = [
     {
         "function_declarations": [
-            {
-                "name": "AISearch",
-                "description": (
-                    "Semantic visual search of the Ducon project catalog. "
-                    "Use for any search query — natural-language descriptions, specific project "
-                    "names, product types, themes, tags, or any keyword the user mentions. "
-                    "Returns Array<CatalogImage>, where each item has {id, name, filename, class, "
-                    "theme, project, tags, url, _type:'catalog_image'}. It opens the AI search modal "
-                    "and resolves when results are set. Treat results as records/metadata, not visual "
-                    "inspection of pixels. If you need to inspect or reference the actual image, "
-                    "call get_image with the chosen result ID/name/object."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Natural-language description of what to find",
-                        },
-                        "show_user": {
-                            "type": "boolean",
-                            "description": (
-                                "True when the user should see search results in the UI. "
-                                "False for internal reference gathering only."
-                            ),
-                        },
-                    },
-                    "required": ["query"],
-                },
-            },
-            {
-                "name": "KeywordSearch",
-                "description": (
-                    "Apply exact filters to the Ducon catalog grid immediately. Use when the user asks "
-                    "to filter/browse by class, theme, level, project, tags, or tag logic rather than "
-                    "semantic design discovery. Returns void."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Keyword text to apply to the catalog grid.",
-                        },
-                        "opts": {
-                            "type": "object",
-                            "description": "Optional exact catalog filters.",
-                            "properties": {
-                                "class": {"type": "string"},
-                                "theme": {"type": "string"},
-                                "level": {"type": "string"},
-                                "project": {"type": "string"},
-                                "tags": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                },
-                                "tagLogic": {
-                                    "type": "string",
-                                    "enum": ["and", "or"],
-                                    "description": "How multiple tags should be combined.",
-                                },
-                            },
-                        },
-                    },
-                    "required": ["query"],
-                },
-            },
+            ai_search_live_declaration(),
+            keyword_search_live_declaration(require_query=False),
             {
                 "name": "UploadImage",
                 "description": (
@@ -418,7 +355,7 @@ _RECONNECT_MAX_DELAY     = 30.0  # cap on exponential backoff
 # never sends a tool_result, the receive() loop blocks forever and the agent
 # appears frozen.  This timeout auto-responds with an error so Gemini can
 # continue rather than waiting indefinitely.
-_TOOL_CALL_TIMEOUT_SECS = float(os.getenv("LIVE_TOOL_CALL_TIMEOUT", "30.0"))
+_TOOL_CALL_TIMEOUT_SECS = 30.0  # default; live via cfg("LIVE_TOOL_CALL_TIMEOUT", _TOOL_CALL_TIMEOUT_SECS)
 
 # Tools that must NOT be auto-timed-out because they are either:
 #   • user-paced   — the user takes as long as they need (UploadImage)
@@ -434,8 +371,20 @@ _NO_TIMEOUT_TOOLS: frozenset[str] = frozenset({
     "get_quotation",   # Gemini 3.1 Pro analysis can take 15–30 s
 })
 
-_LIVE_AISEARCH_MAX_ITEMS: int = int(os.getenv("LIVE_AISEARCH_MAX_ITEMS", os.getenv("CHAT_AISEARCH_MAX_ITEMS", "8")))
-_LIVE_TOOL_RESULT_MAX_CHARS: int = int(os.getenv("LIVE_TOOL_RESULT_MAX_CHARS", os.getenv("CHAT_TOOL_RESULT_MAX_CHARS", "12000")))
+_LIVE_AISEARCH_MAX_ITEMS = 8        # default; live via cfg("CHAT_AISEARCH_MAX_ITEMS", ...)
+_LIVE_TOOL_RESULT_MAX_CHARS = 12000
+
+
+def _live_aisearch_max_items() -> int:
+    return int(cfg("LIVE_AISEARCH_MAX_ITEMS", cfg("CHAT_AISEARCH_MAX_ITEMS", _LIVE_AISEARCH_MAX_ITEMS)))
+
+
+def _live_tool_result_max_chars() -> int:
+    return int(cfg("LIVE_TOOL_RESULT_MAX_CHARS", cfg("CHAT_TOOL_RESULT_MAX_CHARS", _LIVE_TOOL_RESULT_MAX_CHARS)))
+
+
+def _tool_call_timeout() -> float:
+    return float(cfg("LIVE_TOOL_CALL_TIMEOUT", _TOOL_CALL_TIMEOUT_SECS))
 
 # ── Conversation history ───────────────────────────────────────────────────────
 # Maximum number of turns kept in-memory for re-seeding on reconnect.
@@ -452,15 +401,28 @@ _MAX_EXECUTE_NOW_RETRIES: int = 2
 # ── Send-wait policy ──────────────────────────────────────────────────────────
 # How long send_* methods will wait for the session to (re)connect before
 # giving up on a single message.
-SEND_WAIT_TIMEOUT = float(os.getenv("LIVE_SEND_WAIT_TIMEOUT", "8.0"))
+SEND_WAIT_TIMEOUT = 8.0  # default; live via cfg("LIVE_SEND_WAIT_TIMEOUT", SEND_WAIT_TIMEOUT)
+
+
+def _send_wait_timeout() -> float:
+    return float(cfg("LIVE_SEND_WAIT_TIMEOUT", SEND_WAIT_TIMEOUT))
+
 
 # ── VAD sensitivity ───────────────────────────────────────────────────────────
-# How many milliseconds of silence signal end-of-speech.  Tweak in .env if the
-# model cuts off too early (lower value) or too late (raise value).
-_VAD_SILENCE_MS   = int(os.getenv("LIVE_VAD_SILENCE_MS", "800"))
+# How many milliseconds of silence signal end-of-speech.  Tweak via admin panel
+# or .env if the model cuts off too early (lower value) or too late (raise value).
+_VAD_SILENCE_MS = 800
 # prefix_padding: audio captured before speech start is included to avoid
 # clipping the first syllable.
-_VAD_PREFIX_MS    = int(os.getenv("LIVE_VAD_PREFIX_MS", "100"))
+_VAD_PREFIX_MS = 100
+
+
+def _vad_silence_ms() -> int:
+    return int(cfg("LIVE_VAD_SILENCE_MS", _VAD_SILENCE_MS))
+
+
+def _vad_prefix_ms() -> int:
+    return int(cfg("LIVE_VAD_PREFIX_MS", _VAD_PREFIX_MS))
 
 
 # ── Event types ────────────────────────────────────────────────────────────────
@@ -536,13 +498,13 @@ class GeminiLiveSession:
         guest_session_id: Optional[str] = None,
         system_instruction: Optional[str] = None,
         resumption_handle: Optional[str] = None,
-        model: str = LIVE_MODEL,
+        model: Optional[str] = None,
     ) -> None:
         self.user_id = user_id
         self.guest_session_id = guest_session_id
         self.system_instruction = system_instruction or get_live_system_instruction()
         self.resumption_handle = resumption_handle
-        self.model = model
+        self.model = model or cfg("LIVE_MODEL", LIVE_MODEL)
 
         self._client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
@@ -611,6 +573,10 @@ class GeminiLiveSession:
         Using a plain dict decouples us from SDK class names that change
         between minor releases.
         """
+        _voice = cfg("LIVE_VOICE", LIVE_VOICE)
+        _trigger = int(cfg("LIVE_COMPRESSION_TRIGGER", _COMPRESSION_TRIGGER_TOKENS))
+        _target = int(cfg("LIVE_COMPRESSION_TARGET", _COMPRESSION_TARGET_TOKENS))
+        _thinking = cfg("LIVE_THINKING_LEVEL", LIVE_THINKING_LEVEL)
         config: dict = {
             # Only AUDIO output is supported on native-audio live models.
             # Text is accessed via output_audio_transcription.
@@ -618,7 +584,7 @@ class GeminiLiveSession:
 
             "speech_config": {
                 "voice_config": {
-                    "prebuilt_voice_config": {"voice_name": LIVE_VOICE}
+                    "prebuilt_voice_config": {"voice_name": _voice}
                 }
             },
 
@@ -633,15 +599,15 @@ class GeminiLiveSession:
             "realtime_input_config": {
                 "automatic_activity_detection": {
                     "disabled": False,
-                    "prefix_padding_ms": _VAD_PREFIX_MS,
-                    "silence_duration_ms": _VAD_SILENCE_MS,
+                    "prefix_padding_ms": _vad_prefix_ms(),
+                    "silence_duration_ms": _vad_silence_ms(),
                 }
             },
 
             # Sliding-window context compression — unlimited session duration.
             "context_window_compression": {
-                "trigger_tokens": _COMPRESSION_TRIGGER_TOKENS,
-                "sliding_window": {"target_tokens": _COMPRESSION_TARGET_TOKENS},
+                "trigger_tokens": _trigger,
+                "sliding_window": {"target_tokens": _target},
             },
 
             # Session resumption — receive periodic handles that let us
@@ -665,8 +631,8 @@ class GeminiLiveSession:
         if self.system_instruction:
             config["system_instruction"] = self.system_instruction
 
-        if LIVE_THINKING_LEVEL and LIVE_THINKING_LEVEL.lower() not in ("none", ""):
-            config["thinking_config"] = {"thinking_level": LIVE_THINKING_LEVEL}
+        if _thinking and _thinking.lower() not in ("none", ""):
+            config["thinking_config"] = {"thinking_level": _thinking}
 
         return config
 
@@ -694,7 +660,7 @@ class GeminiLiveSession:
 
         logger.info(
             "Gemini Live session ready — user=%s model=%s voice=%s",
-            self.user_id, self.model, LIVE_VOICE,
+            self.user_id, self.model, cfg("LIVE_VOICE", LIVE_VOICE),
         )
 
     async def close(self) -> None:
@@ -738,13 +704,14 @@ class GeminiLiveSession:
         if self._session and self._connected.is_set():
             return self._session
         # Session is reconnecting — wait for it to come back.
+        _swt = _send_wait_timeout()
         logger.info(
             "send: session reconnecting, waiting up to %.0fs — user=%s",
-            SEND_WAIT_TIMEOUT, self.user_id,
+            _swt, self.user_id,
         )
         try:
             await asyncio.wait_for(
-                asyncio.shield(self._connected.wait()), timeout=SEND_WAIT_TIMEOUT
+                asyncio.shield(self._connected.wait()), timeout=_swt
             )
         except asyncio.TimeoutError:
             logger.warning(
@@ -914,7 +881,8 @@ class GeminiLiveSession:
         this timeout, a missing or slow frontend handler would freeze the
         entire voice session indefinitely.
         """
-        await asyncio.sleep(_TOOL_CALL_TIMEOUT_SECS)
+        _timeout = _tool_call_timeout()
+        await asyncio.sleep(_timeout)
 
         timeout_key = call_id or name
         if timeout_key not in self._pending_tool_calls:
@@ -924,7 +892,7 @@ class GeminiLiveSession:
         logger.warning(
             "Tool call timed out after %.0fs: %s call_id=%s — "
             "auto-responding with error so Gemini can continue — user=%s",
-            _TOOL_CALL_TIMEOUT_SECS, name, call_id, self.user_id,
+            _timeout, name, call_id, self.user_id,
         )
         session = self._session
         if session is None:
@@ -1238,19 +1206,31 @@ class GeminiLiveSession:
             prompt  = getattr(usage, "prompt_token_count", None)
             cached  = getattr(usage, "cached_content_token_count", None)
             cand    = getattr(usage, "candidates_token_count", None)
+            _trig = int(cfg("LIVE_COMPRESSION_TRIGGER", _COMPRESSION_TRIGGER_TOKENS))
+            _tgt = int(cfg("LIVE_COMPRESSION_TARGET", _COMPRESSION_TARGET_TOKENS))
             if total is not None:
-                pct = int(total / _COMPRESSION_TRIGGER_TOKENS * 100)
+                pct = int(total / _trig * 100) if _trig else 0
                 bar_len = 20
-                filled  = int(bar_len * total / _COMPRESSION_TRIGGER_TOKENS)
+                filled  = int(bar_len * total / _trig) if _trig else 0
                 bar     = "█" * min(filled, bar_len) + "░" * (bar_len - min(filled, bar_len))
                 _dbg(
-                    f"[LIVE ◀ USAGE] [{bar}] {total:,} / {_COMPRESSION_TRIGGER_TOKENS:,} tokens ({pct}%)"
+                    f"[LIVE ◀ USAGE] [{bar}] {total:,} / {_trig:,} tokens ({pct}%)"
                     f"  prompt={prompt}  output={cand}  cached={cached}"
                     f"  (user={self.user_id})"
                 )
-                if total >= _COMPRESSION_TRIGGER_TOKENS:
-                    _dbg(f"[LIVE ⚡ COMP ] compression triggered — target {_COMPRESSION_TARGET_TOKENS:,} tokens  (user={self.user_id})")
-                elif total >= int(_COMPRESSION_TRIGGER_TOKENS * 0.8):
+                # Non-blocking usage/cost recording for the live voice agent.
+                try:
+                    from app.admin.usage_recorder import record
+                    record(
+                        agent="live", model=self.model, provider="gemini",
+                        user_id=self.user_id, guest_session_id=self.guest_session_id,
+                        input_tokens=int(prompt or 0), output_tokens=int(cand or 0),
+                    )
+                except Exception:
+                    pass
+                if total >= _trig:
+                    _dbg(f"[LIVE ⚡ COMP ] compression triggered — target {_tgt:,} tokens  (user={self.user_id})")
+                elif total >= int(_trig * 0.8):
                     _dbg(f"[LIVE ⚠ USAGE] approaching compression threshold ({pct}% full)  (user={self.user_id})")
 
         # ── Server content BEFORE tool calls ───────────────────────────────────
@@ -1390,12 +1370,13 @@ class GeminiLiveSession:
                     )
                     _dbg(f"[LIVE ◀ TOOL ] {name}({args})  [no timeout]  (user={self.user_id})")
                 else:
+                    _tct = _tool_call_timeout()
                     logger.info(
                         "← Gemini tool_call: %s(%s) call_id=%s [timeout=%.0fs] — user=%s",
                         name, list(args.keys()), call_id,
-                        _TOOL_CALL_TIMEOUT_SECS, self.user_id,
+                        _tct, self.user_id,
                     )
-                    _dbg(f"[LIVE ◀ TOOL ] {name}({args})  [timeout={_TOOL_CALL_TIMEOUT_SECS:.0f}s]  (user={self.user_id})")
+                    _dbg(f"[LIVE ◀ TOOL ] {name}({args})  [timeout={_tct:.0f}s]  (user={self.user_id})")
                     # Spawn a timeout so that if the frontend never replies,
                     # Gemini gets an auto error-response instead of freezing.
                     timeout_key = call_id or name
@@ -1553,14 +1534,14 @@ def _compact_tool_result(name: str, result: object) -> object:
         return _compact_designer_job_result(result)
 
     if name != "AISearch":
-        return _truncate_jsonish(result, _LIVE_TOOL_RESULT_MAX_CHARS)
+        return _truncate_jsonish(result, _live_tool_result_max_chars())
 
     items = result if isinstance(result, list) else (result or {}).get("items") if isinstance(result, dict) else []
     if not isinstance(items, list):
         return result
 
     compacted: list[dict] = []
-    for item in items[:_LIVE_AISEARCH_MAX_ITEMS]:
+    for item in items[:_live_aisearch_max_items()]:
         if not isinstance(item, dict):
             compacted.append({"value": str(item)[:500]})
             continue
