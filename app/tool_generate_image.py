@@ -400,7 +400,9 @@ def _run_generation_sync(
 
 async def generate_multi_image(
     *,
-    user_id:           int,
+    user_id:           Optional[int] = None,
+    guest_session_id:  Optional[str] = None,
+    guest_session=None,
     prompt:            str,
     descriptors:       list[ImageDescriptor],
     model:             str = "pro",
@@ -435,6 +437,9 @@ async def generate_multi_image(
         ValueError   — bad args (invalid source, too many images, etc.)
         RuntimeError — Gemini returned no image
     """
+    if (user_id is None) == (guest_session_id is None):
+        raise ValueError("Provide exactly one of user_id or guest_session_id.")
+
     if not descriptors:
         raise ValueError("At least one image descriptor is required.")
     if len(descriptors) > MAX_IMAGES:
@@ -531,7 +536,7 @@ async def generate_multi_image(
     # ── Generation + post-evaluation loop ─────────────────────────────────────
     # Generate → evaluate → regenerate with revised prompt up to GEN_EVAL_MAX_ROUNDS.
     # All retries reuse the same generation_name so only the final image is stored.
-    subfolder        = str(user_id)
+    subfolder        = f"guests/{guest_session_id}" if guest_session_id else str(user_id)
     safe_prefix      = "".join(c for c in output_prefix if c.isalnum() or c in ("_", "-")) or "multi"
     generation_name  = f"{safe_prefix}_{uuid.uuid4().hex[:12]}.png"
     max_rounds       = GEN_EVAL_MAX_ROUNDS if enable_verify else 1
@@ -683,24 +688,49 @@ async def generate_multi_image(
         raise RuntimeError("No image bytes produced after generation loop.")
 
     # ── Save to disk + storage ────────────────────────────────────────────────
-    _save_bytes_locally(image_bytes, subfolder, generation_name)
+    await asyncio.to_thread(_save_bytes_locally, image_bytes, subfolder, generation_name)
     _dbg("[MULTI_IMAGE ▶ SAVE LOCAL]", {"subfolder": subfolder, "filename": generation_name, "bytes": len(image_bytes)})
-    stored_key = storage.save_generation(user_id, generation_name)
-    _dbg("[MULTI_IMAGE ▶ SAVE STORAGE]", {"stored_key": stored_key})
 
-    # ── Persist to DB ─────────────────────────────────────────────────────────
-    from app.db.models import Generation as Gen
-    db_gen = Gen(
-        user_id=user_id,
-        generation_name=generation_name,
-        url=stored_key,
-        ducon_image_id=None,
-    )
-    db.add(db_gen)
-    await db.flush()
-    await db.commit()
+    if guest_session_id:
+        from datetime import datetime, timedelta, timezone
 
-    signed_url = storage.get_generation_url(db_gen.id, stored_key)
+        from app.db.models import GuestGeneration
+        from app.routers.guest import increment_guest_count
+
+        stored_key = await storage.asave_guest_generation(guest_session_id, generation_name)
+        _dbg("[MULTI_IMAGE ▶ SAVE STORAGE]", {"stored_key": stored_key, "guest_session_id": guest_session_id})
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=48)
+        db_gen = GuestGeneration(
+            guest_session_id=guest_session_id,
+            generation_name=generation_name,
+            url=stored_key,
+            ducon_image_id=None,
+            expires_at=expires_at,
+        )
+        db.add(db_gen)
+        await db.flush()
+        if guest_session is not None:
+            await increment_guest_count(db, guest_session)
+        await db.commit()
+        signed_url = storage.get_guest_generation_url(db_gen.id, stored_key)
+    else:
+        stored_key = await storage.asave_generation(user_id, generation_name)
+        _dbg("[MULTI_IMAGE ▶ SAVE STORAGE]", {"stored_key": stored_key})
+
+        # ── Persist to DB ─────────────────────────────────────────────────────
+        from app.db.models import Generation as Gen
+
+        db_gen = Gen(
+            user_id=user_id,
+            generation_name=generation_name,
+            url=stored_key,
+            ducon_image_id=None,
+        )
+        db.add(db_gen)
+        await db.flush()
+        await db.commit()
+        signed_url = storage.get_generation_url(db_gen.id, stored_key)
+
     _dbg(
         "[MULTI_IMAGE ◀ RESULT]",
         {"id": db_gen.id, "generation_name": generation_name, "url": stored_key, "signed_url": signed_url},
@@ -714,6 +744,8 @@ async def generate_multi_image(
         "model_used":      model_id,
         "images_used":     images_used,
     }
+    if guest_session_id:
+        result["expires_at"] = expires_at.isoformat()
 
     # Non-blocking notice about the user's input photo quality (tilt/crop/suitability).
     if image_gen_agent is not None and image_gen_agent.input_quality:

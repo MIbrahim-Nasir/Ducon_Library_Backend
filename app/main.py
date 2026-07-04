@@ -476,7 +476,7 @@ async def auto_generate_images(
 
         # ── Step 3: Persist & respond ─────────────────────────────────────────
         if is_guest:
-            stored_key = storage.save_guest_generation(raw_session_id, generation_filename)
+            stored_key = await storage.asave_guest_generation(raw_session_id, generation_filename)
             expires_at = datetime.now(timezone.utc) + timedelta(hours=48)
 
             db_generation = GuestGeneration(
@@ -516,7 +516,7 @@ async def auto_generate_images(
                     guest_result["generation_warnings"] = gen_notice
             return guest_result
 
-        stored_key = storage.save_generation(current_user.id, generation_filename)
+        stored_key = await storage.asave_generation(current_user.id, generation_filename)
 
         db_generation = Generation(
             user_id=current_user.id,

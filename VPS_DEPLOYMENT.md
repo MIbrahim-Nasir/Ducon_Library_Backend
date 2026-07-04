@@ -38,9 +38,13 @@ Key runtime traits that drive the proxy config:
 | Voice agent | `GET /ws/voice?token=…` | **WebSocket** | upgrade headers, long read timeout |
 | Multi-image gen | `POST /generate-multi-image` | **SSE** (keepalive every 10 s) | no buffering, long timeout |
 | Single gen / Studio | `POST /autogenerate-images` | **SSE** | no buffering, long timeout |
+| Studio directions | `POST /studio/directions` | **SSE** | no buffering, long timeout |
+| Designer job events | `GET /designer/jobs/{id}/events` | **SSE** | no buffering, long timeout |
 | Chat | `POST /chat/*` | **SSE** | no buffering |
 | Catalog images | `GET /public/images/*`, `/images/*` | static/REST | normal |
-| Everything else | `/auth /bookmarks /generations /guest /quotation /designer /studio /search` | REST | normal |
+| Admin API | `/admin/*` | REST | normal (NOT bare `/admin` — that's the SPA) |
+| Contact | `/contact/*` | REST | normal |
+| Everything else | `/auth /bookmarks /generations /guest /images /public /quotation /search` | REST | normal |
 
 Generation can take **up to ~10 minutes** (`GENERATION_TIMEOUT_MS = 600000` on the
 client). The backend emits `: keepalive` SSE comments every 10 s so the connection
@@ -125,7 +129,7 @@ MULTI_IMAGE_PRO_MODEL=gemini-3-pro-image-preview
 MULTI_IMAGE_FLASH_MODEL=gemini-3.1-flash-image-preview
 CHAT_MODEL=gemini-3.5-flash
 LIVE_MODEL=gemini-3.1-flash-live-preview
-LIVE_VOICE=Kore
+LIVE_VOICE=Iapetus
 QUOTATION_MODEL=gemini-3.1-pro-preview
 
 # ─── Image-gen QC pipeline ───────────────────────────────────
@@ -263,8 +267,10 @@ server {
         proxy_send_timeout  3600s;
     }
 
-    # ---- 2. Long-running SSE generation + chat ----
-    location ~ ^/(generate-multi-image|autogenerate-images|chat) {
+    # ---- 2. Long-running SSE generation + chat + designer events ----
+    # /studio/directions and /designer/jobs/<id>/events are also SSE streams
+    # and MUST be in the no-buffer block, or they'll hang at the 120s REST timeout.
+    location ~ ^/(generate-multi-image|autogenerate-images|chat|studio/directions|designer/jobs/.+/events) {
         proxy_pass http://ducon_api;
         proxy_http_version 1.1;
         proxy_set_header Host       $host;
@@ -278,7 +284,8 @@ server {
     }
 
     # ---- 3. Normal REST API ----
-    location ~ ^/(auth|bookmarks|generations|guest|images|public|quotation|designer|studio|search) {
+    # NOTE: /admin/.+ only — bare /admin is the React admin SPA (served by location /).
+    location ~ ^/(auth|bookmarks|generations|guest|images|public|quotation|search|admin/.+|contact) {
         proxy_pass http://ducon_api;
         proxy_http_version 1.1;
         proxy_set_header Host      $host;
@@ -325,7 +332,9 @@ yourdomain.com {
     encode gzip
 
     # SSE + WS must not be buffered/compressed
-    @stream path /ws/* /generate-multi-image* /autogenerate-images* /chat*
+    # /studio/directions and /designer/jobs/<id>/events are SSE too.
+    @stream path /ws/* /generate-multi-image* /autogenerate-images* /chat* \
+                     /studio/directions* /designer/jobs/*/events*
     reverse_proxy @stream 127.0.0.1:8000 {
         flush_interval -1          # disable buffering (stream immediately)
         transport http {
@@ -334,9 +343,9 @@ yourdomain.com {
         }
     }
 
-    # Other API paths
+    # Other API paths (admin/.+ only — bare /admin is the SPA)
     @api path /auth* /bookmarks* /generations* /guest* /images* /public* \
-              /quotation* /designer* /studio* /search*
+              /quotation* /search* /admin/* /contact*
     reverse_proxy @api 127.0.0.1:8000
 
     # SPA static + fallback
@@ -378,7 +387,8 @@ sudo rsync -a --delete dist/ /var/www/ducon/dist/
   limit, so no extra timeout config is required.
 - **Caching:** add a Cache Rule to **Bypass cache** for
   `/ws/*`, `/generate-multi-image*`, `/autogenerate-images*`, `/chat*`,
-  `/auth*`, `/generations*` (anything dynamic / streaming / authed).
+  `/studio/directions*`, `/designer/jobs*`, `/auth*`, `/generations*`
+  (anything dynamic / streaming / authed).
 - **Cloudflare Tunnel** (no public IP) works too — `cloudflared` forwards WS and
   SSE transparently; point the tunnel at your nginx/Caddy (or directly at `:8000`
   if you let cloudflared serve TLS).
@@ -436,4 +446,3 @@ should move from **connecting → listening** within a couple of seconds.
 - [ ] SPA built with `VITE_API_BASE_URL=same-origin` and deployed to `dist/`
 - [ ] Cloudflare: cache bypass for dynamic/streaming/WS paths (if used)
 - [ ] Smoke tests in §8 pass (REST + SSE trickle + WS 101 + voice connects)
-```

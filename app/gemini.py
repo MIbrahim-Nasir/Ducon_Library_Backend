@@ -61,7 +61,19 @@ _client = None
 def get_gemini_client():
     global _client
     if _client is None:
-        _client = genai.Client(api_key=GOOGLE_API_KEY)
+        # Explicit HTTP timeout so a hung Gemini call can't block a worker
+        # thread/coroutine indefinitely (image gen can take 30-90s; we allow
+        # 600s headroom to match the client-side generation timeout).
+        try:
+            from google.genai.types import HttpOptions
+            _client = genai.Client(
+                api_key=GOOGLE_API_KEY,
+                http_options=HttpOptions(timeout=600_000),
+            )
+        except Exception:
+            # Older SDK versions don't expose HttpOptions this way — fall back
+            # to the plain client rather than failing import.
+            _client = genai.Client(api_key=GOOGLE_API_KEY)
     return _client
 
 

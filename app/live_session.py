@@ -81,7 +81,7 @@ from app.admin.settings_store import cfg
 LIVE_MODEL = "gemini-3.1-flash-live-preview"        # default; live via cfg("LIVE_MODEL", LIVE_MODEL)
 
 # ── Voice ─────────────────────────────────────────────────────────────────────
-LIVE_VOICE = "Kore"
+LIVE_VOICE = "Iapetus"
 
 # ── Thinking level ────────────────────────────────────────────────────────────
 # gemini-3.1-flash-live uses thinkingLevel: minimal | low | medium | high

@@ -2,11 +2,15 @@
 
 Precedence for every key: app_settings DB row > os.getenv(key) > spec.default.
 
+Catalog defaults (``settings_catalog.py``) should match ``env_template.txt`` so
+the admin UI shows the same initial values as a fresh ``.env``. Once you save
+from admin, the DB row wins until you change or delete it.
+
 Agents read config via the sync ``cfg()`` helper, which reads an in-memory
 cache that is updated atomically on admin PUT. This means:
   - No await on the hot path (just a dict lookup).
   - Changes take effect immediately for new requests, no restart.
-  - Existing .env values keep working as the baseline.
+  - Existing .env values apply when no admin override exists in DB.
 
 Secrets are intentionally NOT cached or exposed here — they remain only in
 os.environ and are read by the modules that need them directly.
@@ -90,14 +94,13 @@ class SettingsStore:
         This is the function agents call instead of os.getenv(key, default).
         """
         spec = get_spec(key)
-        ns = get_namespace_for_key(key)
-        cache_key = f"{ns}.{key}"
+        cache_key = f"{get_namespace_for_key(key)}.{key}"
         if cache_key in self._cache:
             return self._cache[cache_key]
         # env fallback (only for non-secret, env-fallback-enabled keys)
         if spec and not spec.is_secret and spec.use_env_fallback:
             env_val = os.getenv(key)
-            if env_val is not None:
+            if env_val is not None and env_val != "":
                 try:
                     return cast_value(spec, env_val)
                 except ValueError:
@@ -186,14 +189,17 @@ class SettingsStore:
                 effective = self._cache.get(cache_key)
                 if effective is None and not spec.is_secret and spec.use_env_fallback:
                     env_val = os.getenv(spec.key)
-                    if env_val is not None:
+                    if env_val is not None and env_val != "":
                         try:
                             effective = cast_value(spec, env_val)
                         except ValueError:
                             effective = None
                 if effective is None:
                     effective = spec.default
-                source = "db" if in_db else ("env" if not spec.is_secret and spec.use_env_fallback and os.getenv(spec.key) is not None else "default")
+                source = "db" if in_db else (
+                    "env" if not spec.is_secret and spec.use_env_fallback and os.getenv(spec.key) not in (None, "")
+                    else "default"
+                )
                 out.append({
                     "namespace": ns.name,
                     "namespace_label": ns.label,

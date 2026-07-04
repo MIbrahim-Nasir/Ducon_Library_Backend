@@ -76,16 +76,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from typing import AsyncIterator, List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user
-from app.db.database import get_db
-from app.db.models import User
+from app.auth import get_optional_user
+from app.db.database import get_db, async_session_maker
+from app.db.models import GuestSession, User
 from app.image_utils import normalize_user_image
+from app.routers.guest import get_or_create_guest_session, verify_turnstile
 from app.sse import SSE_HEADERS
 from app.tool_generate_image import (
     MAX_IMAGES,
@@ -104,7 +106,17 @@ _VALID_RATIOS   = {"1:1", "4:3", "3:4", "16:9", "9:16"}
 _KEEPALIVE_INTERVAL = 10.0  # seconds — well under Cloudflare's 100 s idle timeout
 
 
-async def _stream_generation(descriptors, prompt, model, aspect_ratio, user_id, db) -> AsyncIterator[str]:
+async def _stream_generation(
+    descriptors,
+    prompt,
+    model,
+    aspect_ratio,
+    *,
+    user_id: Optional[int] = None,
+    guest_session_id: Optional[str] = None,
+    guest_session: Optional[GuestSession] = None,
+    db,
+) -> AsyncIterator[str]:
     """
     SSE generator that runs generate_multi_image in a background task and
     emits `: keepalive` comments every 10 s while waiting, so Cloudflare
@@ -118,15 +130,22 @@ async def _stream_generation(descriptors, prompt, model, aspect_ratio, user_id, 
     queue: asyncio.Queue = asyncio.Queue()
 
     async def worker():
+        # Use a dedicated session — the request's `db` (from Depends(get_db))
+        # is still bound to the SSE response and must not be used concurrently
+        # from a background task (SQLAlchemy AsyncSession is not concurrency-safe).
         try:
-            result = await generate_multi_image(
-                user_id=user_id,
-                prompt=prompt,
-                descriptors=descriptors,
-                model=model,
-                aspect_ratio=aspect_ratio or None,
-                db=db,
-            )
+            async with async_session_maker() as worker_db:
+                result = await generate_multi_image(
+                    user_id=user_id,
+                    guest_session_id=guest_session_id,
+                    guest_session=guest_session,
+                    prompt=prompt,
+                    descriptors=descriptors,
+                    model=model,
+                    aspect_ratio=aspect_ratio or None,
+                    db=worker_db,
+                )
+                await worker_db.commit()
             await queue.put(("done", result))
         except (ValueError, RuntimeError) as exc:
             await queue.put(("error", str(exc)))
@@ -160,6 +179,7 @@ async def _stream_generation(descriptors, prompt, model, aspect_ratio, user_id, 
 @router.post("")
 @router.post("/")
 async def create_multi_image_generation(
+    request: Request,
     prompt: str = Form(..., description="Full task prompt for the generation model."),
     images_meta: Optional[str] = Form(
         None,
@@ -185,13 +205,38 @@ async def create_multi_image_generation(
         default=[],
         description='Repeated "files" fields. images_meta source "file:N" references files[N].',
     ),
-    current_user: User = Depends(get_current_user),
+    cf_turnstile_token: Optional[str] = Form(None),
+    current_user: User | None = Depends(get_optional_user),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Generate a new image by compositing multiple source images according to a prompt.
     Uses Gemini image generation with the interleaved-label technique.
     """
+    guest_session_id: str | None = None
+    guest_session_row: GuestSession | None = None
+    if current_user is None:
+        guest_session_id = request.headers.get("x-guest-session-id")
+        if not guest_session_id:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required. Provide a Bearer token or X-Guest-Session-Id header.",
+            )
+        try:
+            uuid.UUID(guest_session_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid X-Guest-Session-Id. Must be a valid UUID.")
+
+        client_ip = request.client.host if request.client else "unknown"
+        if not await verify_turnstile(cf_turnstile_token or "", client_ip):
+            raise HTTPException(
+                status_code=403,
+                detail="Bot verification failed. Please try again.",
+            )
+        guest_session_row = await get_or_create_guest_session(db, guest_session_id, client_ip)
+
+    user_id = current_user.id if current_user else None
+
     # ── Validate basic params ─────────────────────────────────────────────────
     if not prompt.strip():
         raise HTTPException(status_code=422, detail="prompt must not be empty.")
@@ -304,7 +349,9 @@ async def create_multi_image_generation(
             prompt=prompt,
             model=model,
             aspect_ratio=aspect_ratio,
-            user_id=current_user.id,
+            user_id=user_id,
+            guest_session_id=guest_session_id,
+            guest_session=guest_session_row,
             db=db,
         ),
         media_type="text/event-stream",

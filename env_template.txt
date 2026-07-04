@@ -4,6 +4,10 @@ DATABASE_URL = postgresql+asyncpg://user:password@localhost/Ducon_Library
 JWT_SECRET_KEY = ducon_industries_fzco_jwt_key
 GOOGLE_CLIENT_ID = your-google-oauth-client-id.apps.googleusercontent.com
 
+# Google Gemini API key — REQUIRED for all AI features (chat, image gen, embeddings).
+# Get one at https://aistudio.google.com/apikey
+GOOGLE_API_KEY =
+
 # ─── Deployment / security (REQUIRED in production) ───────────────────────────
 # ENV=production enables fail-closed behaviour:
 #   • JWT_SECRET_KEY must be set to a strong non-default value
@@ -55,6 +59,14 @@ TEXT_COLLECTION_BASE = text_store
 IMAGE_COLLECTION_BASE = image_store
 FUSED_COLLECTION_BASE = fused_store
 
+# ─── AI agents (SettingsStore: DB override > env > catalog default) ───────────
+LIVE_VOICE = Iapetus
+LIVE_MODEL = gemini-3.1-flash-live-preview
+CHAT_MODEL = gemini-3.5-flash
+STUDIO_DIRECTIONS_MODEL = gemini-3-flash-preview
+STUDIO_DIRECTIONS_THINKING_LEVEL = High
+IMAGE_GEN_MODEL = gemini-3-pro-image-preview
+
 # ─── Image generation QC (Studio, chat generate_multi_image, autogenerate) ───
 # Optional — defaults apply if omitted (GEN_EVAL_MAX_ROUNDS=3, PROMPT_VERIFY_MAX_ROUNDS=2)
 GEN_EVAL_MAX_ROUNDS = 3
@@ -72,8 +84,6 @@ GUEST_GEN_LIMIT = 3
 GUEST_CHAT_LIMIT = 10
 GUEST_VOICE_LIMIT = 5
 GUEST_IP_TOTAL_LIMIT = 15
-# Legacy alias — used as GUEST_IP_TOTAL_LIMIT fallback if unset
-GUEST_IP_GEN_LIMIT = 6
 
 # ─── Admin panel ──────────────────────────────────────────────────────────────
 # bcrypt hash of the admin re-auth password (generate with: python -m scripts.hash_admin_password)

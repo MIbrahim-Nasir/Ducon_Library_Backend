@@ -5,6 +5,9 @@ Single source of truth for:
   - the /admin/settings API (what's exposed, what's editable, what's secret)
   - the frontend config editors (renders forms from this metadata)
 
+Keep ``SettingSpec.default`` values in sync with ``env_template.txt`` so the
+admin UI initial state matches a fresh deployment .env.
+
 Only the seven tunable namespaces are editable. Secrets are read-only and masked.
 """
 from __future__ import annotations
@@ -141,8 +144,8 @@ VOICE = Namespace(
     label="Voice & Live",
     description="Voice persona and Live API tuning (VAD, timeouts, compression).",
     settings=[
-        SettingSpec("LIVE_VOICE", "Live voice persona", "choice", "Kore",
-                    choices=["Aoede", "Charon", "Fenrir", "Kore", "Puck", "Leda", "Orus", "Zephyr"]),
+        SettingSpec("LIVE_VOICE", "Live voice persona", "choice", "Iapetus",
+                    choices=["Iapetus", "Aoede", "Charon", "Fenrir", "Kore", "Puck", "Leda", "Orus", "Zephyr"]),
         SettingSpec("LIVE_VAD_SILENCE_MS", "VAD silence (ms)", "int", 800, min=100, max=5000),
         SettingSpec("LIVE_VAD_PREFIX_MS", "VAD prefix padding (ms)", "int", 100, min=0, max=1000),
         SettingSpec("LIVE_TOOL_CALL_TIMEOUT", "Live tool call timeout (s)", "float", 30.0, min=1, max=120),

@@ -13,27 +13,7 @@
 -- =============================================================================
 
 
--- ── 0. ALTER existing tables to add new columns (idempotent) ─────────────────
--- These cover schema changes added after launch. Each is safe to re-run.
--- `email_verified` defaults to TRUE so all pre-existing users stay verified
--- and can keep logging in (OTP verification only gates NEW signups).
-
-ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified boolean NOT NULL DEFAULT TRUE;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS user_consent boolean NOT NULL DEFAULT FALSE;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_consent boolean NOT NULL DEFAULT FALSE;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number varchar;
-ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_sms_consent boolean NOT NULL DEFAULT FALSE;
-
--- guest_sessions predates chat/voice limits:
-ALTER TABLE guest_sessions ADD COLUMN IF NOT EXISTS chat_turn_count  integer NOT NULL DEFAULT 0;
-ALTER TABLE guest_sessions ADD COLUMN IF NOT EXISTS voice_turn_count integer NOT NULL DEFAULT 0;
-ALTER TABLE guest_sessions DROP CONSTRAINT IF EXISTS guest_sessions_generation_count_nonneg;
-ALTER TABLE guest_sessions ADD CONSTRAINT guest_sessions_generation_count_nonneg CHECK (generation_count >= 0);
-ALTER TABLE guest_sessions DROP CONSTRAINT IF EXISTS guest_sessions_chat_turn_count_nonneg;
-ALTER TABLE guest_sessions ADD CONSTRAINT guest_sessions_chat_turn_count_nonneg CHECK (chat_turn_count >= 0);
-ALTER TABLE guest_sessions DROP CONSTRAINT IF EXISTS guest_sessions_voice_turn_count_nonneg;
-ALTER TABLE guest_sessions ADD CONSTRAINT guest_sessions_voice_turn_count_nonneg CHECK (voice_turn_count >= 0);
-
+-- ── 0. Pre-migration index cleanup (idempotent; safe on fresh + existing DBs) ──
 -- Replace a non-partial ip_hash index if upgrading from an older schema:
 DROP INDEX IF EXISTS idx_guest_sessions_ip_hash;
 DROP INDEX IF EXISTS idx_guest_sessions_session_id;        -- redundant with UNIQUE(session_id)
@@ -75,7 +55,7 @@ CREATE INDEX IF NOT EXISTS idx_email_otps_email_purpose ON email_otps (email, pu
 CREATE TABLE IF NOT EXISTS images (
   id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY NOT NULL,
   name        varchar,
-  filename    varchar NOT NULL,
+  filename    varchar NOT NULL UNIQUE,
   url         varchar NOT NULL UNIQUE,
   uploaded_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
 );
@@ -240,3 +220,27 @@ CREATE INDEX IF NOT EXISTS idx_session_activity_occurred ON session_activity (oc
 
 -- ── 4. Bootstrap first admin (run once, manually) ────────────────────────────
 -- UPDATE users SET role = 'admin' WHERE email = 'you@example.com';
+
+
+-- ── 5. Post-migration ALTERs (idempotent) ─────────────────────────────────────
+-- These run AFTER the CREATE TABLE blocks above so they're safe on a fresh DB
+-- (the columns already exist via CREATE TABLE → IF NOT EXISTS makes them no-ops)
+-- AND on an existing DB (they add any missing columns from older schema versions).
+-- `email_verified` defaults to TRUE so all pre-existing users stay verified
+-- and can keep logging in (OTP verification only gates NEW signups).
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified boolean NOT NULL DEFAULT TRUE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS user_consent boolean NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS marketing_consent boolean NOT NULL DEFAULT FALSE;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_number varchar;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS whatsapp_sms_consent boolean NOT NULL DEFAULT FALSE;
+
+-- guest_sessions predates chat/voice limits:
+ALTER TABLE guest_sessions ADD COLUMN IF NOT EXISTS chat_turn_count  integer NOT NULL DEFAULT 0;
+ALTER TABLE guest_sessions ADD COLUMN IF NOT EXISTS voice_turn_count integer NOT NULL DEFAULT 0;
+ALTER TABLE guest_sessions DROP CONSTRAINT IF EXISTS guest_sessions_generation_count_nonneg;
+ALTER TABLE guest_sessions ADD CONSTRAINT guest_sessions_generation_count_nonneg CHECK (generation_count >= 0);
+ALTER TABLE guest_sessions DROP CONSTRAINT IF EXISTS guest_sessions_chat_turn_count_nonneg;
+ALTER TABLE guest_sessions ADD CONSTRAINT guest_sessions_chat_turn_count_nonneg CHECK (chat_turn_count >= 0);
+ALTER TABLE guest_sessions DROP CONSTRAINT IF EXISTS guest_sessions_voice_turn_count_nonneg;
+ALTER TABLE guest_sessions ADD CONSTRAINT guest_sessions_voice_turn_count_nonneg CHECK (voice_turn_count >= 0);

@@ -32,6 +32,7 @@ Public API
 """
 
 import os
+import asyncio
 import functools
 import logging
 from pathlib import Path
@@ -134,6 +135,12 @@ def save_generation(user_id: int, filename: str) -> str:
     return key
 
 
+async def asave_generation(user_id: int, filename: str) -> str:
+    """Async wrapper — offloads R2 upload + watermark PIL work to a thread
+    so the event loop can keep sending SSE keepalives and serving other requests."""
+    return await asyncio.to_thread(save_generation, user_id, filename)
+
+
 def delete_generation(stored_key: str) -> None:
     """Delete the generation from R2 or local disk."""
     if CLOUD_STORAGE:
@@ -207,6 +214,11 @@ def save_guest_generation(session_id: str, filename: str) -> str:
             pass
 
     return key
+
+
+async def asave_guest_generation(session_id: str, filename: str) -> str:
+    """Async wrapper — see asave_generation."""
+    return await asyncio.to_thread(save_guest_generation, session_id, filename)
 
 
 def get_guest_generation_url(generation_id: int, stored_key: str) -> str:
