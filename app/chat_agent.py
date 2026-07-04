@@ -33,6 +33,7 @@ import io
 import json
 import logging
 import os
+import asyncio
 import tempfile
 import uuid
 from typing import AsyncGenerator, Optional
@@ -438,6 +439,10 @@ async def upload_file_to_gemini(
     The Files API URI is temporary (TTL ~48 h) and only usable by the same
     project key.  It is never stored persistently.
 
+    Retries transient upstream errors (503/502/429 and network blips) with
+    exponential backoff — Gemini's Files API intermittently returns 503
+    Service Unavailable, which is not a caller bug and resolves on retry.
+
     Returns:
         {"uri": str, "mime_type": str}
     """
@@ -450,17 +455,59 @@ async def upload_file_to_gemini(
         tmp.write(file_bytes)
         tmp_path = tmp.name
 
+    max_attempts = 4
+    delay = 1.5
+    last_exc: Exception | None = None
     try:
-        uploaded = await client.aio.files.upload(
-            file=tmp_path,
-            config={"mime_type": mime_type, "display_name": filename},
-        )
-        return {"uri": uploaded.uri, "mime_type": uploaded.mime_type}
+        for attempt in range(max_attempts):
+            try:
+                uploaded = await client.aio.files.upload(
+                    file=tmp_path,
+                    config={"mime_type": mime_type, "display_name": filename},
+                )
+                return {"uri": uploaded.uri, "mime_type": uploaded.mime_type}
+            except Exception as exc:
+                last_exc = exc
+                if not _is_transient_upload_error(exc) or attempt == max_attempts - 1:
+                    raise
+                print(
+                    f"[ChatAgent] Gemini file upload transient error "
+                    f"(attempt {attempt + 1}/{max_attempts}): {exc} — retrying in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 10.0)
+        # Should be unreachable; surface the last error defensively.
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Gemini file upload failed without a specific error.")
     finally:
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+def _is_transient_upload_error(exc: Exception) -> bool:
+    """True for Gemini/HTTP errors that typically resolve on retry."""
+    text = str(exc).lower()
+    transient_markers = (
+        "503", "service unavailable", "502", "bad gateway",
+        "429", "rate limit", "resource has been exhausted",
+        "504", "gateway timeout", "timeout",
+        "server disconnected", "connection reset", "temporarily",
+        "unavailable", "try again",
+    )
+    if any(marker in text for marker in transient_markers):
+        return True
+    # SDK errors often carry a .status or .code attribute.
+    status = getattr(exc, "status", None) or getattr(exc, "code", None)
+    if status is not None:
+        try:
+            code = int(status)
+        except (TypeError, ValueError):
+            return False
+        return code in (429, 502, 503, 504)
+    return False
 
 
 def _suffix_from_mime(mime_type: str) -> str:
