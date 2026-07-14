@@ -26,11 +26,12 @@ from typing import Any, Optional
 
 from google.genai.types import GenerateContentConfig
 from PIL import Image
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import chromadb, storage
-from app.db.models import Generation, Image as DBImage, User
+from app.db.database import async_session_maker
+from app.db.models import DesignerJobRow, Generation, Image as DBImage, User
 from app.gemini import (
     get_gemini_client,
     verify_prompt as _verify_prompt,
@@ -83,6 +84,8 @@ _CRITICAL_SECTION_KEYS = (
     "B3_zones",
     "C1_no_extra",
     "C2_no_missing",
+    "F1_mark_followthrough",
+    "F2_mark_cleanup",
 )
 
 
@@ -166,6 +169,74 @@ def _sse(payload: dict[str, Any]) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+async def _persist_job_create(job: DesignerJob) -> None:
+    """Insert the job row so other workers can see it immediately."""
+    try:
+        async with async_session_maker() as db:
+            db.add(DesignerJobRow(
+                id=job.id,
+                user_id=job.user_id,
+                status=job.status,
+            ))
+            await db.commit()
+    except Exception:
+        _dbg("[DESIGNER ⚠ persist create failed]")
+
+
+async def _persist_job_event(job: DesignerJob, payload: dict[str, Any]) -> None:
+    """Append one event to the job's JSONB event log + bump status/updated_at.
+
+    Uses a raw SQL array concat so it is a single, atomic round-trip (no
+    read-modify-write race between concurrent emits). Best-effort: a DB failure
+    here never breaks the in-memory live stream on the owning worker.
+    """
+    try:
+        async with async_session_maker() as db:
+            await db.execute(
+                text(
+                    "UPDATE designer_jobs "
+                    "SET events = events || CAST(:evt AS jsonb), "
+                    "    status = :status, "
+                    "    updated_at = NOW() "
+                    "WHERE id = :id"
+                ),
+                {"evt": json.dumps([payload], ensure_ascii=False), "status": job.status, "id": job.id},
+            )
+            await db.commit()
+    except Exception:
+        _dbg("[DESIGNER ⚠ persist event failed]")
+
+
+async def _persist_job_final(
+    job: DesignerJob,
+    *,
+    final: Optional[dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> None:
+    """Persist the terminal state (completed/failed/cancelled) + final/error."""
+    try:
+        async with async_session_maker() as db:
+            row = await db.get(DesignerJobRow, job.id)
+            if row is None:
+                # Upsert terminal row if create never landed (avoids stuck pollers).
+                row = DesignerJobRow(
+                    id=job.id,
+                    user_id=job.user_id,
+                    status=job.status,
+                    events=list(job.events or []),
+                )
+                db.add(row)
+            row.status = job.status
+            row.updated_at = datetime.now(timezone.utc)
+            if final is not None:
+                row.final = final
+            if error is not None:
+                row.error = error
+            await db.commit()
+    except Exception:
+        _dbg("[DESIGNER ⚠ persist final failed]")
+
+
 async def emit(job: DesignerJob, event_type: str, **data: Any) -> None:
     payload = {
         "type": event_type,
@@ -177,6 +248,11 @@ async def emit(job: DesignerJob, event_type: str, **data: Any) -> None:
     _dbg("[DESIGNER EVENT]", payload)
     job.events.append(payload)
     await job.queue.put(_sse(payload))
+    # Mirror to Postgres so workers that don't own this job can still serve
+    # GET /designer/jobs/{id} and a polling /events stream. Awaited inline to
+    # preserve event ordering in the DB log (jobs emit ~30-50 events total, so
+    # the few-ms round-trip per emit is negligible vs the 30-90s job runtime).
+    await _persist_job_event(job, payload)
 
 
 def create_job(user: User) -> DesignerJob:
@@ -185,7 +261,42 @@ def create_job(user: User) -> DesignerJob:
     return job
 
 
+async def get_job_for_user(job_id: str, user_id: int) -> Optional[DesignerJob]:
+    """Resolve a job for a user, preferring the live in-memory registry (this
+    worker owns the running job) and falling back to the persisted row.
+
+    Returns a DesignerJob populated from the DB row when the job is not in this
+    worker's JOBS registry (cross-worker case). The returned object's
+    ``events`` list reflects everything persisted so far.
+    """
+    job = JOBS.get(job_id)
+    if job is not None and job.user_id == user_id:
+        return job
+    try:
+        async with async_session_maker() as db:
+            row = await db.get(DesignerJobRow, job_id)
+            if row is None or row.user_id != user_id:
+                return None
+            restored = DesignerJob(id=row.id, user_id=int(row.user_id))
+            restored.status = row.status
+            restored.created_at = row.created_at.isoformat() if row.created_at else restored.created_at
+            restored.events = list(row.events or [])
+            restored.final = row.final
+            restored.error = row.error
+            restored.cancel_requested = bool(row.cancel_requested)
+            # Not in this worker's registry; no live queue/task.
+            restored.task = None
+            return restored
+    except Exception:
+        _dbg("[DESIGNER ⚠ get_job_for_user db read failed]")
+        return None
+
+
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+
+
 async def stream_job_events(job: DesignerJob):
+    """Live SSE stream for a job owned by THIS worker (has a live queue)."""
     yield ": connected\n\n"
     for event in job.events:
         yield _sse(event)
@@ -200,14 +311,88 @@ async def stream_job_events(job: DesignerJob):
         yield item
 
 
-def cancel_job(job_id: str, user_id: int) -> bool:
+async def stream_job_events_from_db(job_id: str, user_id: int):
+    """Polling SSE stream for a job owned by ANOTHER worker.
+
+    Replays all persisted events, then polls the JSONB event log for new ones
+    every couple of seconds until the job reaches a terminal status. Events
+    arrive with up to ~2s latency versus the owning worker's live stream, which
+    is acceptable for a regression-safe cross-worker experience.
+    """
+    yield ": connected\n\n"
+    sent = 0
+    idle = 0
+    while True:
+        try:
+            async with async_session_maker() as db:
+                row = await db.get(DesignerJobRow, job_id)
+        except Exception:
+            yield ": keep-alive\n\n"
+            await asyncio.sleep(2)
+            continue
+        if row is None or row.user_id != user_id:
+            # Vanished mid-stream — stop.
+            break
+        events = list(row.events or [])
+        if len(events) > sent:
+            for event in events[sent:]:
+                yield _sse(event)
+            sent = len(events)
+            idle = 0
+        else:
+            idle += 1
+        if row.status in _TERMINAL_STATUSES:
+            break
+        await asyncio.sleep(2)
+
+
+async def cancel_job(job_id: str, user_id: int) -> bool:
+    """Request cancellation of a designer job.
+
+    Returns True iff the job exists and belongs to ``user_id``. Sets the
+    in-memory cancel flag (and cancels the running task) when this worker owns
+    the job, and always persists ``cancel_requested = TRUE`` so a cancel
+    request landing on a different worker is durably recorded.
+
+    Cross-worker cancel won't interrupt the owning worker's in-flight task
+    (that process isn't reachable from here), but the flag is stored for
+    inspection and the job will still terminate on its own.
+    """
     job = JOBS.get(job_id)
-    if not job or job.user_id != user_id:
+    if job is not None and job.user_id == user_id:
+        job.cancel_requested = True
+        if job.task and not job.task.done():
+            job.task.cancel()
+        await _persist_cancel_request(job_id, user_id)
+        return True
+
+    # Cross-worker: confirm ownership via the DB row, then persist the flag.
+    try:
+        async with async_session_maker() as db:
+            row = await db.get(DesignerJobRow, job_id)
+            if row is None or row.user_id != user_id:
+                return False
+        await _persist_cancel_request(job_id, user_id)
+        return True
+    except Exception:
+        _dbg("[DESIGNER ⚠ cross-worker cancel db read failed]")
         return False
-    job.cancel_requested = True
-    if job.task and not job.task.done():
-        job.task.cancel()
-    return True
+
+
+async def _persist_cancel_request(job_id: str, user_id: int) -> None:
+    try:
+        async with async_session_maker() as db:
+            await db.execute(
+                text(
+                    "UPDATE designer_jobs "
+                    "SET cancel_requested = TRUE, updated_at = NOW() "
+                    "WHERE id = :id AND user_id = :uid"
+                ),
+                {"id": job_id, "uid": user_id},
+            )
+            await db.commit()
+    except Exception:
+        _dbg("[DESIGNER ⚠ persist cancel failed]")
 
 
 async def run_designer_job(
@@ -222,6 +407,7 @@ async def run_designer_job(
     aspect_ratio: Optional[str] = DESIGNER_AGENT_DEFAULT_ASPECT_RATIO,
 ) -> None:
     """Main long-running designer loop."""
+    await _persist_job_create(job)
     try:
         _dbg(
             "[DESIGNER ▶ JOB START]",
@@ -247,9 +433,31 @@ async def run_designer_job(
         job.status = "running"
         await emit(job, "status", message="Analyzing the client's space image.")
 
-        user_image = normalize_user_image(user_image_bytes)
+        user_image = await asyncio.to_thread(normalize_user_image, user_image_bytes)
         _dbg("[DESIGNER ▶ INPUT IMAGE]", _image_summary(user_image))
         user_prompt = (user_prompt or "").strip()
+
+        # Persist the client's original space photo so the result viewer can show
+        # it as the slider "before" (and cross-worker / page-refresh clients can
+        # fetch it via GET /designer/jobs/{job_id}/input-image). Stored WITHOUT a
+        # watermark — it is the client's own upload, not a Ducon generation.
+        try:
+            input_image_bytes = await asyncio.to_thread(_pil_to_bytes, user_image, "PNG")
+            input_stored_key = await storage.asave_designer_input(
+                job.user_id, job.id, input_image_bytes
+            )
+            user_image_url = storage.get_designer_input_url(job.id, input_stored_key)
+            await emit(
+                job,
+                "input_image",
+                user_image={"url": user_image_url, "label": "Your space"},
+                message="Client space photo received.",
+            )
+        except Exception as exc:
+            # Persistence is best-effort: a failure here must not abort the run.
+            # The generation still proceeds; only the slider "before" is affected.
+            _dbg(f"[DESIGNER ⚠ input image persist failed: {exc}]")
+            user_image_url = None
 
         plan = await _analyze_and_plan(user_image, user_prompt, user_id=job.user_id)
         await emit(job, "plan", plan=plan)
@@ -474,6 +682,13 @@ async def run_designer_job(
         job.status = "completed"
         job.final = {
             "job_id": job.id,
+            # Client's original space photo → slider "before". May be None if
+            # persistence failed mid-run; the frontend falls back to references.
+            "user_image": (
+                {"url": user_image_url, "label": "Your space"}
+                if user_image_url
+                else None
+            ),
             "best_generation": last_generation,
             "best_scored_generation": _enrich_generation_record(dict(best["generation"])),
             "best_evaluation": best["evaluation"],
@@ -482,17 +697,24 @@ async def run_designer_job(
             "summary": final_summary,
         }
         await emit(job, "final", **job.final)
+        await _persist_job_final(job, final=job.final)
 
     except asyncio.CancelledError:
         job.status = "cancelled"
         await emit(job, "cancelled", message="Designer job was cancelled.")
+        await _persist_job_final(job)
     except Exception as exc:
         job.status = "failed"
         job.error = str(exc)
         _dbg("[DESIGNER ✖ ERROR]", repr(exc))
         await emit(job, "error", message=str(exc))
+        await _persist_job_final(job, error=str(exc))
     finally:
         await job.queue.put(None)
+        # Drop from the owning worker's in-memory registry once terminal; cross-worker
+        # clients and reconnects read from Postgres via get_job_for_user().
+        if job.status in {"completed", "failed", "cancelled"}:
+            JOBS.pop(job.id, None)
 
 
 async def _analyze_and_plan(user_image: Image.Image, user_prompt: str, *, user_id: Optional[int] = None) -> dict[str, Any]:
@@ -650,7 +872,7 @@ async def _search_references(
         _dbg("[DESIGNER ▶ EMBEDDING]", {"query": query})
         embedding = await asyncio.to_thread(embedding_model.get_text_embedding, query)
         _dbg("[DESIGNER ◀ EMBEDDING]", {"query": query, "dimensions": len(embedding)})
-        result = chromadb.retrieve(collection, embedding, DESIGNER_AGENT_SEARCH_LIMIT)
+        result = await asyncio.to_thread(chromadb.retrieve, collection, embedding, DESIGNER_AGENT_SEARCH_LIMIT)
         ids = (result.get("ids") or [[]])[0]
         _dbg("[DESIGNER ◀ CHROMA]", {"query": query, "ids": ids})
         await emit(job, "search_done", query=query, raw_ids=ids)
@@ -856,34 +1078,50 @@ async def _load_generation_image(db: AsyncSession, generation_id: int) -> Image.
             resp = await client.get(url)
         if resp.status_code != 200:
             raise RuntimeError(f"Failed to fetch generated image for evaluation ({resp.status_code}).")
-        img = Image.open(io.BytesIO(resp.content)).convert("RGB")
+        # PIL decode is CPU-bound — offload so the event loop keeps streaming.
+        content = resp.content
+        img = await asyncio.to_thread(lambda: Image.open(io.BytesIO(content)).convert("RGB"))
         _dbg("[DESIGNER ◀ LOAD GENERATION]", {"generation_id": generation_id, "image": _image_summary(img)})
         return img
     local = storage.serve_local_path(row.url)
     if not local.exists():
         raise RuntimeError(f"Generated image file is missing: {local}")
-    img = Image.open(local).convert("RGB")
+    img = await asyncio.to_thread(lambda: Image.open(local).convert("RGB"))
     _dbg("[DESIGNER ◀ LOAD GENERATION]", {"generation_id": generation_id, "path": str(local), "image": _image_summary(img)})
     return img
 
 
 async def _load_reference_images(db: AsyncSession, references: list[dict[str, Any]]) -> list[Image.Image]:
-    images: list[Image.Image] = []
-    for ref in references:
+    # Resolve all reference rows in one query, then fetch each image bytes
+    # concurrently. Fetches are independent (local disk or R2 HTTP), so running
+    # them in parallel cuts the per-attempt reference-load time from
+    # ~N*latency to ~1*latency on the designer's hot path.
+    ids = [int(ref["id"]) for ref in references if ref.get("id") is not None]
+    if not ids:
+        return []
+    rows = (
+        await db.execute(select(DBImage).where(DBImage.id.in_(ids)))
+    ).scalars().all()
+    row_by_id = {int(r.id): r for r in rows}
+
+    async def _load_one(ref: dict[str, Any]) -> Optional[Image.Image]:
         ref_id = ref.get("id")
         if ref_id is None:
-            continue
-        row = (
-            await db.execute(select(DBImage).where(DBImage.id == int(ref_id)))
-        ).scalar_one_or_none()
-        if not row:
-            continue
+            return None
+        row = row_by_id.get(int(ref_id))
+        if row is None:
+            return None
         try:
             img = await load_ducon_image(row)
-            images.append(normalize_user_image(_pil_to_bytes(img)))
+            # Decode + resize + re-encode is CPU-bound; offload per reference so
+            # concurrent gather() actually parallelizes on the thread pool.
+            return await asyncio.to_thread(lambda: normalize_user_image(_pil_to_bytes(img)))
         except Exception as exc:
             _dbg("[DESIGNER ⚠ LOAD REFERENCE FAILED]", {"id": ref_id, "error": str(exc)})
-    return images
+            return None
+
+    loaded = await asyncio.gather(*[_load_one(ref) for ref in references])
+    return [img for img in loaded if img is not None]
 
 
 def _compose_generation_prompt(

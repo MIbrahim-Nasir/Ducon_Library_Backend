@@ -173,6 +173,7 @@ async def main() -> int:
     log.info("Done. Executed %d statement(s); skipped %d with warnings.", executed, skipped_errors)
     log.info("Next steps:")
     log.info("  1. Promote an admin:  UPDATE users SET role='admin' WHERE email='you@example.com';")
+    log.info("     Analytics-only:     UPDATE users SET role='analytics' WHERE email='analyst@example.com';")
     log.info("  2. Set ADMIN_PASSWORD_HASH in .env (run: python -m scripts.hash_admin_password)")
     log.info("  3. Set RESEND_API_KEY / RESEND_FROM_EMAIL in .env for OTP emails")
     log.info("  4. Restart uvicorn")

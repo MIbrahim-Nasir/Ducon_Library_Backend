@@ -10,6 +10,8 @@ import asyncio
 import os
 from pathlib import Path
 
+from app.admin.settings_store import cfg
+
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 # ── Gemini image / quotation pipeline ─────────────────────────────────────────
@@ -61,6 +63,25 @@ def _read_prompt_file(filename: str) -> str:
     return path.read_text(encoding="utf-8").strip()
 
 
+def gen_eval_strictness() -> str:
+    """Return ``relaxed`` (default) or ``strict`` for QC rubric + finalize_evaluation."""
+    raw = str(cfg("GEN_EVAL_STRICTNESS", "relaxed")).strip().lower().replace("-", "_")
+    if raw in {"strict", "more_restrictive"}:
+        return "strict"
+    if raw in {"relaxed", "less_restrictive", ""}:
+        return "relaxed"
+    return "relaxed"
+
+
+def _load_gen_eval_rubric() -> str:
+    filename = (
+        "gen-eval-rubric-strict.md"
+        if gen_eval_strictness() == "strict"
+        else "gen-eval-rubric-relaxed.md"
+    )
+    return _read_prompt_file(filename)
+
+
 def _apply_placeholders(text: str, values: dict[str, str]) -> str:
     for key, value in values.items():
         text = text.replace(f"{{{{{key}}}}}", value)
@@ -101,6 +122,7 @@ def load_prompts(
     placeholders = {
         "IMAGE_GEN_MODEL": str(image_gen_model),
         "DESIGNER_AGENT_PASS_SCORE": str(designer_pass_score),
+        "GEN_EVAL_RUBRIC": _load_gen_eval_rubric(),
     }
 
     for attr, filename in _PROMPT_FILES.items():
@@ -163,6 +185,7 @@ async def persist_image_gen_agent_system(updated_prompt: str) -> None:
             {
                 "IMAGE_GEN_MODEL": _image_gen_model_name(),
                 "DESIGNER_AGENT_PASS_SCORE": os.getenv("DESIGNER_AGENT_PASS_SCORE", "7.5"),
+                "GEN_EVAL_RUBRIC": _load_gen_eval_rubric(),
             },
         )
         print(

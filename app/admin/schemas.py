@@ -31,7 +31,7 @@ class SettingsUpdateResponse(BaseModel):
 
 
 class UserPatchRequest(BaseModel):
-    role: Optional[str] = None  # customer | admin
+    role: Optional[str] = None  # customer | admin | analytics | analytics
     banned: Optional[bool] = None  # reserved for future ban table
 
 

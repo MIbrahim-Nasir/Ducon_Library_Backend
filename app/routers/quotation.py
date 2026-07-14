@@ -72,7 +72,13 @@ async def create_quotation(
     analysis by Gemini 3.1 Pro.  They are indicative, not contractual.
     """
 
-    require_rate_limit(request, max_requests=5, window_seconds=60, key_prefix="quotation")
+    await require_rate_limit(
+        request,
+        max_requests=5,
+        window_seconds=60,
+        key_prefix="quotation",
+        key_suffix=str(current_user.id),
+    )
     # ── Resolve Ducon catalog image from DB ───────────────────────────────────
     result = await db.execute(select(DBImage).where(DBImage.id == ducon_image_id))
     ducon_db_image = result.scalar_one_or_none()

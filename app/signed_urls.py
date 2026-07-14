@@ -14,10 +14,18 @@ import hashlib
 import hmac
 import os
 
+from app.config import IS_PRODUCTION
+
+_DEFAULT_SECRET = "changeme-use-env-var-in-production"
 _SIGN_SECRET = (
     os.getenv("URL_SIGNING_SECRET")
-    or os.getenv("JWT_SECRET_KEY", "changeme-use-env-var-in-production")
+    or os.getenv("JWT_SECRET_KEY", _DEFAULT_SECRET)
 )
+if IS_PRODUCTION and (not _SIGN_SECRET or _SIGN_SECRET == _DEFAULT_SECRET):
+    raise RuntimeError(
+        "URL_SIGNING_SECRET or JWT_SECRET_KEY must be set to a strong secret in "
+        "production (the default value is not allowed for signed guest URLs)."
+    )
 
 
 def _sign(namespace: str, identifier: int | str) -> str:

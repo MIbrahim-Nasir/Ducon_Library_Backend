@@ -8,11 +8,13 @@ from sqlalchemy import (
     Boolean,
     TIMESTAMP,
     Date,
+    Float,
     Numeric,
     ForeignKey,
     UniqueConstraint,
     Text,
     Index,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
@@ -93,6 +95,8 @@ class Generation(Base):
     user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     generation_name = Column(String, nullable=False)
     url = Column(String, nullable=False, unique=True)
+    # User's original space photo (storage key). Used for authoritative before/after.
+    source_image_url = Column(String, nullable=True)
     generated_at = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     ducon_image_id = Column(BigInteger, ForeignKey("images.id", ondelete="SET NULL"), nullable=True)
 
@@ -108,17 +112,33 @@ class Generation(Base):
 # ── Guest tables (kept fully separate from authenticated user tables) ──────────
 
 class GuestSession(Base):
-    """Tracks a guest browser session and its generation usage for rate limiting."""
+    """Tracks a guest browser session and its generation usage for rate limiting.
+
+    Identity resolution order (most stable → least stable):
+      1. fingerprint_hash — SHA-256 of browser fingerprint signals sent by client.
+         When present, any new session_id from the same device is remapped to the
+         existing session so UUID rotation cannot reset quota.
+      2. session_id — server-issued cookie or X-Guest-Session-Id header when no
+         fingerprint is available.
+
+    composite_hash / subnet_key / ja4 / asn are stored for audit and optional shared
+    caps but never merge different session UUIDs into one quota row.
+    """
     __tablename__ = "guest_sessions"
 
-    id               = Column(BigInteger, primary_key=True, autoincrement=True)
-    session_id       = Column(String, nullable=False, unique=True, index=True)  # UUID from X-Guest-Session-Id
-    ip_hash          = Column(String, nullable=True)                            # SHA-256 of client IP (non-reversible)
-    generation_count = Column(Integer, nullable=False, server_default='0')
-    chat_turn_count  = Column(Integer, nullable=False, server_default='0')
-    voice_turn_count = Column(Integer, nullable=False, server_default='0')
-    created_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
-    last_used_at     = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    id                = Column(BigInteger, primary_key=True, autoincrement=True)
+    session_id        = Column(String, nullable=False, unique=True, index=True)  # UUID from X-Guest-Session-Id
+    ip_hash           = Column(String, nullable=True)                            # SHA-256 of client IP (non-reversible)
+    fingerprint_hash  = Column(String, nullable=True, index=True)               # SHA-256 of browser fingerprint (X-Guest-Fingerprint)
+    composite_hash    = Column(String, nullable=True, index=True)               # SHA-256 of server-side identity signals
+    subnet_key        = Column(String, nullable=True, index=True)               # IPv4 /24 or IPv6 /64 (supplementary abuse)
+    ja4_fingerprint   = Column(String, nullable=True)                            # Cloudflare JA4/JA3 (audit)
+    asn               = Column(String, nullable=True)                            # Cloudflare ASN when forwarded (audit)
+    generation_count  = Column(Integer, nullable=False, server_default='0')
+    chat_turn_count   = Column(Integer, nullable=False, server_default='0')
+    voice_turn_count  = Column(Integer, nullable=False, server_default='0')
+    created_at        = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    last_used_at      = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
 
     generations = relationship("GuestGeneration", back_populates="guest_session",
                                foreign_keys="GuestGeneration.guest_session_id", passive_deletes=True)
@@ -132,6 +152,7 @@ class GuestGeneration(Base):
     guest_session_id = Column(String, ForeignKey("guest_sessions.session_id", ondelete="SET NULL"), nullable=True)
     generation_name = Column(String, nullable=False)
     url             = Column(String, nullable=False, unique=True)   # R2 key or local path
+    source_image_url = Column(String, nullable=True)  # user's original space photo key
     ducon_image_id  = Column(BigInteger, ForeignKey("images.id", ondelete="SET NULL"), nullable=True)
     generated_at    = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
     expires_at      = Column(TIMESTAMP(timezone=True), nullable=True)  # NULL once claimed → permanent
@@ -268,4 +289,150 @@ class SessionActivity(Base):
         # time_spent daily series scans by occurred_at window.
         Index("idx_session_activity_occurred", "occurred_at"),
     )
+
+
+class DesignerJobRow(Base):
+    """Persistent state for a long-running Designer Agent job.
+
+    The job loop runs in-process on whichever gunicorn/UvicornWorker accepted
+    the POST /designer/jobs request, and keeps a live ``asyncio.Queue`` for SSE
+    streaming on that worker. Other workers cannot see that in-memory registry,
+    so state is mirrored here: any worker can serve ``GET /designer/jobs/{id}``
+    and a polling-based ``/events`` stream by reading this row. Without this,
+    a poll/events request landing on a different worker returns 404.
+    """
+    __tablename__ = "designer_jobs"
+
+    id               = Column(String, primary_key=True)  # uuid4 hex
+    user_id          = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    status           = Column(String, nullable=False, server_default="queued")  # queued|running|completed|failed|cancelled
+    created_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    updated_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    error            = Column(Text, nullable=True)
+    final            = Column(JSONB, nullable=True)
+    events           = Column(JSONB, nullable=False, server_default="[]")
+    cancel_requested = Column(Boolean, nullable=False, server_default="false")
+
+    __table_args__ = (
+        Index("idx_designer_jobs_user_id", "user_id"),
+        Index("idx_designer_jobs_status_updated", "status", "updated_at"),
+    )
+
+
+class ChatSessionRow(Base):
+    """Postgres-backed chat ↔ voice continuity (multi-worker safe).
+
+    Replaces the former in-memory ``chat_session`` dicts so interaction_id and
+    transcript survive across gunicorn workers.
+    """
+    __tablename__ = "chat_sessions"
+
+    id               = Column(BigInteger, primary_key=True, autoincrement=True)
+    user_id          = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
+    guest_session_id = Column(String, ForeignKey("guest_sessions.session_id", ondelete="CASCADE"), nullable=True)
+    interaction_id   = Column(String(128), nullable=True)
+    transcript       = Column(JSONB, nullable=False, server_default="[]")
+    updated_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+
+    __table_args__ = (
+        Index(
+            "idx_chat_sessions_user_id",
+            "user_id",
+            unique=True,
+            postgresql_where=text("user_id IS NOT NULL"),
+        ),
+        Index(
+            "idx_chat_sessions_guest",
+            "guest_session_id",
+            unique=True,
+            postgresql_where=text("guest_session_id IS NOT NULL"),
+        ),
+        Index("idx_chat_sessions_updated_at", "updated_at"),
+    )
+
+
+class GenerationJobRow(Base):
+    """Durable multi-image generation job (mirrors designer_jobs).
+
+    Lets clients create a job, disconnect, then poll/SSE for result without
+    depending on one long-lived request to the owning worker.
+    """
+    __tablename__ = "generation_jobs"
+
+    id               = Column(String, primary_key=True)  # uuid4 hex
+    user_id          = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
+    guest_session_id = Column(String, ForeignKey("guest_sessions.session_id", ondelete="SET NULL"), nullable=True)
+    status           = Column(String, nullable=False, server_default="queued")
+    created_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    updated_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    error            = Column(Text, nullable=True)
+    final            = Column(JSONB, nullable=True)
+    events           = Column(JSONB, nullable=False, server_default="[]")
+    request_id       = Column(String(64), nullable=True)
+    cancel_requested = Column(Boolean, nullable=False, server_default="false")
+
+    __table_args__ = (
+        Index("idx_generation_jobs_user_id", "user_id"),
+        Index("idx_generation_jobs_guest", "guest_session_id"),
+        Index("idx_generation_jobs_status_updated", "status", "updated_at"),
+    )
+
+
+class AppErrorLog(Base):
+    """Structured application errors for ops/debugging. Written by ErrorLogger."""
+    __tablename__ = "app_error_logs"
+
+    id               = Column(BigInteger, primary_key=True, autoincrement=True)
+    created_at       = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    severity         = Column(String(16), nullable=False, server_default='error')  # error|warning
+    category         = Column(String(32), nullable=False)
+    source           = Column(String(255), nullable=False)
+    user_id          = Column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    guest_session_id = Column(String(64), nullable=True)
+    endpoint         = Column(String(255), nullable=True)
+    model            = Column(String(128), nullable=True)
+    error_type       = Column(String(128), nullable=True)
+    message          = Column(Text, nullable=False)
+    detail           = Column(JSONB, nullable=True)
+    request_id       = Column(String(64), nullable=True)
+    http_status      = Column(Integer, nullable=True)
+    provider_status  = Column(Integer, nullable=True)
+    archived_at      = Column(TIMESTAMP(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("idx_app_error_logs_created_at", "created_at"),
+        Index("idx_app_error_logs_category_created", "category", "created_at"),
+        Index("idx_app_error_logs_severity_created", "severity", "created_at"),
+        Index("idx_app_error_logs_user_id", "user_id"),
+    )
+
+
+class RevokedJti(Base):
+    """Durable JWT revocation — shared across gunicorn workers.
+
+    In-memory ``_revoked_jtis`` is still checked first for speed; this table is
+    the cross-worker source of truth until the token's ``exp``.
+    """
+    __tablename__ = "revoked_jtis"
+
+    jti        = Column(String(64), primary_key=True)
+    expires_at = Column(TIMESTAMP(timezone=True), nullable=False)
+
+    __table_args__ = (
+        Index("idx_revoked_jtis_expires_at", "expires_at"),
+    )
+
+
+class RateLimitCounter(Base):
+    """Fixed-window rate-limit counters — exact limits across gunicorn workers.
+
+    ``key`` is ``{prefix}:{client_ip}[:{identity}]``; ``window_start`` is the
+    epoch-aligned start of the current window. Rows are upserted atomically by
+    ``app.rate_limiter`` and purged by the periodic cleanup loop.
+    """
+    __tablename__ = "rate_limit_counters"
+
+    key          = Column(String(255), primary_key=True)
+    window_start = Column(Float, nullable=False)
+    count        = Column(Integer, nullable=False, default=1)
 

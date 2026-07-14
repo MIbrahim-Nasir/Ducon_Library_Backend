@@ -13,6 +13,15 @@ import os
 ENV = os.getenv("ENV", os.getenv("ENVIRONMENT", "development")).strip().lower()
 IS_PRODUCTION = ENV in ("production", "prod")
 
+# When false (default in development), server-side Turnstile verification is skipped
+# so local dev works even if production Turnstile keys are configured. Set
+# TURNSTILE_ENFORCE=true to test the full bot-protection flow locally.
+ENFORCE_TURNSTILE = os.getenv("TURNSTILE_ENFORCE", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 
 def _split_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]

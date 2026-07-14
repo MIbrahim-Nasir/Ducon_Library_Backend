@@ -1,0 +1,4 @@
+# Selenium E2E suite (not installed by default CI / `pytest tests/`)
+selenium>=4.27.0
+webdriver-manager>=4.0.2
+pytest>=9.1.1

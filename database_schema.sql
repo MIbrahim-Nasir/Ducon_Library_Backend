@@ -7,9 +7,10 @@
 --
 --   psql "postgresql://postgres:ducondb@localhost/Ducon_Library" -f database_schema.sql
 --
--- For an existing DB, the ALTER TABLE block at the top adds any missing
+-- For an existing DB, the ALTER TABLE block at the bottom adds any missing
 -- columns; the CREATE TABLE IF NOT EXISTS blocks add any missing tables
--- (admin/metrics + OTP); CREATE INDEX IF NOT EXISTS adds any missing indexes.
+-- (guest tables, designer_jobs, admin/metrics + OTP); CREATE INDEX IF NOT EXISTS
+-- adds any missing indexes.
 -- =============================================================================
 
 
@@ -72,6 +73,7 @@ CREATE TABLE IF NOT EXISTS generations (
   user_id        bigint REFERENCES users (id) ON DELETE CASCADE,
   generation_name varchar NOT NULL,
   url            varchar NOT NULL UNIQUE,
+  source_image_url varchar NULL,  -- user's original space photo (before)
   generated_at   TIMESTAMPTZ DEFAULT NOW() NOT NULL,
   ducon_image_id bigint REFERENCES images (id) ON DELETE SET NULL
 );
@@ -91,27 +93,41 @@ CREATE INDEX IF NOT EXISTS idx_generations_user_generated_at ON generations (use
 --   generation_count — one saved pipeline output (internal retries do not count)
 --   chat_turn_count  — one /chat/message SSE done (tool_result continuations do not)
 --   voice_turn_count — one voice turn_complete
--- IP cap (GUEST_IP_TOTAL_LIMIT) sums all three columns across rows sharing ip_hash.
+-- Optional IP cap (GUEST_IP_TOTAL_LIMIT > 0) sums all three columns across rows sharing ip_hash.
+-- Default 0 = disabled so guests on the same office NAT each get their own session limits.
 
 CREATE TABLE IF NOT EXISTS guest_sessions (
-  id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY NOT NULL,
-  session_id       varchar NOT NULL UNIQUE,   -- UUID from X-Guest-Session-Id (unique index implicit)
-  ip_hash          varchar,                   -- SHA-256 of client IP (non-reversible)
-  generation_count integer NOT NULL DEFAULT 0,
-  chat_turn_count  integer NOT NULL DEFAULT 0,
-  voice_turn_count integer NOT NULL DEFAULT 0,
-  created_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL,
-  last_used_at     TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+  id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY NOT NULL,
+  session_id        varchar NOT NULL UNIQUE,   -- UUID from X-Guest-Session-Id (unique index implicit)
+  ip_hash           varchar,                   -- SHA-256 of client IP (non-reversible)
+  fingerprint_hash  varchar,                   -- SHA-256 of browser fingerprint sent as X-Guest-Fingerprint
+  composite_hash    varchar,                   -- SHA-256 of server-side identity signals (secondary binding)
+  subnet_key        varchar,                   -- IPv4 /24 or IPv6 /64 for supplementary abuse tracking
+  ja4_fingerprint   varchar,                   -- Cloudflare JA4/JA3 TLS fingerprint (audit)
+  asn               varchar,                   -- Cloudflare ASN when forwarded (audit)
+  generation_count  integer NOT NULL DEFAULT 0,
+  chat_turn_count   integer NOT NULL DEFAULT 0,
+  voice_turn_count  integer NOT NULL DEFAULT 0,
+  created_at        TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+  last_used_at      TIMESTAMPTZ DEFAULT NOW() NOT NULL,
   CONSTRAINT guest_sessions_generation_count_nonneg CHECK (generation_count >= 0),
   CONSTRAINT guest_sessions_chat_turn_count_nonneg  CHECK (chat_turn_count >= 0),
   CONSTRAINT guest_sessions_voice_turn_count_nonneg CHECK (voice_turn_count >= 0)
 );
+-- fingerprint_hash lookup for UUID-rotation resistance
+CREATE INDEX IF NOT EXISTS guest_sessions_fingerprint_hash_idx ON guest_sessions (fingerprint_hash);
+-- composite_hash index for audit queries (not used for cross-session quota merge)
+CREATE INDEX IF NOT EXISTS guest_sessions_composite_hash_idx ON guest_sessions (composite_hash);
+-- subnet_key for optional shared-subnet abuse caps (GUEST_SUBNET_LIMIT > 0)
+CREATE INDEX IF NOT EXISTS idx_guest_sessions_subnet_key ON guest_sessions (subnet_key)
+  WHERE subnet_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS guest_generations (
   id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY NOT NULL,
   guest_session_id varchar REFERENCES guest_sessions (session_id) ON DELETE SET NULL,
   generation_name  varchar NOT NULL,
   url              varchar NOT NULL UNIQUE,
+  source_image_url varchar NULL,
   ducon_image_id   bigint REFERENCES images (id) ON DELETE SET NULL,
   generated_at     TIMESTAMPTZ DEFAULT NOW() NOT NULL,
   expires_at       TIMESTAMPTZ,
@@ -141,6 +157,67 @@ CREATE INDEX IF NOT EXISTS idx_guest_generations_expires ON guest_generations (e
   WHERE expires_at IS NOT NULL;
 -- guest_consent_audit: time-range audit queries
 CREATE INDEX IF NOT EXISTS idx_guest_consent_audit_logged_at ON guest_consent_audit (logged_at);
+
+
+-- ── 2b. Designer Agent jobs ─────────────────────────────────────────────────
+-- Long-running designer jobs run in-process on one UvicornWorker; state is
+-- mirrored here so GET /designer/jobs/{id} and /events work from any worker
+-- (the in-memory JOBS registry is per-process). Events are stored as a JSONB
+-- array on this row (append-only via SQL || in app/designer_agent.py).
+-- Retention: POST /guest/cleanup (cron) deletes terminal rows older than
+-- DESIGNER_JOB_RETENTION_DAYS and marks stale running jobs failed.
+CREATE TABLE IF NOT EXISTS designer_jobs (
+  id               varchar PRIMARY KEY NOT NULL,        -- uuid4 hex (no dashes)
+  user_id          bigint NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+  status           varchar NOT NULL DEFAULT 'queued',   -- queued|running|completed|failed|cancelled
+  created_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+  updated_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+  error            text,
+  final            jsonb,                               -- terminal payload (best generation, refs, summary)
+  events           jsonb NOT NULL DEFAULT '[]'::jsonb,  -- [{type, ...}, ...] SSE replay log
+  cancel_requested boolean NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_designer_jobs_user_id        ON designer_jobs (user_id);
+CREATE INDEX IF NOT EXISTS idx_designer_jobs_status_updated ON designer_jobs (status, updated_at);
+
+
+-- ── 2c. Chat / voice session continuity (multi-worker) ───────────────────────
+-- Replaces in-process chat_session dicts so interaction_id + transcript are
+-- shared across gunicorn workers (chat ↔ voice seed).
+CREATE TABLE IF NOT EXISTS chat_sessions (
+  id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY NOT NULL,
+  user_id          bigint REFERENCES users (id) ON DELETE CASCADE,
+  guest_session_id varchar REFERENCES guest_sessions (session_id) ON DELETE CASCADE,
+  interaction_id   varchar(128),
+  transcript       jsonb NOT NULL DEFAULT '[]'::jsonb,
+  updated_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_sessions_user_id
+  ON chat_sessions (user_id) WHERE user_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_sessions_guest
+  ON chat_sessions (guest_session_id) WHERE guest_session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated_at ON chat_sessions (updated_at);
+
+
+-- ── 2d. Multi-image generation jobs (create + poll/SSE) ──────────────────────
+-- Same pattern as designer_jobs: owning worker runs the job; any worker can
+-- serve GET /generation/jobs/{id} and poll-based /events from this row.
+CREATE TABLE IF NOT EXISTS generation_jobs (
+  id               varchar PRIMARY KEY NOT NULL,
+  user_id          bigint REFERENCES users (id) ON DELETE CASCADE,
+  guest_session_id varchar REFERENCES guest_sessions (session_id) ON DELETE SET NULL,
+  status           varchar NOT NULL DEFAULT 'queued',
+  created_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+  updated_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+  error            text,
+  final            jsonb,
+  events           jsonb NOT NULL DEFAULT '[]'::jsonb,
+  request_id       varchar(64),
+  cancel_requested boolean NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_generation_jobs_user_id        ON generation_jobs (user_id);
+CREATE INDEX IF NOT EXISTS idx_generation_jobs_guest          ON generation_jobs (guest_session_id);
+CREATE INDEX IF NOT EXISTS idx_generation_jobs_status_updated ON generation_jobs (status, updated_at);
 
 
 -- ── 3. Admin / metrics tables ────────────────────────────────────────────────
@@ -218,8 +295,40 @@ CREATE INDEX IF NOT EXISTS idx_session_activity_user_day ON session_activity (us
 CREATE INDEX IF NOT EXISTS idx_session_activity_occurred ON session_activity (occurred_at);
 
 
--- ── 4. Bootstrap first admin (run once, manually) ────────────────────────────
--- UPDATE users SET role = 'admin' WHERE email = 'you@example.com';
+CREATE TABLE IF NOT EXISTS app_error_logs (
+  id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY NOT NULL,
+  created_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+  severity         varchar(16)  NOT NULL DEFAULT 'error',
+  category         varchar(32)  NOT NULL,
+  source           varchar(255) NOT NULL,
+  user_id          bigint REFERENCES users (id) ON DELETE SET NULL,
+  guest_session_id varchar(64),
+  endpoint         varchar(255),
+  model            varchar(128),
+  error_type       varchar(128),
+  message          text         NOT NULL,
+  detail           jsonb,
+  request_id       varchar(64),
+  http_status      integer,
+  provider_status  integer,
+  archived_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_app_error_logs_created_at
+  ON app_error_logs (created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_error_logs_category_created
+  ON app_error_logs (category, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_error_logs_severity_created
+  ON app_error_logs (severity, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_app_error_logs_user_id
+  ON app_error_logs (user_id)
+  WHERE user_id IS NOT NULL;
+
+
+-- ── 4. Bootstrap privileged users (run once, manually) ─────────────────────
+-- Full admin:
+--   UPDATE users SET role = 'admin' WHERE email = 'you@example.com';
+-- Analytics-only (read metrics/errors, no settings/secrets/user CRUD):
+--   UPDATE users SET role = 'analytics' WHERE email = 'analyst@example.com';
 
 
 -- ── 5. Post-migration ALTERs (idempotent) ─────────────────────────────────────
@@ -244,3 +353,63 @@ ALTER TABLE guest_sessions DROP CONSTRAINT IF EXISTS guest_sessions_chat_turn_co
 ALTER TABLE guest_sessions ADD CONSTRAINT guest_sessions_chat_turn_count_nonneg CHECK (chat_turn_count >= 0);
 ALTER TABLE guest_sessions DROP CONSTRAINT IF EXISTS guest_sessions_voice_turn_count_nonneg;
 ALTER TABLE guest_sessions ADD CONSTRAINT guest_sessions_voice_turn_count_nonneg CHECK (voice_turn_count >= 0);
+
+-- guest_sessions server-side identity signals (audit + optional shared caps):
+ALTER TABLE guest_sessions ADD COLUMN IF NOT EXISTS fingerprint_hash  varchar;
+ALTER TABLE guest_sessions ADD COLUMN IF NOT EXISTS composite_hash  varchar;
+ALTER TABLE guest_sessions ADD COLUMN IF NOT EXISTS subnet_key      varchar;
+ALTER TABLE guest_sessions ADD COLUMN IF NOT EXISTS ja4_fingerprint varchar;
+ALTER TABLE guest_sessions ADD COLUMN IF NOT EXISTS asn             varchar;
+CREATE INDEX IF NOT EXISTS guest_sessions_fingerprint_hash_idx ON guest_sessions (fingerprint_hash);
+CREATE INDEX IF NOT EXISTS guest_sessions_composite_hash_idx ON guest_sessions (composite_hash);
+CREATE INDEX IF NOT EXISTS idx_guest_sessions_subnet_key ON guest_sessions (subnet_key)
+  WHERE subnet_key IS NOT NULL;
+
+-- designer_jobs (cross-worker persistence; safe on fresh DB — table created in §2b):
+ALTER TABLE designer_jobs ADD COLUMN IF NOT EXISTS status           varchar NOT NULL DEFAULT 'queued';
+ALTER TABLE designer_jobs ADD COLUMN IF NOT EXISTS created_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL;
+ALTER TABLE designer_jobs ADD COLUMN IF NOT EXISTS updated_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL;
+ALTER TABLE designer_jobs ADD COLUMN IF NOT EXISTS error            text;
+ALTER TABLE designer_jobs ADD COLUMN IF NOT EXISTS final            jsonb;
+ALTER TABLE designer_jobs ADD COLUMN IF NOT EXISTS events           jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE designer_jobs ADD COLUMN IF NOT EXISTS cancel_requested boolean NOT NULL DEFAULT FALSE;
+CREATE INDEX IF NOT EXISTS idx_designer_jobs_user_id        ON designer_jobs (user_id);
+CREATE INDEX IF NOT EXISTS idx_designer_jobs_status_updated ON designer_jobs (status, updated_at);
+
+-- Tier 3 tables (create_all does not alter existing DBs — run explicitly on prod):
+CREATE TABLE IF NOT EXISTS chat_sessions (
+  id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY NOT NULL,
+  user_id          bigint REFERENCES users (id) ON DELETE CASCADE,
+  guest_session_id varchar REFERENCES guest_sessions (session_id) ON DELETE CASCADE,
+  interaction_id   varchar(128),
+  transcript       jsonb NOT NULL DEFAULT '[]'::jsonb,
+  updated_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_sessions_user_id
+  ON chat_sessions (user_id) WHERE user_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_sessions_guest
+  ON chat_sessions (guest_session_id) WHERE guest_session_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_updated_at ON chat_sessions (updated_at);
+
+CREATE TABLE IF NOT EXISTS generation_jobs (
+  id               varchar PRIMARY KEY NOT NULL,
+  user_id          bigint REFERENCES users (id) ON DELETE CASCADE,
+  guest_session_id varchar REFERENCES guest_sessions (session_id) ON DELETE SET NULL,
+  status           varchar NOT NULL DEFAULT 'queued',
+  created_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+  updated_at       TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+  error            text,
+  final            jsonb,
+  events           jsonb NOT NULL DEFAULT '[]'::jsonb,
+  request_id       varchar(64),
+  cancel_requested boolean NOT NULL DEFAULT FALSE
+);
+CREATE INDEX IF NOT EXISTS idx_generation_jobs_user_id        ON generation_jobs (user_id);
+CREATE INDEX IF NOT EXISTS idx_generation_jobs_guest          ON generation_jobs (guest_session_id);
+CREATE INDEX IF NOT EXISTS idx_generation_jobs_status_updated ON generation_jobs (status, updated_at);
+CREATE TABLE IF NOT EXISTS revoked_jtis (
+  jti        varchar(64) PRIMARY KEY NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_revoked_jtis_expires_at ON revoked_jtis (expires_at);
+

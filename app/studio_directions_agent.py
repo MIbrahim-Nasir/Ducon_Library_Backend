@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -33,6 +34,33 @@ from app.ml import GeminiEmbeddingModel
 # STUDIO_DIRECTIONS_MODEL          — Gemini model id (default: gemini-3-flash-preview)
 # STUDIO_DIRECTIONS_THINKING_LEVEL — none | minimal | low | medium | high (default: High)
 from app.admin.settings_store import cfg, cfg_str
+from app.error_logger import log_error
+
+logger = logging.getLogger(__name__)
+
+
+def _record_studio_embedding(
+    *,
+    user_id: int | None = None,
+    guest_session_id: str | None = None,
+    image_count: int = 1,
+) -> None:
+    try:
+        from app.admin.usage_recorder import record
+
+        record(
+            agent="studio",
+            model="embedding-multimodal",
+            provider="gemini",
+            user_id=user_id,
+            guest_session_id=guest_session_id,
+            input_tokens=0,
+            output_tokens=0,
+            image_count=image_count,
+        )
+    except Exception:
+        pass
+
 
 STUDIO_DIRECTIONS_MAX_TURNS = 8
 STUDIO_DIRECTIONS_MAX_SEARCHES = int(os.getenv("STUDIO_DIRECTIONS_MAX_SEARCHES", "6"))
@@ -243,7 +271,7 @@ async def _run_keyword_search(
     limit: int = 20,
 ) -> dict[str, Any]:
     opts = opts or {}
-    print(f"[StudioDirections] keyword_search: {query!r} opts={opts}")
+    logger.info(f"[StudioDirections] keyword_search: {query!r} opts={opts}")
     result = await keyword_search_catalog(
         db,
         query=str(query or ""),
@@ -273,6 +301,8 @@ async def _run_ai_search(
     limit: int,
     user_image_bytes: bytes,
     user_mime: str,
+    user_id: int | None = None,
+    guest_session_id: str | None = None,
 ) -> dict[str, Any]:
     if session.search_count >= STUDIO_DIRECTIONS_MAX_SEARCHES:
         return {
@@ -282,7 +312,7 @@ async def _run_ai_search(
 
     session.search_count += 1
     limit = max(4, min(limit or STUDIO_DIRECTIONS_SEARCH_LIMIT, 20))
-    print(f"[StudioDirections] ai_search #{session.search_count}: {query!r} (limit={limit})")
+    logger.info(f"[StudioDirections] ai_search #{session.search_count}: {query!r} (limit={limit})")
 
     embedding = await asyncio.to_thread(
         embedding_model.get_multimodal_embedding,
@@ -290,7 +320,8 @@ async def _run_ai_search(
         user_image_bytes,
         user_mime,
     )
-    result = chromadb.retrieve(collection, embedding, limit)
+    _record_studio_embedding(user_id=user_id, guest_session_id=guest_session_id)
+    result = await asyncio.to_thread(chromadb.retrieve, collection, embedding, limit)
     filenames = (result.get("ids") or [[]])[0]
     row_by_filename = await _resolve_rows_by_filenames(db, filenames)
 
@@ -357,11 +388,13 @@ async def _run_inspect_designs(
         if not row:
             return None, None, None
         try:
-            img = await load_ducon_image(row)
-            img = normalize_user_image(_pil_bytes(img))
+            raw_img = await load_ducon_image(row)
+            # Decode + resize + re-encode is CPU-bound; offload so concurrent
+            # gather() actually parallelizes on the thread pool.
+            img = await asyncio.to_thread(lambda: normalize_user_image(_pil_bytes(raw_img)))
         except Exception as exc:
             session.rejected_ids.add(cid)
-            print(f"[StudioDirections] inspect skip id={cid}: {exc}")
+            logger.info(f"[StudioDirections] inspect skip id={cid}: {exc}")
             return None, None, None
 
         meta = session.candidate_pool.get(cid, {})
@@ -370,7 +403,8 @@ async def _run_inspect_designs(
             f"(theme: {meta.get('theme') or 'n/a'}, class: {meta.get('class') or 'n/a'})"
         ))
         info = {"catalog_id": cid, "name": meta.get("name") or row.filename}
-        return text_part, _pil_part(img), info
+        image_part = await asyncio.to_thread(_pil_part, img)
+        return text_part, image_part, info
 
     loaded = await asyncio.gather(*[_load_one(cid) for cid in ids])
     for text_part, image_part, info in loaded:
@@ -640,6 +674,8 @@ async def _presearch_candidates(
     limit_per_query: int,
     user_image_bytes: bytes,
     user_mime: str,
+    user_id: int | None = None,
+    guest_session_id: str | None = None,
 ) -> None:
     """Run multiple searches in parallel to populate the candidate pool quickly.
 
@@ -655,6 +691,11 @@ async def _presearch_candidates(
         )
         for q in queries
     ])
+    _record_studio_embedding(
+        user_id=user_id,
+        guest_session_id=guest_session_id,
+        image_count=len(queries),
+    )
 
     # Chroma retrieval is CPU-bound but very fast; run in threads for safety.
     retrieval_results = await asyncio.gather(*[
@@ -687,7 +728,7 @@ async def _presearch_candidates(
             session.candidate_pool[cid] = _serialize_catalog_row(row, query=query_tag)
 
     session.search_count += len(queries)
-    print(
+    logger.info(
         f"[StudioDirections] pre-search: {len(queries)} parallel queries "
         f"→ {len(session.candidate_pool)} unique candidates"
     )
@@ -703,13 +744,15 @@ async def curate_studio_directions(
     space: dict[str, Any],
     style: dict[str, Any],
     on_event: EventCallback | None = None,
+    user_id: int | None = None,
+    guest_session_id: str | None = None,
 ) -> dict[str, Any]:
     prompt_loader.ensure_prompts_loaded()
     client = get_gemini_client()
     model_id = studio_directions_model()
     thinking_level = studio_directions_thinking_level()
     thinking_label = thinking_level if thinking_level else "disabled"
-    print(
+    logger.info(
         f"[StudioDirections] model={model_id!r} thinking={thinking_label!r}"
     )
     session = StudioDirectionsSession()
@@ -718,15 +761,18 @@ async def curate_studio_directions(
 
     # Normalize user image once — raw uploads can be 5–12 MB from phone cameras.
     # This reduces upload size for every Gemini embedding and generate call.
+    # Decode + resize + JPEG encode is CPU-bound, so offload it to a thread.
     try:
-        _norm_pil = normalize_user_image(user_image_bytes)
-        _norm_buf = io.BytesIO()
-        _norm_pil.save(_norm_buf, format="JPEG", quality=88)
-        user_image_bytes = _norm_buf.getvalue()
+        def _normalize_for_upload(b: bytes) -> bytes:
+            _norm_pil = normalize_user_image(b)
+            _norm_buf = io.BytesIO()
+            _norm_pil.save(_norm_buf, format="JPEG", quality=88)
+            return _norm_buf.getvalue()
+        user_image_bytes = await asyncio.to_thread(_normalize_for_upload, user_image_bytes)
         user_mime = "image/jpeg"
-        print(f"[StudioDirections] user image normalized to {len(user_image_bytes) // 1024} KB")
+        logger.info(f"[StudioDirections] user image normalized to {len(user_image_bytes) // 1024} KB")
     except Exception as exc:
-        print(f"[StudioDirections] image normalization skipped: {exc}")
+        logger.info(f"[StudioDirections] image normalization skipped: {exc}")
 
     if on_event:
         await on_event({"type": "status", "phase": "reading"})
@@ -747,6 +793,8 @@ async def curate_studio_directions(
         limit_per_query=_PRESEARCH_LIMIT,
         user_image_bytes=user_image_bytes,
         user_mime=user_mime,
+        user_id=user_id,
+        guest_session_id=guest_session_id,
     )
 
     # ── Phase 2: Pre-inspect top candidates ───────────────────────────────────
@@ -805,6 +853,18 @@ async def curate_studio_directions(
             contents=session.conversation,
             config=config,
         )
+        try:
+            from app.admin.usage_helpers import record_from_response
+
+            record_from_response(
+                response,
+                agent="studio_directions",
+                model=model_id,
+                user_id=user_id,
+                guest_session_id=guest_session_id,
+            )
+        except Exception:
+            pass
 
         if not response.candidates:
             break
@@ -845,6 +905,8 @@ async def curate_studio_directions(
                     limit=int(args.get("limit") or STUDIO_DIRECTIONS_SEARCH_LIMIT),
                     user_image_bytes=user_image_bytes,
                     user_mime=user_mime,
+                    user_id=user_id,
+                    guest_session_id=guest_session_id,
                 )
             elif name == "keyword_search":
                 if on_event:
@@ -931,7 +993,7 @@ async def curate_studio_directions(
         sorted({d.get("catalog", {}).get("found_via_query", "") for d in directions if d.get("catalog")})
     ) or build_legacy_query(space, style)
 
-    print(
+    logger.info(
         f"[StudioDirections] done — {len(directions)} directions, "
         f"{session.search_count} searches, pool={len(session.candidate_pool)}"
     )
@@ -961,6 +1023,8 @@ async def stream_studio_directions_events(
     user_mime: str,
     space: dict[str, Any],
     style: dict[str, Any],
+    user_id: int | None = None,
+    guest_session_id: str | None = None,
 ) -> AsyncIterator[str]:
     """SSE stream: candidates after each search, then done with final 9 directions."""
     from app.db.database import async_session_maker
@@ -982,9 +1046,18 @@ async def stream_studio_directions_events(
                     space=space,
                     style=style,
                     on_event=on_event,
+                    user_id=user_id,
+                    guest_session_id=guest_session_id,
                 )
         except Exception as exc:
-            print(f"[StudioDirections] stream error: {exc}")
+            logger.info(f"[StudioDirections] stream error: {exc}")
+            await log_error(
+                "studio",
+                "studio_directions_agent.stream",
+                str(exc) or "Studio direction curation failed",
+                endpoint="/studio/directions",
+                exc=exc,
+            )
             await queue.put({"type": "error", "message": str(exc) or "Studio direction curation failed."})
         finally:
             await queue.put(None)

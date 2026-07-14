@@ -46,8 +46,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_user, get_optional_user
 from app.db.database import get_db
 from app.db.models import GuestSession, User
-from app.guest_usage import GuestUsageKind, increment_guest_usage
-from app.routers.guest import get_or_create_guest_session, verify_turnstile
+from app.guest_identity import build_guest_request_identity
+from app.guest_session_token import require_guest_session_id
+from app.guest_usage import GuestUsageKind, get_guest_session_row, increment_guest_usage
+from app.routers.guest import resolve_guest_context
 from app import chat_agent
 from app import chat_session
 from app import llm_provider
@@ -56,6 +58,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 from app.admin.settings_store import cfg
+from app.error_logger import log_error, log_warning
 
 _MAX_TOOL_RESULT_CHARS = 12000      # default; live value via cfg("CHAT_TOOL_RESULT_MAX_CHARS", _MAX_TOOL_RESULT_CHARS)
 _MAX_AISEARCH_ITEMS = 8
@@ -152,7 +155,13 @@ async def _stream_with_session_save(
     record_transcript: bool = True,
     increment_guest_on_done: bool = False,
 ):
-    """Persist interaction_id, optional transcript turns, and emit keepalive pings."""
+    """Emit chat SSE, then persist final-turn metadata without hiding ``done``.
+
+    The ``done`` event is the client-visible transaction boundary.  It must be
+    yielded before any best-effort persistence: a database/session failure must
+    not truncate an otherwise completed model response and leave the composer
+    permanently in its streaming state.
+    """
     KEEPALIVE_INTERVAL = 15.0  # seconds — resets Cloudflare's 100 s idle timeout
     assistant_parts: list[str] = []
 
@@ -182,29 +191,63 @@ async def _stream_with_session_save(
                         assistant_parts.append(delta)
                 if payload.get("type") == "done" and payload.get("interaction_id"):
                     iid = payload["interaction_id"]
-                    if user_id is not None:
-                        chat_session.set_interaction_id(user_id, iid)
-                    elif guest_session_id:
-                        chat_session.set_guest_interaction_id(guest_session_id, iid)
-                    if record_transcript:
-                        model_text = "".join(assistant_parts).strip()
-                        memory_user = (user_text or "").strip()
-                        if memory_user or model_text:
-                            if user_id is not None:
-                                chat_session.append_turn(user_id, memory_user, model_text)
-                            elif guest_session_id:
-                                chat_session.append_guest_turn(
-                                    guest_session_id, memory_user, model_text,
-                                )
-                    if (
-                        increment_guest_on_done
-                        and guest_session_row is not None
-                        and db is not None
-                    ):
-                        await increment_guest_usage(
-                            db, guest_session_row, GuestUsageKind.CHAT,
+                    # `done` is the protocol boundary and is always the final
+                    # event from chat_agent. Deliver it before persistence so a
+                    # database/session error cannot suppress completion.
+                    yield chunk
+                    try:
+                        if user_id is not None:
+                            await chat_session.set_interaction_id(user_id, iid)
+                        elif guest_session_id:
+                            await chat_session.set_guest_interaction_id(
+                                guest_session_id, iid
+                            )
+                        if record_transcript:
+                            model_text = "".join(assistant_parts).strip()
+                            memory_user = (user_text or "").strip()
+                            if memory_user or model_text:
+                                if user_id is not None:
+                                    await chat_session.append_turn(
+                                        user_id, memory_user, model_text
+                                    )
+                                elif guest_session_id:
+                                    await chat_session.append_guest_turn(
+                                        guest_session_id, memory_user, model_text
+                                    )
+                        if (
+                            increment_guest_on_done
+                            and guest_session_row is not None
+                            and db is not None
+                        ):
+                            await increment_guest_usage(
+                                db, guest_session_row, GuestUsageKind.CHAT
+                            )
+                            await db.commit()
+                    except Exception as exc:
+                        logger.exception(
+                            "Chat turn completed but final persistence failed "
+                            "(user_id=%r guest_session_id=%r interaction_id=%r)",
+                            user_id,
+                            guest_session_id,
+                            iid,
                         )
-                        await db.commit()
+                        if db is not None:
+                            try:
+                                await db.rollback()
+                            except Exception:
+                                logger.exception(
+                                    "Failed to roll back chat persistence transaction"
+                                )
+                        await log_error(
+                            "chat",
+                            "chat._stream_with_session_save",
+                            str(exc),
+                            user_id=user_id,
+                            guest_session_id=guest_session_id,
+                            endpoint="/chat/message",
+                            exc=exc,
+                        )
+                    continue
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
         yield chunk
@@ -214,32 +257,29 @@ async def _stream_with_session_save(
 
 @router.get("/session")
 async def get_chat_session(
+    request: Request,
     current_user: User | None = Depends(get_optional_user),
-    x_guest_session_id: str | None = Header(None, alias="X-Guest-Session-Id"),
 ):
     """Return the persisted Interactions API chain id (voice + text share it)."""
     if current_user is not None:
-        return {"interaction_id": chat_session.get_interaction_id(current_user.id)}
-    if x_guest_session_id:
-        return {
-            "interaction_id": chat_session.get_guest_interaction_id(x_guest_session_id),
-        }
-    raise HTTPException(status_code=401, detail="Authentication required.")
+        return {"interaction_id": await chat_session.get_interaction_id(current_user.id)}
+    x_guest_session_id = require_guest_session_id(request)
+    return {
+        "interaction_id": await chat_session.get_guest_interaction_id(x_guest_session_id),
+    }
 
 
 @router.delete("/session", status_code=204)
 async def clear_chat_session(
+    request: Request,
     current_user: User | None = Depends(get_optional_user),
-    x_guest_session_id: str | None = Header(None, alias="X-Guest-Session-Id"),
 ):
     """Clear the stored chat session (e.g. when user clears the conversation)."""
     if current_user is not None:
-        chat_session.clear_session(current_user.id)
+        await chat_session.clear_session(current_user.id)
         return
-    if x_guest_session_id:
-        chat_session.clear_guest_session(x_guest_session_id)
-        return
-    raise HTTPException(status_code=401, detail="Authentication required.")
+    x_guest_session_id = require_guest_session_id(request)
+    await chat_session.clear_guest_session(x_guest_session_id)
 
 
 # ── POST /chat/message ────────────────────────────────────────────────────────
@@ -286,21 +326,16 @@ async def chat_message(
     guest_session_id: str | None = None
     guest_session_row: GuestSession | None = None
     if current_user is None:
-        guest_session_id = request.headers.get("x-guest-session-id")
-        if not guest_session_id:
-            raise HTTPException(
-                status_code=401,
-                detail="Authentication required. Provide a Bearer token or X-Guest-Session-Id header.",
-            )
-        client_ip = request.client.host if request.client else "unknown"
-        if not await verify_turnstile(cf_turnstile_token or "", client_ip):
-            raise HTTPException(
-                status_code=403,
-                detail="Bot verification failed. Please try again.",
-            )
-        guest_session_row = await get_or_create_guest_session(
-            db, guest_session_id, client_ip, usage_kind=GuestUsageKind.CHAT,
+        guest_session_row = await resolve_guest_context(
+            request, db,
+            turnstile_token=cf_turnstile_token,
+            endpoint="/chat/message",
+            source="chat",
+            usage_kind=GuestUsageKind.CHAT,
         )
+        # Fingerprint remapping may return a different canonical UUID than the
+        # header/cookie — bind chat usage/history to the row that was enforced.
+        guest_session_id = guest_session_row.session_id
 
     chat_agent._dbg(
         "[CHAT ROUTER ▶ MESSAGE]",
@@ -377,6 +412,16 @@ async def chat_message(
             )
         except Exception as exc:
             logger.warning("File upload failed for %s: %s", upload.filename, exc)
+            await log_error(
+                "chat",
+                "chat_agent.upload_file_to_gemini",
+                f"Gemini file upload failed: {upload.filename}",
+                user_id=current_user.id if current_user else None,
+                guest_session_id=guest_session_id,
+                endpoint="/chat/message",
+                exc=exc,
+                http_status=502,
+            )
             raise HTTPException(
                 status_code=502,
                 detail="File upload failed. Please try again or use a different file.",
@@ -397,10 +442,12 @@ async def chat_message(
 
     # Prefer server-persisted session (updated by voice_context injects) over a
     # possibly stale client previous_interaction_id.
+    # After guest → login, the client clears previous_interaction_id so this
+    # fallback cannot chain onto a guest turn.
     if current_user is not None:
-        session_prev = chat_session.get_interaction_id(current_user.id)
+        session_prev = await chat_session.get_interaction_id(current_user.id)
     else:
-        session_prev = chat_session.get_guest_interaction_id(guest_session_id)
+        session_prev = await chat_session.get_guest_interaction_id(guest_session_id)
     effective_prev = session_prev or previous_interaction_id
     memory_user = (message or "").strip()
     if not memory_user and file_parts:
@@ -433,6 +480,7 @@ async def chat_tool_result(
     request: Request,
     body: ToolResultRequest,
     current_user: User | None = Depends(get_optional_user),
+    db: AsyncSession = Depends(get_db),
 ):
     """
     Submit tool execution results and receive the model's follow-up response.
@@ -461,19 +509,31 @@ async def chat_tool_result(
 
     guest_session_id: str | None = None
     if current_user is None:
-        guest_session_id = request.headers.get("x-guest-session-id")
-        if not guest_session_id:
-            raise HTTPException(
-                status_code=401,
-                detail="Authentication required. Provide a Bearer token or X-Guest-Session-Id header.",
-            )
+        guest_session_id = require_guest_session_id(request)
+        # Match /chat/message: fingerprint remapping may change the canonical UUID.
+        guest_identity = build_guest_request_identity(
+            request.headers,
+            peer_host=request.client.host if request.client else None,
+            raw_fingerprint=request.headers.get("x-guest-fingerprint"),
+        )
+        guest_row = await get_guest_session_row(
+            db,
+            guest_session_id,
+            guest_identity.ip_hash,
+            fingerprint_hash=guest_identity.fingerprint_hash,
+            composite_hash=guest_identity.composite_hash,
+            subnet_key=guest_identity.subnet_key,
+            ja4_fingerprint=guest_identity.ja4_fingerprint,
+            asn=guest_identity.asn,
+        )
+        guest_session_id = guest_row.session_id
 
     stream_user_id = current_user.id if current_user else None
     if current_user is not None:
-        chain_prev = chat_session.get_interaction_id(current_user.id) or body.previous_interaction_id
+        chain_prev = await chat_session.get_interaction_id(current_user.id) or body.previous_interaction_id
     else:
         chain_prev = (
-            chat_session.get_guest_interaction_id(guest_session_id)
+            await chat_session.get_guest_interaction_id(guest_session_id)
             or body.previous_interaction_id
         )
 
@@ -542,6 +602,9 @@ def _compact_tool_result(tool_name: str, result: object) -> object:
     if tool_name in ("open_ai_generations", "show_image_generations"):
         return _compact_generations_list(result)
 
+    if tool_name == "generate_multi_image":
+        return _compact_generate_multi_image_result(result)
+
     raw = json.dumps(result, ensure_ascii=False)
     _mtc = _max_tool_result_chars()
     if len(raw) <= _mtc:
@@ -553,9 +616,43 @@ def _compact_tool_result(tool_name: str, result: object) -> object:
     }
 
 
+def _compact_generate_multi_image_result(result: object) -> object:
+    """Keep generation ids/refs for the model; drop long signed URLs."""
+    if not isinstance(result, dict):
+        return result
+    gid = result.get("id") or result.get("generation_id")
+    compact: dict = {
+        "_type": "GenerateMultiImageResult",
+        "_compacted_for_model": True,
+        "id": gid,
+        "generation_id": gid,
+        "generation_name": result.get("generation_name"),
+        "generation_ref": f"gen:{gid}" if gid else result.get("generation_ref"),
+        "model_used": result.get("model_used"),
+        "images_used": result.get("images_used"),
+        "approved": result.get("approved"),
+        "input_quality": result.get("input_quality"),
+        "generation_warnings": result.get("generation_warnings"),
+    }
+    # Preserve a short URL hint only if already short (avoid megabyte data-URIs).
+    for key in ("url", "signed_url"):
+        val = result.get(key)
+        if isinstance(val, str) and val.startswith("http") and len(val) <= 512:
+            compact[key] = val
+    return compact
+
+
 def _compact_generations_list(result: object) -> object:
     """Compact generation lists so the model gets ids/refs without megabytes of signed URLs."""
-    items = result if isinstance(result, list) else []
+    if isinstance(result, dict) and isinstance(result.get("generations"), list):
+        items = result["generations"]
+        note = result.get("note")
+    elif isinstance(result, list):
+        items = result
+        note = None
+    else:
+        items = []
+        note = None
     compact: list[dict] = []
     for item in items[:12]:
         if not isinstance(item, dict):
@@ -568,7 +665,7 @@ def _compact_generations_list(result: object) -> object:
             "generated_at": item.get("generated_at"),
             "name": item.get("name") or item.get("generation_name"),
         })
-    return {
+    out: dict = {
         "_type": "GenerationsList",
         "_compacted_for_model": True,
         "_original_count": len(items),
@@ -578,6 +675,9 @@ def _compact_generations_list(result: object) -> object:
             "Use generation_ref (e.g. gen:339) to avoid catalog id collisions."
         ),
     }
+    if note:
+        out["note"] = note
+    return out
 
 
 def _compact_ai_search_result(result: object) -> object:
@@ -804,9 +904,9 @@ async def inject_voice_context(
             ),
         }]
     else:
-        return {"interaction_id": chat_session.get_interaction_id(current_user.id)}
+        return {"interaction_id": await chat_session.get_interaction_id(current_user.id)}
 
-    session_prev = chat_session.get_interaction_id(current_user.id)
+    session_prev = await chat_session.get_interaction_id(current_user.id)
     chain_prev = session_prev or body.previous_interaction_id
 
     # Normal voice turns are already stored by GeminiLiveSession._commit_turn.
@@ -938,12 +1038,12 @@ async def inject_browse_context(
     Returns { "interaction_id": "v1_..." } for the next /chat/message call.
     """
     if not body.actions:
-        return {"interaction_id": chat_session.get_interaction_id(current_user.id)}
+        return {"interaction_id": await chat_session.get_interaction_id(current_user.id)}
 
     memory_text = _format_browse_memory(body.actions)
     input_parts = [{"type": "text", "text": memory_text}]
 
-    session_prev = chat_session.get_interaction_id(current_user.id)
+    session_prev = await chat_session.get_interaction_id(current_user.id)
     chain_prev = session_prev or body.previous_interaction_id
 
     interaction_id: Optional[str] = None
@@ -1051,12 +1151,12 @@ async def inject_studio_context(
     Returns { "interaction_id": "v1_..." } for the next /chat/message call.
     """
     if not body.context:
-        return {"interaction_id": chat_session.get_interaction_id(current_user.id)}
+        return {"interaction_id": await chat_session.get_interaction_id(current_user.id)}
 
     memory_text = _format_studio_memory(body.context)
     input_parts = [{"type": "text", "text": memory_text}]
 
-    session_prev = chat_session.get_interaction_id(current_user.id)
+    session_prev = await chat_session.get_interaction_id(current_user.id)
     chain_prev = session_prev or body.previous_interaction_id
 
     interaction_id: Optional[str] = None

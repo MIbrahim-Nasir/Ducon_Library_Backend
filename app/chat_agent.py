@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 from app.admin.settings_store import cfg, cfg_str
+from app.error_logger import log_error
 
 CHAT_MODEL = "gemini-3.5-flash"                      # default; live value via cfg("CHAT_MODEL", CHAT_MODEL)
 CHAT_THINKING_LEVEL = "low"
@@ -426,6 +427,16 @@ CHAT_TOOLS: list[dict] = [
 ]
 
 
+AUTHENTICATED_ONLY_CHAT_TOOLS = frozenset({"start_designer_job"})
+
+
+def get_chat_tools(*, user_id: Optional[int] = None) -> list[dict]:
+    """Return chat tools available for this request (guests cannot start designer jobs)."""
+    if user_id is not None:
+        return CHAT_TOOLS
+    return [t for t in CHAT_TOOLS if t.get("name") not in AUTHENTICATED_ONLY_CHAT_TOOLS]
+
+
 # ── File upload helper ────────────────────────────────────────────────────────
 
 async def upload_file_to_gemini(
@@ -573,7 +584,12 @@ async def stream_chat(
     # Route to Claude when enabled — Claude has no server-managed Interactions
     # API, so we keep our own message transcript keyed by the conversation id.
     if llm_provider.use_claude():
-        async for chunk in _stream_chat_claude(input_parts, previous_interaction_id, allow_tools=allow_tools):
+        async for chunk in _stream_chat_claude(
+            input_parts,
+            previous_interaction_id,
+            allow_tools=allow_tools,
+            user_id=user_id,
+        ):
             yield chunk
         return
 
@@ -582,6 +598,7 @@ async def stream_chat(
     _chat_model = cfg_str("CHAT_MODEL", CHAT_MODEL)
     _chat_thinking = cfg_str("CHAT_THINKING_LEVEL", CHAT_THINKING_LEVEL)
     _chat_stream = cfg("CHAT_STREAM", CHAT_STREAM)
+    chat_tools = get_chat_tools(user_id=user_id) if allow_tools else []
 
     generation_config: dict = {}
     if _chat_thinking and _chat_thinking.lower() not in ("none", ""):
@@ -600,7 +617,7 @@ async def stream_chat(
                 "thinking_level": _chat_thinking,
                 "previous_interaction_id": previous_interaction_id,
                 "input_parts": _summarize_input_parts(input_parts),
-                "tools": [tool.get("name") for tool in CHAT_TOOLS],
+                "tools": [tool.get("name") for tool in chat_tools],
                 "context": (
                     "Interactions API history is server-managed via previous_interaction_id; "
                     "this backend does not manually summarize chat context."
@@ -616,7 +633,7 @@ async def stream_chat(
                 model=_chat_model,
                 system_instruction=get_chat_system_instruction(),
                 input=input_parts,
-                tools=CHAT_TOOLS,
+                tools=chat_tools or None,
                 previous_interaction_id=previous_interaction_id,
                 generation_config=generation_config or None,
                 stream=True,
@@ -729,7 +746,7 @@ async def stream_chat(
                 model=_chat_model,
                 system_instruction=get_chat_system_instruction(),
                 input=input_parts,
-                tools=CHAT_TOOLS,
+                tools=chat_tools or None,
                 previous_interaction_id=previous_interaction_id,
                 generation_config=generation_config or None,
             )
@@ -771,6 +788,15 @@ async def stream_chat(
     except Exception as exc:
         logger.exception("Chat agent error during interaction")
         _dbg("[CHAT ✖ ERROR]", repr(exc))
+        await log_error(
+            "chat",
+            "chat_agent.stream_chat",
+            str(exc),
+            user_id=user_id,
+            guest_session_id=guest_session_id,
+            endpoint="/chat/message",
+            exc=exc,
+        )
         yield _sse_error(str(exc))
         return
 
@@ -810,13 +836,20 @@ _CLAUDE_HISTORY: dict[str, list[dict]] = {}
 _CLAUDE_HISTORY_MAX_MESSAGES = int(cfg("CLAUDE_CHAT_MAX_MESSAGES", 60))
 
 _claude_chat_tools_cache: Optional[list[dict]] = None
+_claude_guest_chat_tools_cache: Optional[list[dict]] = None
 
 
-def get_claude_chat_tools() -> list[dict]:
-    global _claude_chat_tools_cache
-    if _claude_chat_tools_cache is None:
-        _claude_chat_tools_cache = llm_provider.to_claude_tools(CHAT_TOOLS)
-    return _claude_chat_tools_cache
+def get_claude_chat_tools(*, user_id: Optional[int] = None) -> list[dict]:
+    global _claude_chat_tools_cache, _claude_guest_chat_tools_cache
+    if user_id is not None:
+        if _claude_chat_tools_cache is None:
+            _claude_chat_tools_cache = llm_provider.to_claude_tools(CHAT_TOOLS)
+        return _claude_chat_tools_cache
+    if _claude_guest_chat_tools_cache is None:
+        _claude_guest_chat_tools_cache = llm_provider.to_claude_tools(
+            get_chat_tools(user_id=None),
+        )
+    return _claude_guest_chat_tools_cache
 
 
 def _trim_history(messages: list[dict]) -> list[dict]:
@@ -986,10 +1019,21 @@ async def _stream_chat_claude(
     previous_interaction_id: Optional[str],
     *,
     allow_tools: bool = True,
+    user_id: Optional[int] = None,
 ) -> AsyncGenerator[str, None]:
     """Claude equivalent of stream_chat — same SSE event contract."""
     conv_id = previous_interaction_id if (previous_interaction_id and str(previous_interaction_id).startswith("cld_")) else f"cld_{uuid.uuid4().hex}"
     messages: list[dict] = list(_CLAUDE_HISTORY.get(conv_id, []))
+    if previous_interaction_id and str(previous_interaction_id).startswith("cld_") and not messages:
+        # KNOWN LIMITATION: _CLAUDE_HISTORY is per-worker in-memory. Under
+        # gunicorn -w N a continuation can land on a worker that never saw the
+        # conversation — context is lost and tool_result pairing can 400.
+        # Requires sticky sessions or -w 1 while USE_CLAUDE is enabled.
+        logger.warning(
+            "[CHAT · claude] continuation %s has no in-memory history on this "
+            "worker (multi-worker without sticky sessions?) — starting fresh",
+            conv_id,
+        )
 
     user_msg = _build_claude_user_message(input_parts, messages)
     messages.append(user_msg)
@@ -1011,7 +1055,7 @@ async def _stream_chat_claude(
             "messages": messages,
         }
         if allow_tools:
-            kwargs["tools"] = get_claude_chat_tools()
+            kwargs["tools"] = get_claude_chat_tools(user_id=user_id)
         th = llm_provider._thinking_param()
         if th:
             kwargs["thinking"] = th
@@ -1054,6 +1098,13 @@ async def _stream_chat_claude(
     except Exception as exc:
         logger.exception("Claude chat agent error")
         _dbg("[CHAT ✖ ERROR · claude]", repr(exc))
+        await log_error(
+            "chat",
+            "chat_agent.stream_chat_claude",
+            str(exc),
+            endpoint="/chat/message",
+            exc=exc,
+        )
         yield _sse_error(str(exc))
         return
 

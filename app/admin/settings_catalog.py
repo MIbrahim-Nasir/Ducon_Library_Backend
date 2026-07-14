@@ -56,6 +56,7 @@ AI_MODELS = Namespace(
         SettingSpec("DESIGNER_AGENT_MODEL", "Designer agent model", "string", "gemini-3.5-flash"),
         SettingSpec("STUDIO_DIRECTIONS_MODEL", "Studio directions model", "string", "gemini-3-flash-preview"),
         SettingSpec("IMAGE_GEN_MODEL", "Image gen model (studio / autogen)", "string", "gemini-3-pro-image-preview"),
+        SettingSpec("PROMPT_GEN_MODEL", "Prompt writer / QC eval model (image gen workflow)", "string", "gemini-3-flash-preview"),
         SettingSpec("MULTI_IMAGE_PRO_MODEL", "Multi-image pro model", "string", "gemini-3-pro-image-preview"),
         SettingSpec("MULTI_IMAGE_FLASH_MODEL", "Multi-image flash model", "string", "gemini-3.1-flash-image-preview"),
         SettingSpec("DESIGNER_AGENT_IMAGE_MODEL", "Designer image model tier", "choice", "flash",
@@ -97,6 +98,15 @@ LIMITS = Namespace(
         SettingSpec("DESIGNER_AGENT_MAX_STEPS", "Designer agent max steps", "int", 12, min=1, max=50),
         SettingSpec("DESIGNER_AGENT_MAX_GENERATIONS", "Designer max candidate generations", "int", 3, min=1, max=12),
         SettingSpec("GEN_EVAL_MAX_ROUNDS", "Generation eval retries", "int", 3, min=0, max=10),
+        SettingSpec(
+            "GEN_EVAL_STRICTNESS",
+            "Generation QC strictness",
+            "choice",
+            "relaxed",
+            choices=["relaxed", "strict", "less_restrictive", "more_restrictive"],
+            description="Relaxed: pass/accepted/rejected tiers, trust model verdict. "
+            "Strict: pass/fail only, enforce all critical sections.",
+        ),
         SettingSpec("PROMPT_VERIFY_MAX_ROUNDS", "Prompt verify retries", "int", 2, min=0, max=10),
         SettingSpec("STUDIO_DIRECTIONS_MAX_TURNS", "Studio directions max turns", "int", 8, min=1, max=30),
         SettingSpec("CHAT_TOOL_RESULT_MAX_CHARS", "Chat tool result max chars", "int", 12000, min=1000, max=100000),
@@ -127,12 +137,27 @@ PATHS = Namespace(
 GUEST = Namespace(
     name="guest",
     label="Guest Limits",
-    description="Per-session and per-IP usage caps for unauthenticated guests.",
+    description="Per-guest-session usage caps (X-Guest-Session-Id). Optional IP cap for public abuse control.",
     settings=[
         SettingSpec("GUEST_GEN_LIMIT", "Guest generation limit / session", "int", 3, min=0, max=100),
         SettingSpec("GUEST_CHAT_LIMIT", "Guest chat turn limit / session", "int", 10, min=0, max=200),
         SettingSpec("GUEST_VOICE_LIMIT", "Guest voice turn limit / session", "int", 5, min=0, max=100),
-        SettingSpec("GUEST_IP_TOTAL_LIMIT", "Per-IP total limit", "int", 15, min=0, max=500),
+        SettingSpec(
+            "GUEST_IP_TOTAL_LIMIT",
+            "Optional shared IP cap (0 = disabled)",
+            "int",
+            0,
+            min=0,
+            max=500,
+        ),
+        SettingSpec(
+            "GUEST_SUBNET_LIMIT",
+            "Optional shared subnet cap /24|/64 (0 = disabled)",
+            "int",
+            0,
+            min=0,
+            max=500,
+        ),
     ],
 )
 
@@ -167,25 +192,19 @@ WATERMARK = Namespace(
         SettingSpec("WATERMARK_ENABLED", "Enable watermark", "bool", "true",
                     "When false, generated images are saved without any watermark. "
                     "Also controllable via ENABLE_WATERMARK in .env (takes precedence when set)."),
-        SettingSpec("WATERMARK_OPACITY", "Diagonal watermark opacity (0-1)", "float", 0.4,
-                    "Translucency of the large diagonal logo/text mark. 0.35-0.5 is the sweet spot.",
+        SettingSpec("WATERMARK_OPACITY", "Main watermark opacity (0-1)", "float", 0.4,
+                    "Translucency of the large centered Ducon 'D' mark only. "
+                    "Corner badge is always fully opaque (ignores this setting). "
+                    "0.35-0.5 is the sweet spot for the main mark.",
                     min=0.0, max=1.0),
-        SettingSpec("WATERMARK_LOGO_PATH", "Logo PNG path (empty = DUCON text fallback)", "string",
-                    "app/static/ducon_logo_white.png",
-                    "Single-logo override (backward-compat). When set, used for both diagonal and "
-                    "badge marks. If the file is missing or unreadable, the watermark falls back to "
-                    "the adaptive white/black logos, then to bold 'DUCON' text."),
-        SettingSpec("WATERMARK_LOGO_WHITE_PATH", "White logo PNG (used on dark images)", "string",
-                    "app/static/ducon_logo_white.png",
-                    "White Ducon logo used when the image is dark (mean luminance < 128). "
-                    "Adaptive: selected automatically based on image brightness."),
-        SettingSpec("WATERMARK_LOGO_BLACK_PATH", "Black logo PNG (used on light images)", "string",
-                    "app/static/ducon_logo_black.png",
-                    "Black Ducon logo used when the image is light (mean luminance >= 128). "
-                    "Adaptive: selected automatically based on image brightness."),
+        SettingSpec("WATERMARK_MAIN_PATH", "Main (centered) watermark PNG path", "string",
+                    "app/static/ducon_main_watermark.png",
+                    "Large Ducon 'D' mark scaled to fit inside the image and centered. "
+                    "RGBA PNG preferred; near-black backgrounds are keyed to transparent."),
         SettingSpec("WATERMARK_CORNER_PATH", "Corner watermark image path", "string",
-                    "app/static/corner watermark.jpeg",
-                    "Precomposed top-left badge (logo + contact info). JPEG or PNG."),
+                    "app/static/ducon_corner_watermark.png",
+                    "Precomposed bottom-right badge (logo + contact info), flush to image edges, "
+                    "always at 100% opacity. RGBA PNG preferred."),
     ],
 )
 

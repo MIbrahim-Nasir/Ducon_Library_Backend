@@ -64,7 +64,10 @@ async def signup_request(
     payload: UserCreate,
     db: AsyncSession = Depends(get_db),
 ):
-    require_rate_limit(request, max_requests=5, window_seconds=300, key_prefix="signup_otp")
+    # IP bucket = anti-abuse (many emails from one IP). Per-email resend cooldown
+    # lives in otp_service (OTP_RESEND_COOLDOWN_SECONDS). Slightly raised so
+    # office NAT coworkers are less likely to share a tight IP bucket.
+    await require_rate_limit(request, max_requests=10, window_seconds=300, key_prefix="signup_otp")
     email = normalize_email(payload.email)
 
     result = await db.execute(select(User).where(User.email == email))
@@ -111,7 +114,7 @@ async def signup_verify(
     payload: SignupVerifyRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    require_rate_limit(request, max_requests=10, window_seconds=300, key_prefix="signup_verify")
+    await require_rate_limit(request, max_requests=10, window_seconds=300, key_prefix="signup_verify")
     email = normalize_email(payload.email)
 
     result = await db.execute(select(User).where(User.email == email))
@@ -156,7 +159,8 @@ async def password_forgot(
     payload: PasswordForgotRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    require_rate_limit(request, max_requests=5, window_seconds=300, key_prefix="password_forgot")
+    # Same dual-layer model as signup: IP anti-abuse + per-email OTP cooldown.
+    await require_rate_limit(request, max_requests=10, window_seconds=300, key_prefix="password_forgot")
     email = normalize_email(payload.email)
 
     result = await db.execute(select(User).where(User.email == email))
@@ -185,7 +189,7 @@ async def password_verify_otp(
     payload: PasswordVerifyOtpRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    require_rate_limit(request, max_requests=10, window_seconds=300, key_prefix="password_verify_otp")
+    await require_rate_limit(request, max_requests=10, window_seconds=300, key_prefix="password_verify_otp")
     email = normalize_email(payload.email)
 
     result = await db.execute(select(User).where(User.email == email))
@@ -213,7 +217,7 @@ async def password_reset(
     payload: PasswordResetRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    require_rate_limit(request, max_requests=5, window_seconds=300, key_prefix="password_reset")
+    await require_rate_limit(request, max_requests=5, window_seconds=300, key_prefix="password_reset")
     email = normalize_email(payload.email)
 
     result = await db.execute(select(User).where(User.email == email))
@@ -240,7 +244,7 @@ async def password_reset(
 
 @router.post("/login", response_model=Token)
 async def login(request: Request, payload: UserLogin, db: AsyncSession = Depends(get_db)):
-    require_rate_limit(request, max_requests=8, window_seconds=60, key_prefix="login")
+    await require_rate_limit(request, max_requests=8, window_seconds=60, key_prefix="login")
     email = normalize_email(payload.email)
     result = await db.execute(select(User).where(User.email == email))
     user = result.scalar_one_or_none()
@@ -270,7 +274,7 @@ async def login(request: Request, payload: UserLogin, db: AsyncSession = Depends
 
 @router.post("/google", response_model=Token)
 async def google_auth(request: Request, payload: GoogleAuthToken, db: AsyncSession = Depends(get_db)):
-    require_rate_limit(request, max_requests=10, window_seconds=60, key_prefix="google_auth")
+    await require_rate_limit(request, max_requests=10, window_seconds=60, key_prefix="google_auth")
     """
     Accepts a Google ID token from the frontend (via Google Identity Services).
     - New user  → creates account (password_hash=null)

@@ -25,35 +25,49 @@ MAX_IMAGE_PX = 2048
 
 _IMAGE_INFO_JSON_PATH = os.getenv("IMAGE_INFO_JSON_PATH", "")
 _IMAGE_INFO_CACHE: list[dict] | None = None
+_IMAGE_INFO_BY_FILENAME: dict[str, dict] | None = None
 _IMAGE_INFO_CACHE_AT: float = 0.0
 _IMAGE_INFO_CACHE_TTL = 60 * 60 * 24  # 1 day
 
 
 def load_image_info() -> list[dict]:
-    global _IMAGE_INFO_CACHE, _IMAGE_INFO_CACHE_AT
+    global _IMAGE_INFO_CACHE, _IMAGE_INFO_BY_FILENAME, _IMAGE_INFO_CACHE_AT
     now = time.time()
     if _IMAGE_INFO_CACHE is not None and (now - _IMAGE_INFO_CACHE_AT) < _IMAGE_INFO_CACHE_TTL:
         return _IMAGE_INFO_CACHE
     if not _IMAGE_INFO_JSON_PATH:
-        return []
+        _IMAGE_INFO_CACHE = []
+        _IMAGE_INFO_BY_FILENAME = {}
+        _IMAGE_INFO_CACHE_AT = now
+        return _IMAGE_INFO_CACHE
     if _IMAGE_INFO_JSON_PATH.startswith(("http://", "https://")):
         r = httpx.get(_IMAGE_INFO_JSON_PATH, timeout=30)
         data = r.json() if r.status_code == 200 else []
     else:
         p = Path(_IMAGE_INFO_JSON_PATH)
         data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else []
+    if not isinstance(data, list):
+        data = []
     _IMAGE_INFO_CACHE = data
+    _IMAGE_INFO_BY_FILENAME = {
+        str(item.get("filename")): item
+        for item in data
+        if isinstance(item, dict) and item.get("filename")
+    }
     _IMAGE_INFO_CACHE_AT = now
     return _IMAGE_INFO_CACHE
+
+
+def image_info_by_filename() -> dict[str, dict]:
+    """O(1) filename → metadata map (built alongside ``load_image_info``)."""
+    load_image_info()
+    return _IMAGE_INFO_BY_FILENAME or {}
 
 
 def get_image_metadata(filename: str) -> dict | None:
     """Return the metadata entry for a Ducon image by filename, or None."""
     try:
-        return next(
-            (item for item in load_image_info() if item.get("filename") == filename),
-            None,
-        )
+        return image_info_by_filename().get(filename)
     except Exception:
         return None
 

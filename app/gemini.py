@@ -6,13 +6,20 @@ from io import BytesIO
 from dotenv import load_dotenv
 import asyncio
 import json
+import logging
 import os
-from typing import Optional
+import time
+from typing import Any, Optional, TYPE_CHECKING
 
 from app import prompt_loader
 from app import llm_provider
 
+if TYPE_CHECKING:
+    from app.benchmark.types import StepMetrics
+
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 from app.admin.settings_store import cfg
 
@@ -47,13 +54,21 @@ def gen_eval_max_rounds() -> int:
     return int(cfg("GEN_EVAL_MAX_ROUNDS", 3))
 
 
+def gen_eval_strictness() -> str:
+    return prompt_loader.gen_eval_strictness()
+
+
 def image_thinking_level() -> str:
     return cfg("IMAGE_THINKING_LEVEL", "High")
 
 _NANO_BANANA_2 = "gemini-3.1-flash-image-preview"
 
-# Gemini 3.1 Flash-Lite — fast multimodal prompt generation (text output only)
-PROMPT_GEN_MODEL = "gemini-3-flash-preview"
+PROMPT_GEN_MODEL_DEFAULT = "gemini-3-flash-preview"
+
+
+def prompt_gen_model() -> str:
+    """Text model for prompt writing, verification, and generation QC (not image output)."""
+    return cfg("PROMPT_GEN_MODEL", PROMPT_GEN_MODEL_DEFAULT)
 
 _client = None
 
@@ -77,7 +92,68 @@ def get_gemini_client():
     return _client
 
 
-def _vision_json(system_instruction: str, images: list, context: str) -> dict:
+def _record_metrics(
+    response: Any,
+    *,
+    agent: str,
+    model: str,
+    metrics: "Optional[StepMetrics]" = None,
+    image_count: int = 0,
+    latency_ms: Optional[int] = None,
+    provider: str = "gemini",
+    user_id: Optional[int] = None,
+    guest_session_id: Optional[str] = None,
+) -> None:
+    """Record usage for a model response and (when instrumented) accumulate into ``metrics``.
+
+    Always enqueues a usage event via the recorder (non-blocking). When a
+    ``StepMetrics`` accumulator is supplied — the benchmark instrumentation
+    signal — also extract token counts and computed cost into it so the runner
+    can populate the per-step ``BenchmarkStep``.
+    """
+    from app.admin.usage_helpers import record_from_response, tokens_from_usage
+
+    record_from_response(
+        response,
+        agent=agent,
+        model=model,
+        provider=provider,
+        user_id=user_id,
+        guest_session_id=guest_session_id,
+        image_count=image_count,
+        latency_ms=latency_ms,
+    )
+
+    if metrics is not None:
+        usage = getattr(response, "usage_metadata", None) or getattr(response, "usage", None)
+        inp, out = tokens_from_usage(usage)
+        from app.admin.pricing import compute_cost
+
+        cost = compute_cost(
+            model,
+            input_tokens=inp,
+            output_tokens=out,
+            image_count=image_count,
+        )
+        metrics.add(
+            model=model,
+            tokens_in=inp,
+            tokens_out=out,
+            image_count=image_count,
+            cost_usd=cost,
+        )
+
+
+def _vision_json(
+    system_instruction: str,
+    images: list,
+    context: str,
+    *,
+    prompt_model: Optional[str] = None,
+    prompt_thinking: Optional[str] = None,
+    metrics: "Optional[StepMetrics]" = None,
+    agent_tag: str = "bench_vision",
+) -> dict:
     """
     Run a multimodal → JSON request through the active provider.
 
@@ -85,6 +161,12 @@ def _vision_json(system_instruction: str, images: list, context: str) -> dict:
     Claude (when USE_CLAUDE) gets base64 image blocks + the context text and the
     same system prompt; Gemini uses native PIL contents with JSON mime type.
     Both return a parsed dict.
+
+    When ``prompt_model``/``prompt_thinking`` are supplied they override the
+    live ``cfg()`` values (used by the benchmark runner to run many configs
+    concurrently without mutating global state). When ``metrics`` is supplied
+    the call is considered instrumented: usage is recorded and tokens/cost are
+    accumulated into the metrics holder.
     """
     if llm_provider.use_claude():
         blocks = [llm_provider.pil_image_block(im) for im in images]
@@ -92,15 +174,19 @@ def _vision_json(system_instruction: str, images: list, context: str) -> dict:
         return llm_provider.generate_json(system_instruction, blocks)
 
     client = get_gemini_client()
+    _model = prompt_model or prompt_gen_model()
+    _think = prompt_thinking or prompt_thinking_level()
     response = client.models.generate_content(
-        model=PROMPT_GEN_MODEL,
+        model=_model,
         contents=[*images, context],
         config=GenerateContentConfig(
             system_instruction=system_instruction,
             response_mime_type="application/json",
-            thinking_config=ThinkingConfig(thinking_level=prompt_thinking_level()),
+            thinking_config=ThinkingConfig(thinking_level=_think),
         ),
     )
+    if metrics is not None:
+        _record_metrics(response, agent=agent_tag, model=_model, metrics=metrics)
     return _parse_json_response(response.text)
 
 
@@ -136,10 +222,10 @@ def _parse_json_response(text: str | None) -> dict:
     if isinstance(obj, list):
         dict_items = [item for item in obj if isinstance(item, dict)]
         if len(dict_items) == 1:
-            print("[Gemini JSON] unwrapped single-object array response")
+            logger.info("[Gemini JSON] unwrapped single-object array response")
             obj = dict_items[0]
         elif len(dict_items) > 1:
-            print(
+            logger.info(
                 f"[Gemini JSON] merged {len(dict_items)} object array elements"
             )
             merged: dict = {}
@@ -152,7 +238,7 @@ def _parse_json_response(text: str | None) -> dict:
 
     trailing = raw[end:].strip()
     if trailing:
-        print(f"[Gemini JSON] ignored trailing content after JSON ({len(trailing)} chars)")
+        logger.info(f"[Gemini JSON] ignored trailing content after JSON ({len(trailing)} chars)")
 
     return obj
 
@@ -174,6 +260,8 @@ _EVAL_CRITICAL_SECTIONS = (
     "E3_placement_logic",
     "E4_surface_orientation",
     "E5_user_experience",
+    "F1_mark_followthrough",
+    "F2_mark_cleanup",
 )
 
 _EVAL_SECTION_ORDER = (
@@ -193,30 +281,33 @@ _EVAL_SECTION_ORDER = (
     "E3_placement_logic",
     "E4_surface_orientation",
     "E5_user_experience",
+    "F1_mark_followthrough",
+    "F2_mark_cleanup",
 )
 
 
-def _eval_section_passes(value: object) -> bool:
+def _eval_section_passes(value: object, *, strict: bool = False) -> bool:
     normalized = str(value or "").strip().lower()
-    return normalized in {"pass", "na", "n/a", "not_applicable", "not applicable"}
+    if strict:
+        return normalized in {"pass", "na", "n/a", "not_applicable", "not applicable"}
+    return normalized in {
+        "pass",
+        "accepted",
+        "na",
+        "n/a",
+        "not_applicable",
+        "not applicable",
+    }
 
 
 def _eval_section_fails(value: object) -> bool:
     return str(value or "").strip().lower() == "fail"
 
 
-def finalize_evaluation(data: dict) -> tuple[bool, list[str], str | None]:
+def _finalize_evaluation_relaxed(data: dict) -> tuple[bool, list[str], str | None]:
     """
-    Normalize model QC JSON into an approve/reject decision.
-
-    Trust-the-model gate: the verdict is authoritative, and we only OVERRIDE an
-    "approved" verdict when the model itself explicitly marked one or more
-    sections as ``"fail"`` (an internal inconsistency we must catch).
-
-    We deliberately DO NOT treat missing/omitted sections as failures. The model
-    legitimately omits sections that are N/A, and the previous behaviour —
-    requiring all 14 critical keys to be present *and* "pass" — caused chronic
-    false rejections and excessive regeneration retries even on good output.
+    Trust-the-model gate: honour model verdict; override approved only on explicit
+    section ``fail`` (internal inconsistency).
     """
     issues: list[str] = [str(i) for i in (data.get("issues") or [])]
     section_results = data.get("section_results") or {}
@@ -225,16 +316,14 @@ def finalize_evaluation(data: dict) -> tuple[bool, list[str], str | None]:
 
     verdict = str(data.get("verdict") or "").strip().lower()
 
-    # Explicit per-section failures are the authoritative reject signal.
     explicit_fails = [
-        key for key, value in section_results.items() if _eval_section_fails(value)
+        key
+        for key, value in section_results.items()
+        if str(value or "").strip().lower() == "fail"
     ]
     for key in explicit_fails:
         issues.append(f"Section {key} failed quality check")
 
-    # Approve only when the model approved AND did not contradict itself with an
-    # explicit section fail. A "rejected" verdict (with or without section data)
-    # is always honoured.
     approved = verdict == "approved" and not explicit_fails
 
     issues = list(dict.fromkeys(issues))
@@ -248,6 +337,94 @@ def finalize_evaluation(data: dict) -> tuple[bool, list[str], str | None]:
         revised_prompt = revised_prompt.strip()
 
     return approved, issues, revised_prompt
+
+
+def _finalize_evaluation_strict(data: dict) -> tuple[bool, list[str], str | None]:
+    """Strict gate: require critical sections pass; catch analysis/result mismatches."""
+    issues: list[str] = [str(i) for i in (data.get("issues") or [])]
+    section_results = data.get("section_results") or {}
+    section_analysis = data.get("section_analysis") or {}
+
+    if not isinstance(section_results, dict):
+        section_results = {}
+
+    failed_critical = [
+        key
+        for key in _EVAL_CRITICAL_SECTIONS
+        if not _eval_section_passes(section_results.get(key), strict=True)
+    ]
+    if failed_critical:
+        issues.append(
+            f"Critical QC sections failed or missing: {', '.join(failed_critical)}"
+        )
+
+    for key, value in section_results.items():
+        normalized = str(value or "").strip().lower()
+        if normalized == "fail":
+            issues.append(f"Section {key} marked fail in section_results")
+        elif normalized == "accepted":
+            issues.append(
+                f"Section {key} marked accepted but strict mode requires pass or na"
+            )
+
+    if isinstance(section_analysis, dict):
+        for key in _EVAL_SECTION_ORDER:
+            if key not in section_results:
+                continue
+            entry = section_analysis.get(key)
+            if not isinstance(entry, dict):
+                continue
+            analysis_verdict = str(entry.get("verdict") or "").strip().lower()
+            result_verdict = str(section_results.get(key) or "").strip().lower()
+            if analysis_verdict == "fail" and _eval_section_passes(
+                result_verdict, strict=True
+            ):
+                issues.append(
+                    f"Section {key}: section_analysis verdict is fail but section_results is not fail"
+                )
+            if (
+                analysis_verdict in {"pass", "fail", "na", "n/a", "accepted"}
+                and result_verdict
+                and analysis_verdict
+                not in {"na", "n/a", "not_applicable", "not applicable"}
+                and analysis_verdict != result_verdict
+            ):
+                issues.append(
+                    f"Section {key}: verdict mismatch (analysis={analysis_verdict}, results={result_verdict})"
+                )
+
+    verdict = str(data.get("verdict") or "").strip().lower()
+    if verdict == "approved" and failed_critical:
+        issues.append("Model returned approved but critical sections did not pass")
+
+    issues = list(dict.fromkeys(issues))
+    approved = verdict == "approved" and not issues
+
+    revised_prompt = data.get("revised_prompt")
+    if approved:
+        revised_prompt = None
+    elif not isinstance(revised_prompt, str) or not revised_prompt.strip():
+        revised_prompt = None
+    else:
+        revised_prompt = revised_prompt.strip()
+
+    return approved, issues, revised_prompt
+
+
+def finalize_evaluation(data: dict) -> tuple[bool, list[str], str | None]:
+    """
+    Normalize model QC JSON into an approve/reject decision.
+
+    Mode is controlled by ``GEN_EVAL_STRICTNESS`` (default ``relaxed``):
+
+    - **relaxed** — trust the model verdict; only override ``approved`` when a section
+      is explicitly marked ``fail``.
+    - **strict** — require all critical sections to be ``pass``/``na``; treat ``accepted``
+      or missing critical sections as failures; validate analysis/result consistency.
+    """
+    if gen_eval_strictness() == "strict":
+        return _finalize_evaluation_strict(data)
+    return _finalize_evaluation_relaxed(data)
 
 
 def extract_input_quality(data: dict) -> dict | None:
@@ -338,17 +515,17 @@ def log_section_analysis(
 ) -> None:
     """Print structured per-section observations and evaluations."""
     if not isinstance(section_analysis, dict) or not section_analysis:
-        print(f"{prefix} section_analysis: (missing — model did not return structured analysis)")
+        logger.info(f"{prefix} section_analysis: (missing — model did not return structured analysis)")
         return
 
     results = section_results if isinstance(section_results, dict) else {}
-    print(f"{prefix} --- section analysis ---")
+    logger.info(f"{prefix} --- section analysis ---")
     for key in _EVAL_SECTION_ORDER:
         entry = section_analysis.get(key)
         verdict = results.get(key, "?")
         if not isinstance(entry, dict):
             if verdict != "?":
-                print(f"{prefix} {key} [{verdict}]: (no structured analysis)")
+                logger.info(f"{prefix} {key} [{verdict}]: (no structured analysis)")
             continue
 
         verdict = entry.get("verdict") or verdict
@@ -357,16 +534,16 @@ def log_section_analysis(
         gen_obs = (entry.get("generated_observation") or "").strip()
         evaluation = (entry.get("evaluation") or "").strip()
 
-        print(f"{prefix} {key} [{verdict}]")
+        logger.info(f"{prefix} {key} [{verdict}]")
         if aspect:
-            print(f"{prefix}   aspect: {aspect}")
+            logger.info(f"{prefix}   aspect: {aspect}")
         if ref_obs:
-            print(f"{prefix}   reference: {ref_obs}")
+            logger.info(f"{prefix}   reference: {ref_obs}")
         if gen_obs:
-            print(f"{prefix}   generated: {gen_obs}")
+            logger.info(f"{prefix}   generated: {gen_obs}")
         if evaluation:
-            print(f"{prefix}   evaluation: {evaluation}")
-    print(f"{prefix} --- end section analysis ---")
+            logger.info(f"{prefix}   evaluation: {evaluation}")
+    logger.info(f"{prefix} --- end section analysis ---")
 
 
 def evaluate_generation(
@@ -376,6 +553,10 @@ def evaluate_generation(
     prompt_used: str,
     image1_name: str,
     image2_name: str | None = None,
+    *,
+    prompt_model: Optional[str] = None,
+    prompt_thinking: Optional[str] = None,
+    metrics: "Optional[StepMetrics]" = None,
 ) -> tuple[bool, str | None, list[str]]:
     """
     Evaluates the generated image against the Ducon reference(s) and the prompt.
@@ -403,19 +584,23 @@ def evaluate_generation(
         prompt_loader.EVAL_SYSTEM_INSTRUCTION,
         [image1, image2, generated],
         context,
+        prompt_model=prompt_model,
+        prompt_thinking=prompt_thinking,
+        metrics=metrics,
+        agent_tag="bench_eval",
     )
     approved, issues, revised_prompt = finalize_evaluation(data)
 
-    print(f"[Evaluator] verdict={data.get('verdict')}  reason={data.get('reason')}")
+    logger.info(f"[Evaluator] verdict={data.get('verdict')}  reason={data.get('reason')}")
     log_section_analysis(
         data.get("section_analysis"),
         data.get("section_results") or {},
         prefix="[Evaluator]",
     )
     if issues:
-        print(f"[Evaluator] issues: {issues}")
+        logger.info(f"[Evaluator] issues: {issues}")
     if revised_prompt:
-        print(f"[Evaluator] revised_prompt (first 400 chars):\n{revised_prompt[:400]}\n")
+        logger.info(f"[Evaluator] revised_prompt (first 400 chars):\n{revised_prompt[:400]}\n")
 
     return approved, revised_prompt, issues
 
@@ -429,6 +614,9 @@ def evaluate_generation_multi(
     user_space_index: int,
     design_direction_index: int | None = None,
     product_indices: list[int] | None = None,
+    prompt_model: Optional[str] = None,
+    prompt_thinking: Optional[str] = None,
+    metrics: "Optional[StepMetrics]" = None,
 ) -> tuple[bool, str | None, list[str]]:
     """Evaluate a generation against user space, design direction, and product references."""
     prompt_loader.ensure_prompts_loaded()
@@ -461,19 +649,23 @@ def evaluate_generation_multi(
         prompt_loader.EVAL_SYSTEM_INSTRUCTION,
         [*images, generated],
         context,
+        prompt_model=prompt_model,
+        prompt_thinking=prompt_thinking,
+        metrics=metrics,
+        agent_tag="bench_eval",
     )
     approved, issues, revised_prompt = finalize_evaluation(data)
 
-    print(f"[EvaluatorMulti] verdict={data.get('verdict')}  reason={data.get('reason')}")
+    logger.info(f"[EvaluatorMulti] verdict={data.get('verdict')}  reason={data.get('reason')}")
     log_section_analysis(
         data.get("section_analysis"),
         data.get("section_results") or {},
         prefix="[EvaluatorMulti]",
     )
     if issues:
-        print(f"[EvaluatorMulti] issues: {issues}")
+        logger.info(f"[EvaluatorMulti] issues: {issues}")
     if revised_prompt:
-        print(f"[EvaluatorMulti] revised_prompt (first 400 chars):\n{revised_prompt[:400]}\n")
+        logger.info(f"[EvaluatorMulti] revised_prompt (first 400 chars):\n{revised_prompt[:400]}\n")
 
     return approved, revised_prompt, issues
 
@@ -482,6 +674,10 @@ def verify_prompt(
     images: list[Image.Image],
     labels: list[str],
     prompt: str,
+    *,
+    prompt_model: Optional[str] = None,
+    prompt_thinking: Optional[str] = None,
+    metrics: "Optional[StepMetrics]" = None,
 ) -> tuple[bool, list[str], str | None]:
     """
     Pre-generation prompt verifier.  Checks the prompt against the input images
@@ -517,16 +713,20 @@ def verify_prompt(
         prompt_loader.PROMPT_VERIFY_SYSTEM_INSTRUCTION,
         list(images),
         context,
+        prompt_model=prompt_model,
+        prompt_thinking=prompt_thinking,
+        metrics=metrics,
+        agent_tag="bench_verify",
     )
     passed: bool = bool(data.get("passed", False))
     issues: list[str] = data.get("issues") or []
     improved_prompt: str | None = data.get("improved_prompt") if not passed else None
 
-    print(f"[PromptVerifier] passed={passed}  issues={len(issues)}")
+    logger.info(f"[PromptVerifier] passed={passed}  issues={len(issues)}")
     if issues:
-        print(f"[PromptVerifier] issues: {issues}")
+        logger.info(f"[PromptVerifier] issues: {issues}")
     if improved_prompt:
-        print(f"[PromptVerifier] improved_prompt (first 400 chars):\n{improved_prompt[:400]}\n")
+        logger.info(f"[PromptVerifier] improved_prompt (first 400 chars):\n{improved_prompt[:400]}\n")
 
     return passed, issues, improved_prompt
 
@@ -597,8 +797,8 @@ def generate_prompt(
     )
     prompt = data.get("image_generation_prompt", "")
 
-    print(f"[Prompt Generator] operation_type: {data.get('operation_type', 'unknown')}")
-    print(f"[Prompt Generator] generated prompt:\n{prompt}\n")
+    logger.info(f"[Prompt Generator] operation_type: {data.get('operation_type', 'unknown')}")
+    logger.info(f"[Prompt Generator] generated prompt:\n{prompt}\n")
 
     return prompt
 
@@ -610,6 +810,13 @@ def combine_images(
     prompt: str,
     subfolder: str = None,
     aspect_ratio: str | None = None,
+    *,
+    image_model: Optional[str] = None,
+    image_thinking: Optional[str] = None,
+    dry_run: bool = False,
+    metrics: "Optional[StepMetrics]" = None,
+    user_id: Optional[int] = None,
+    guest_session_id: Optional[str] = None,
 ):
     """
     Sends both images and the generated prompt to the configured image generation
@@ -626,14 +833,26 @@ def combine_images(
     aspect_ratio: optional hard ImageConfig lock (e.g. "16:9", "4:3"). When
     omitted the model picks its own ratio, which often mismatches the user's
     space photo — callers should pass the ratio inferred from the input.
+
+    Overrides:
+      image_model / image_thinking — bypass ``cfg()`` reads (per-call config
+        for the benchmark runner). When omitted the live config values are used.
+      dry_run — when True, skip disk writes and return raw PNG ``bytes`` instead
+        of the saved filename. Used by the benchmark runner so no artifacts land
+        on disk/storage/DB.
+      metrics — when supplied, the call is instrumented: usage is recorded and
+        token/cost accumulated into the holder.
+
+    Return:
+      ``str`` filename (default) or ``bytes`` PNG (when ``dry_run=True``).
     """
     client = get_gemini_client()
 
-    _model = image_gen_model()
+    _model = image_model or image_gen_model()
     is_nano_banana_2 = _model == _NANO_BANANA_2
-    _think = image_thinking_level()
-    print(f"[ImageGen] model={_model!r}  is_nano_banana_2={is_nano_banana_2}  "
-          f"image_thinking_level={_think!r}  aspect_ratio={aspect_ratio!r}")
+    _think = image_thinking or image_thinking_level()
+    logger.info(f"[ImageGen] model={_model!r}  is_nano_banana_2={is_nano_banana_2}  "
+          f"image_thinking_level={_think!r}  aspect_ratio={aspect_ratio!r}  dry_run={dry_run}")
 
     config = GenerateContentConfig(
         response_modalities=[Modality.TEXT, Modality.IMAGE],
@@ -644,27 +863,54 @@ def combine_images(
         ) if is_nano_banana_2 else None,
     )
 
+    t0 = time.perf_counter()
     response = client.models.generate_content(
         model=_model,
         contents=[image1, image2, prompt],
         config=config,
     )
+    latency_ms = int((time.perf_counter() - t0) * 1000)
 
-    from app.admin.usage_helpers import record_from_response
-    record_from_response(response, agent="image_gen", model=_model, image_count=1)
+    # Always record usage; accumulate into metrics when instrumented.
+    _record_metrics(
+        response,
+        agent="image_gen" if metrics is None else "bench_image",
+        model=_model,
+        metrics=metrics,
+        image_count=1,
+        latency_ms=latency_ms,
+        user_id=user_id,
+        guest_session_id=guest_session_id,
+    )
 
     if is_nano_banana_2:
         for part in response.candidates[0].content.parts:
             if getattr(part, "thought", False) and part.text:
-                print(f"[NB2 Thought]\n{part.text}\n")
+                logger.info(f"[NB2 Thought]\n{part.text}\n")
+
+    if dry_run:
+        return _extract_png_bytes(response)
 
     return save_image(filename, response=response, subfolder=subfolder)
+
+
+def _extract_png_bytes(response) -> bytes:
+    """Pull the first inline image part out of a Gemini response as PNG bytes."""
+    for part in response.candidates[0].content.parts:
+        if getattr(part, "inline_data", None) and part.inline_data.data:
+            # Re-encode through PIL so callers always get PNG regardless of the
+            # raw mime the model returned.
+            img = Image.open(BytesIO(part.inline_data.data))
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            return buf.getvalue()
+    raise RuntimeError("Gemini returned no image data.")
 
 
 def save_image(filename: str, response, subfolder: str = None):
     for part in response.candidates[0].content.parts:
         if part.text:
-            print(part.text)
+            logger.info(part.text)
         elif part.inline_data:
             image = Image.open(BytesIO(part.inline_data.data))
             output_dir = os.path.join("outputs", subfolder) if subfolder else "outputs"
@@ -674,27 +920,63 @@ def save_image(filename: str, response, subfolder: str = None):
             return filename
 
 
-def generate_image(prompt: str = None):
-    """Standalone text-to-image generation for testing."""
+def generate_image(
+    prompt: str = None,
+    *,
+    image_model: Optional[str] = None,
+    image_thinking: Optional[str] = None,
+    aspect_ratio: Optional[str] = None,
+    dry_run: bool = False,
+    metrics: "Optional[StepMetrics]" = None,
+):
+    """Standalone text-to-image generation for testing.
+
+    When ``dry_run=True`` returns raw PNG ``bytes`` instead of writing to disk.
+    """
     if not prompt:
-        print("no prompt given")
+        logger.info("no prompt given")
         return
     client = get_gemini_client()
-    response = client.models.generate_content(
-        model=image_gen_model(),
-        contents=prompt,
-        config=GenerateContentConfig(
-            response_modalities=[Modality.TEXT, Modality.IMAGE],
-        ),
+    _model = image_model or image_gen_model()
+    _think = image_thinking or image_thinking_level()
+    is_nano_banana_2 = _model == _NANO_BANANA_2
+
+    config = GenerateContentConfig(
+        response_modalities=[Modality.TEXT, Modality.IMAGE],
+        image_config=ImageConfig(aspect_ratio=aspect_ratio) if aspect_ratio else None,
+        thinking_config=ThinkingConfig(
+            thinking_level=_think,
+            include_thoughts=True,
+        ) if is_nano_banana_2 else None,
     )
+
+    t0 = time.perf_counter()
+    response = client.models.generate_content(
+        model=_model,
+        contents=prompt,
+        config=config,
+    )
+    latency_ms = int((time.perf_counter() - t0) * 1000)
+    _record_metrics(
+        response,
+        agent="image_gen" if metrics is None else "bench_image",
+        model=_model,
+        metrics=metrics,
+        image_count=1,
+        latency_ms=latency_ms,
+    )
+
+    if dry_run:
+        return _extract_png_bytes(response)
     save_image("test.png", response=response)
+    return
 
 
 def list_available_models():
     client = get_gemini_client()
     for model in client.models.list():
         if "image" in model.name.lower():
-            print(model.name)
+            logger.info(model.name)
 
 
 async def _single_quotation_call(
@@ -718,7 +1000,7 @@ async def _single_quotation_call(
         result = _parse_json_response(response.text)
         from app.admin.usage_helpers import record_from_response
         record_from_response(response, agent="quotation", model=quotation_model())
-        print(
+        logger.info(
             f"[Quotation {pass_label}] "
             f"area_items={len(result.get('area_measurements', []))}  "
             f"fixed_items={len(result.get('fixed_items', []))}"
@@ -800,7 +1082,7 @@ async def analyze_quotation(
             ("C", ctx_without_ref, "WITHOUT reference measurements (visual anchors only)"),
             ("D", ctx_without_ref, "WITHOUT reference measurements (visual anchors only)"),
         ]
-        print("[Quotation] launching 4 concurrent passes (2 with reference, 2 without)…")
+        logger.info("[Quotation] launching 4 concurrent passes (2 with reference, 2 without)…")
     else:
         # No reference supplied — all 4 passes use visual anchors only.
         pass_configs = [
@@ -809,7 +1091,7 @@ async def analyze_quotation(
             ("C", ctx_without_ref, "WITHOUT reference measurements (visual anchors only)"),
             ("D", ctx_without_ref, "WITHOUT reference measurements (visual anchors only)"),
         ]
-        print("[Quotation] launching 4 concurrent passes (no reference provided)…")
+        logger.info("[Quotation] launching 4 concurrent passes (no reference provided)…")
 
     # ── Step 1: four concurrent independent passes ────────────────────────────
     raw_results = await asyncio.gather(
@@ -826,12 +1108,12 @@ async def analyze_quotation(
         if isinstance(result, dict):
             labelled.append((label, description, result))
         else:
-            print(f"[Quotation {label}] failed — {result}")
+            logger.info(f"[Quotation {label}] failed — {result}")
 
     if not labelled:
         raise ValueError("All 4 quotation analysis passes failed.")
     if len(labelled) == 1:
-        print("[Quotation] only 1 pass succeeded — returning without synthesis")
+        logger.info("[Quotation] only 1 pass succeeded — returning without synthesis")
         return labelled[0][2]
 
     # ── Step 2: synthesis pass ────────────────────────────────────────────────
@@ -855,7 +1137,7 @@ async def analyze_quotation(
         )
     synthesis_context = "\n".join(synthesis_parts)
 
-    print(f"[Quotation] running synthesis pass over {len(labelled)} results…")
+    logger.info(f"[Quotation] running synthesis pass over {len(labelled)} results…")
     prompt_loader.ensure_prompts_loaded()
     synthesis_response = await client.aio.models.generate_content(
         model=quotation_model(),
@@ -874,7 +1156,7 @@ async def analyze_quotation(
             f"Synthesis pass returned non-JSON: {synthesis_response.text[:200]}"
         ) from exc
 
-    print(
+    logger.info(
         f"[Quotation] synthesis complete — "
         f"area_items={len(final.get('area_measurements', []))}  "
         f"fixed_items={len(final.get('fixed_items', []))}"
@@ -886,9 +1168,11 @@ def __getattr__(name: str):
     """Lazy backward-compatible aliases (read live config via cfg())."""
     _aliases = {
         "IMAGE_GEN_MODEL": image_gen_model,
+        "PROMPT_GEN_MODEL": prompt_gen_model,
         "QUOTATION_MODEL": quotation_model,
         "PROMPT_VERIFY_MAX_ROUNDS": prompt_verify_max_rounds,
         "GEN_EVAL_MAX_ROUNDS": gen_eval_max_rounds,
+        "GEN_EVAL_STRICTNESS": gen_eval_strictness,
         "_PROMPT_THINKING_LEVEL": prompt_thinking_level,
         "_IMAGE_THINKING_LEVEL": image_thinking_level,
         "_QUOTATION_THINKING_LEVEL": quotation_thinking_level,

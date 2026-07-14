@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -103,7 +104,23 @@ async def issue_otp(
     db.add(record)
     await db.commit()
 
-    send_otp_email(email, otp, purpose)
+    # Resend HTTP call is blocking — offload so the async route doesn't stall
+    # the event loop (and other in-flight requests) while waiting on the API.
+    # email_service throttles + retries 429s; daily Resend quota cannot be queued.
+    try:
+        await asyncio.to_thread(send_otp_email, email, otp, purpose)
+    except Exception:
+        # Drop the unused OTP so the per-email cooldown does not block a retry
+        # after a transient Resend failure. Other users' OTPs are untouched.
+        await db.execute(
+            delete(EmailOtp).where(
+                EmailOtp.email == email,
+                EmailOtp.purpose == purpose,
+                EmailOtp.verified_at.is_(None),
+            )
+        )
+        await db.commit()
+        raise
 
 
 async def verify_otp(

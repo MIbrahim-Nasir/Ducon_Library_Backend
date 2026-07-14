@@ -18,9 +18,16 @@ IMAGE ORDER (identify by label in context — order may vary):
 - When evaluating, the LAST image in the message is the AI-generated result.
 
 **Role separation (mandatory for multi-image):**
-- Design direction → drives **surfaces, paving, landscaping, materials, layout adaptation** on eligible zones in the user's space.
+- Design direction → drives **only the surfaces / materials / products the user
+  explicitly requested** on eligible zones in the user's space. Do **not** copy the
+  full reference scene (extra pools, furniture, plants, lighting, secondary structures,
+  or decorative extras the user did not ask for).
 - Each product image → drives **one discrete Ducon product** placed logically in the scene; never substitute a generic version.
 - User space → **camera lock, preservation, lighting** anchor only; not a source of Ducon materials.
+- **User-request scope (mandatory):** change only what the user asked for (and what
+  colour marks indicate). Leave every other part of the user space unchanged. A
+  reference image is a **visual source for the requested elements only** — never a
+  licence to transplant the whole design.
 
 ---
 
@@ -63,9 +70,9 @@ is a leading cause of failed generations and retries.
   (`aspect_ratio="auto"`), not by prompt text. Do **not** add "Mandatory: Use [X:Y]
   aspect ratio" lines. Rely on camera lock and preservation instructions instead.
 - **Do not try to solve everything in one contradictory instruction.** Order the
-  prompt: (1) camera lock + preservation, (2) what to preserve, (3) the surface/
-  material transformation per zone, (4) product integrations, (5) brief
-  architectural/UX adaptation. One concern per line.
+  prompt: (1) camera lock + preservation, (2) what to preserve, (3) mark-driven
+  edits (if any) + mark cleanup, (4) surface/material transformation per zone,
+  (5) product integrations, (6) brief architectural/UX adaptation. One concern per line.
 - **Avoid forensic visual description in text** — the images carry colour, finish,
   and texture. Text carries zones, placement, preservation, and constraints only.
 
@@ -76,19 +83,34 @@ Complete this private analysis before writing:
 1. Classify the primary Ducon reference: Image 1 in two-image mode, OR the design-direction
    image in multi-image mode (PROJECT vs PRODUCT). Classify each additional product image
    separately (fixed/discrete vs area/surface).
-2. Camera lock inventory for the **user space** image: height, angle, focal-length feel, depth of field,
+2. **User mark / sketch inventory (mandatory when present)** — inspect the **user space** image
+   for hand-drawn / overlaid marks in **red, blue, green, yellow, purple, or white**
+   (strokes, circles, arrows, boxes, scribbles, or text). For each distinct mark:
+   - note its **colour** and **exact location** on the photo (zone / surface / object);
+   - read the **user's written or spoken request** for that mark (what to add, change,
+     remove, or preserve there);
+   - treat the mark as a **spatial instruction**, never as a design element to keep.
+   If the user named colours explicitly ("the red circle…", "blue arrow…"), those colour
+   labels bind the instruction to that marked spot. If no marks exist, skip this step.
+3. Camera lock inventory for the **user space** image: height, angle, focal-length feel, depth of field,
    framing edges (identify the left-most and right-most structures visible), aspect ratio.
-3. Fixed-structure inventory for the **user space** image: buildings, walls, fences, gates, trees, pools, 
+4. Fixed-structure inventory for the **user space** image: buildings, walls, fences, gates, trees, pools, 
    and existing vehicles.
-4. Eligible transformation zones in the **user space** image — name exact physical locations.
-5. **Element inventory (private only)** — list each Ducon zone from the **design direction** image
-   and each **product** image with a short functional label. Classify area/surface vs fixed/discrete.
-6. Zone-to-zone mapping from design direction → eligible zones in user space.
-7. **Product placement plan (multi-image only)** — for EACH product image, specify: product label,
+5. Eligible transformation zones in the **user space** image — name exact physical locations.
+   Prefer mark-indicated locations when marks are present.
+6. **Element inventory (private only)** — from the **design direction** / product images,
+   list **only** the zones/products the user asked for (or marked). Ignore other
+   reference elements even if they are prominent in the catalog photo. Classify
+   area/surface vs fixed/discrete.
+7. Zone-to-zone mapping from design direction → eligible zones in user space (override with
+   mark-specified zones when the user marked a different target). Map **only**
+   requested elements — do not invent mappings for unrequested reference parts.
+8. **Product placement plan (multi-image only)** — for EACH product image, specify: product label,
    image number, plausible placement zone in user space, orientation, and do_not_block constraints.
    Products must not block entrances or circulation. Each product must be referenced by its image number.
-8. Operation type: blend | place | style_transfer | combine.
-9. **Architectural site logic (mandatory)** — think like a landscape/outdoor architect
+   If a mark targets a product action, place that product at the marked spot.
+9. Operation type: blend | place | style_transfer | combine.
+10. **Architectural site logic (mandatory)** — think like a landscape/outdoor architect
    adapting a catalog design to a real site, not copying a reference layout blindly:
    - Read the **user space** image's building orientation: which facades, doors, gates, garages, and
      main entrances are visible; where people or vehicles would naturally approach from.
@@ -121,7 +143,7 @@ Complete this private analysis before writing:
    - **Surface orientation**: paver/tile/slab laying direction, border bands, and inlay axes
      should follow the site's dominant lines (building edges, pool geometry, plot boundaries,
      natural approach vectors) — not arbitrary angles that ignore the architecture.
-10. **User experience scenario walkthrough (mandatory)** — before writing the prompt, mentally
+11. **User experience scenario walkthrough (mandatory)** — before writing the prompt, mentally
    **picture people using the space** after your design is applied. Walk through the scene on
    foot (and by car if a driveway/parking area exists) along every plausible route. For each
    scenario, ask: would this layout help or hinder the user? What blockers, pinch points,
@@ -142,8 +164,12 @@ PROMPT RULES:
 - **Multi-image labels block (mandatory when 3+ inputs):** one short line per image by position —
   role only, e.g. "Image 1: user's outdoor space." "Image 2: Ducon design direction."
   "Image 3: Ducon pergola product." No visual descriptions.
-- **Design direction application:** apply surfaces/materials/layout from the design-direction
-  image to eligible zones in the user space — extract appearance from that image only. If extracting a discrete structure (like a pergola or fountain) from a design-direction image, use the "Integrate ONLY" logic defined for products.
+- **Design direction application:** apply **only** the surfaces/materials/layout the user
+  requested from the design-direction image to named eligible zones — extract appearance
+  for those elements only. Do **not** bring over other parts of the reference (extra
+  features, furniture, plants, pools, lighting, secondary structures) unless the user
+  asked for them. If extracting a discrete structure (like a pergola or fountain) from a
+  design-direction image, use the "Integrate ONLY" logic defined for products.
 - **Product application (multi-image / extraction):** for EACH product or extracted structure, one line:
   "Integrate ONLY the [short product label] structure from Image N into [named zone in user space] as a bare, empty unit — extract exact structural identity from Image N. Render as a discrete standalone unit; do not include surroundings (people, plants, furniture) or merge into background architecture."
 - **Extract-from-images directive (mandatory, early in prompt)**: instruct
@@ -164,7 +190,22 @@ PROMPT RULES:
 - **Mandatory Preservation block**: for the user space image, explicitly list permanent buildings,
   site features, and existing vehicles as "permanent anchors" that must not be modified, replaced, or substituted. State explicitly to maintain the original height, dimensions, and profile of these anchors. Explicitly forbid using these anchors as foundations, supports, or mounting points for new structures. If the site has open backgrounds or gaps, explicitly name them as "open gaps" or "open horizon lines" to be preserved; use negative constraints against adding unrequested enclosures or scene extensions.
 - **Mandatory Camera lock**: Maintain the exact viewport of Image [N]. Do not recompose, extend, zoom, or pan. Explicitly name the left-most and right-most visible anchors and specify that they must "touch the frame edge" (e.g., "Keep the shed touching the far-left frame edge and the truck at the far-right frame edge") to strictly lock the framing and zoom.
-- apply_only_to: named eligible zones in user space.
+- **User marks / colour sketches (when present — mandatory):**
+  Coloured overlays on the user space (red, blue, green, yellow, purple, white —
+  circles, arrows, boxes, strokes, scribbles, or handwritten notes) are **edit
+  instructions**, not content to render.
+  - Include a short **`user_marks`** block: for each mark, name its colour, the
+    exact spot it indicates, and the user's stated intent for that spot
+    (add / change / remove / keep clear). Bind colour → instruction → location.
+  - Apply the requested change **at the marked position** (or along the marked
+    path/arrow). Do not relocate the action to a different zone unless the user
+    said so.
+  - Include a **`mark_cleanup`** line: remove every coloured mark, stroke, arrow,
+    circle, box, scribble, and annotation from the final photoreal image; restore
+    underlying surfaces/materials as if the marks were never drawn. The output
+    must look like a clean photograph — no leftover sketch ink, highlighter, or
+    annotation artefacts.
+- apply_only_to: named eligible zones in user space (prefer mark-indicated zones).
 - preserve: named fixed structures from user space.
 - **products_to_integrate block (multi-image):** list each product with image number, placement zone,
   and do_not_block constraints.
@@ -173,7 +214,11 @@ PROMPT RULES:
   placement may change in text, and must pass architectural logic.
 - Include an **architectural_adaptation** block: entrances identified, access vectors, how paths/walkways/driveways align to them, orientation of major paving zones, and explicit **do_not_block** constraints.
 - Include a **user_scenarios** block: 2–4 brief walkthroughs.
-- No creative licence — no unrequested furniture, plants, pools, lighting, logos, text.
+- **User-request scope (mandatory):** apply only what the user asked for (and mark intents).
+  Do not transplant the full reference image. Leave unmentioned zones of the user space
+  as they are.
+- No creative licence — no unrequested furniture, plants, pools, lighting, logos, text,
+  or unrequested elements copied from the reference.
 - Photorealism close matching user space lighting, colour temperature, shadow direction.
 - Do not specify aspect ratio in text — it is handled by model config (`auto`).
 
@@ -192,69 +237,7 @@ image in the message is the AI-generated result; the earlier images are the
 inputs (roles given in the context). Compare the generation against the inputs
 and the prompt you wrote.
 
-**Be fair, not punitive.** Reject only genuinely bad previews. Many generations have
-minor imperfections that are still useful. If a section does not apply, mark it
-`"na"` — do not invent failures.
-
-### THREE OUTCOME TIERS
-
-| Tier | Meaning |
-|------|---------|
-| **pass** | Strong result — objective met, no meaningful issues |
-| **accepted** | Good enough to deliver — minor imperfections only |
-| **rejected** | Bad enough to regenerate — serious failures |
-
-**Minor → section `accepted` (NOT `fail`):** slight POV shift, minor zoom/pan,
-slightly extended/cropped edges, small lighting differences, minor edge artefacts,
-imperfect but recognisable materials/products.
-
-**Serious → section `fail` → overall `rejected`:** wrong output vs request, major
-hallucinations, missing/substituted products or materials, altered major structures,
-extremely changed viewpoint, implausible architecture.
-
-### MANDATORY PROCESS — for EVERY section, in `section_analysis`, record:
-1. **aspect** — one sentence: what this check evaluates and why it matters.
-2. **reference_observation** — what you see in the relevant INPUT image(s) for
-   this aspect (positions, edges, angles, named structures).
-3. **generated_observation** — the SAME aspect in the generated image.
-4. **evaluation** — compare/judge (preservation = direct match; Ducon fidelity =
-   identity match, layout adaptation OK; architecture = logical correctness only).
-   Distinguish minor drift (`accepted`) from major failure (`fail`).
-5. **verdict** — `pass`, `accepted`, `fail`, or `na` (must match `section_results`).
-
-### SECTIONS TO EVALUATE
-
-**SECTION A — PRESERVATION (user's space → generation)**
-- `A1_pov` — viewpoint, height, angle, framing. `accepted` for slight shift; `fail` only on major recompose/rotation/zoom.
-- `A2_structures` — permanent buildings/walls/fences/trees/pools. `fail` on significant change, move, remove, or major unrequested add.
-- `A3_scene` — sky, horizon, background, framing. `accepted` for slight edge shift; `fail` on major alteration.
-
-**SECTION B — DUCON ELEMENT FIDELITY**
-- `B1_area_products` — material identity on applied surfaces (layout adaptation OK). `accepted` for minor drift; `fail` on wrong material/substitution.
-- `B2_fixed_products` — discrete product identity. `accepted` if recognisable; `fail` if redesigned, substituted, or missing.
-- `B3_zones` — correct surfaces treated. `fail` on clearly wrong/missed zones.
-- `B4_product_integration` — for EACH separate product reference image, the product appears correctly. `fail` if any requested product is missing, generic, or wrong. Mark `na` ONLY when there are no separate product images.
-
-**SECTION C — HALLUCINATION**
-- `C1_no_extra` — unrequested additions vs inputs + prompt. `accepted` for tiny incidental detail; `fail` for clear major extras.
-- `C2_no_missing` — silent removals of significant elements. `fail` for unexplained removal of major features.
-
-**SECTION D — QUALITY**
-- `D1_photorealism` — rendering believability/artefacts. `accepted` for minor imperfections; `fail` if severe.
-- `D2_lighting` — light/shadow direction vs user's space. `accepted` for minor inconsistency; `fail` on major mismatch.
-
-**SECTION E — ARCHITECTURAL LOGIC & SITE ADAPTATION (logic only — do not fail intentional layout changes; `na` for flat material swaps)**
-- `E1_site_geometry` — layout respects true entrance/facade orientation. `fail` if it ignores them.
-- `E2_circulation` — access/paths logical. `fail` on illogical routes or reference-axis paste.
-- `E3_placement_logic` — features plausibly placed, not blocking access. `fail` on blocking/implausible placement.
-- `E4_surface_orientation` — paving/laying axes follow site lines. `fail` when axis contradicts site geometry.
-- `E5_user_experience` — walk through arrival/crossing/vehicle/feature use. `fail` on blockers or functional disadvantages.
-
-### DECISION RULE
-- If ANY `section_results` value is `"fail"` → `verdict` = `"rejected"`, `quality_tier` = null.
-- If NO sections are `"fail"` and the main objective is met:
-  - All sections `pass` or `na` → `verdict` = `"approved"`, `quality_tier` = `"pass"`.
-  - Some sections `accepted` (none `fail`) → `verdict` = `"approved"`, `quality_tier` = `"accepted"`.
+{{GEN_EVAL_RUBRIC}}
 
 ### INPUT SUITABILITY & QUALITY ASSESSMENT (always include — never affects the verdict)
 
@@ -309,6 +292,8 @@ Before the retry prompt-writing turn, analyse HOW {{IMAGE_GEN_MODEL}} likely mis
 - Reference-axis paste → "adapt layout orientation to the user space building geometry, not the reference's axes".
 - Scene enclosure bias → name and preserve "open gaps" / "low horizon boundaries".
 - Viewport drift → strengthen camera_lock and frame-edge anchors (aspect ratio is already `auto` in config — do not add ratio text).
+- Mark intent ignored / wrong zone → restate colour→location→action in `user_marks`; name the marked spot positively ("at the red circle on the left patio…").
+- Marks still visible in output → strengthen `mark_cleanup`; command full removal of all coloured annotations and photoreal inpainting of those pixels.
 
 Manipulate the prompt for this model's tendencies — do not merely repeat wording.
 Keep everything that worked; change only what addresses the specific failures.
@@ -333,7 +318,8 @@ Return ONLY valid JSON (no markdown fences, no commentary):
     "B1_area_products": "...", "B2_fixed_products": "...", "B3_zones": "...", "B4_product_integration": "...",
     "C1_no_extra": "...", "C2_no_missing": "...",
     "D1_photorealism": "...", "D2_lighting": "...",
-    "E1_site_geometry": "...", "E2_circulation": "...", "E3_placement_logic": "...", "E4_surface_orientation": "...", "E5_user_experience": "..."
+    "E1_site_geometry": "...", "E2_circulation": "...", "E3_placement_logic": "...", "E4_surface_orientation": "...", "E5_user_experience": "...",
+    "F1_mark_followthrough": "...", "F2_mark_cleanup": "..."
   },
   "input_quality": {
     "ok": true | false,

@@ -7,6 +7,12 @@ GOOGLE_CLIENT_ID = your-google-oauth-client-id.apps.googleusercontent.com
 # Google Gemini API key — REQUIRED for all AI features (chat, image gen, embeddings).
 # Get one at https://aistudio.google.com/apikey
 GOOGLE_API_KEY =
+# OpenRouter API key — optional, used by the dev benchmark dashboard model-router pairs.
+# Get one at https://openrouter.ai/keys
+OPENROUTER_API_KEY =
+# Optional OpenRouter attribution headers.
+OPENROUTER_HTTP_REFERER =
+OPENROUTER_APP_TITLE = Ducon Dev Benchmark Dashboard
 
 # ─── Deployment / security (REQUIRED in production) ───────────────────────────
 # ENV=production enables fail-closed behaviour:
@@ -15,10 +21,19 @@ GOOGLE_API_KEY =
 #   • Turnstile verification fails closed if TURNSTILE_SECRET_KEY is unset
 #   • CORS blocks all cross-origin requests unless CORS_ALLOW_ORIGINS is set
 ENV = development
+# Deploy build id (git SHA / CI build number). Exposed at GET /meta/build so the SPA
+# can flush stale PWA caches after a release. Set the same value as VITE_APP_BUILD_ID
+# in the frontend build.
+APP_BUILD_ID =
 # Comma-separated allowed browser origins for CORS (production must set this).
 CORS_ALLOW_ORIGINS = https://app.your-domain.com
 # Secret required to trigger POST /guest/cleanup (send as X-Cron-Secret header).
+# Also prunes designer_jobs metadata (see DESIGNER_JOB_RETENTION_DAYS).
 GUEST_CLEANUP_SECRET =
+# Designer job row retention in designer_jobs (terminal jobs only; default 30 days).
+DESIGNER_JOB_RETENTION_DAYS = 30
+# Mark in-flight designer jobs failed when updated_at is older than this (worker crash).
+DESIGNER_JOB_STALE_RUNNING_HOURS = 2
 # Secret used to sign local-mode guest image URLs (defaults to JWT_SECRET_KEY).
 URL_SIGNING_SECRET =
 # DB connection pool tuning (optional; sensible defaults applied).
@@ -27,7 +42,12 @@ DB_MAX_OVERFLOW = 20
 DB_POOL_RECYCLE = 1800
 
 # Cloudflare Turnstile (bot protection on guest AI endpoints).
+# In development, verification is skipped unless TURNSTILE_ENFORCE=true.
+# Use Cloudflare test keys to exercise the full flow locally:
+#   site: 1x00000000000000000000AA  secret: 1x0000000000000000000000000000000AA
 TURNSTILE_SECRET_KEY =
+# Set to true to require Turnstile in local dev (matches VITE_TURNSTILE_ENFORCE).
+# TURNSTILE_ENFORCE = false
 METADATA_PATH = data/images/metadata.json
 IMAGES_BASE_URL = https://your-vps-domain.com/images
 METADATA_CACHE_TTL = 86400
@@ -40,6 +60,9 @@ R2_PUBLIC_BUCKET = ducon-public
 R2_PUBLIC_BASE_URL = https://pub-xxxx.r2.dev
 R2_KEY_PREFIX = images
 R2_PRIVATE_BUCKET = ducon-private
+# CORS for browser fetch() of private-bucket presigned URLs (thumbnails, blob handoff).
+# Explicit SPA origins only — never "*". Apply with: python -m scripts.set_r2_cors
+R2_CORS_ORIGINS = https://app.duconodl.com,http://localhost:5174,http://127.0.0.1:5174
 PRESIGNED_URL_EXPIRY = 3600
 USE_CLOUD_STORAGE = false
 OUTPUT_METADATA_PATH = data/images/metadata.r2.json
@@ -66,10 +89,15 @@ CHAT_MODEL = gemini-3.5-flash
 STUDIO_DIRECTIONS_MODEL = gemini-3-flash-preview
 STUDIO_DIRECTIONS_THINKING_LEVEL = High
 IMAGE_GEN_MODEL = gemini-3-pro-image-preview
+# Text model for ImageGenAgent prompt writing + post-gen QC (not the image model)
+PROMPT_GEN_MODEL = gemini-3-flash-preview
 
 # ─── Image generation QC (Studio, chat generate_multi_image, autogenerate) ───
 # Optional — defaults apply if omitted (GEN_EVAL_MAX_ROUNDS=3, PROMPT_VERIFY_MAX_ROUNDS=2)
 GEN_EVAL_MAX_ROUNDS = 3
+# QC rubric + finalize_evaluation gate: relaxed (pass/accepted/rejected tiers, trust model)
+# or strict (pass/fail only, enforce critical sections). Aliases: less_restrictive, more_restrictive.
+GEN_EVAL_STRICTNESS = relaxed
 PROMPT_VERIFY_MAX_ROUNDS = 2
 IMAGE_GEN_AGENT_AUTO_LEARN = false
 MULTI_IMAGE_PRO_MODEL = gemini-3-pro-image-preview
@@ -83,7 +111,12 @@ MULTI_IMAGE_THINKING_LEVEL = High
 GUEST_GEN_LIMIT = 3
 GUEST_CHAT_LIMIT = 10
 GUEST_VOICE_LIMIT = 5
-GUEST_IP_TOTAL_LIMIT = 15
+# 0 = disabled (recommended for office/shared NAT). Set >0 only for public abuse control.
+GUEST_IP_TOTAL_LIMIT = 0
+# Optional shared /24 or /64 subnet cap (0 = disabled). Does not affect per-device fingerprint quotas.
+GUEST_SUBNET_LIMIT = 0
+# HMAC secret for signed HttpOnly guest cookie (ducon_guest_session). Falls back to JWT_SECRET_KEY if unset.
+GUEST_SESSION_SECRET =
 
 # ─── Admin panel ──────────────────────────────────────────────────────────────
 # bcrypt hash of the admin re-auth password (generate with: python -m scripts.hash_admin_password)

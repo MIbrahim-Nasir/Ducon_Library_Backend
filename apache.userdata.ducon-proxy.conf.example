@@ -1,0 +1,73 @@
+# HostGator / cPanel userdata snippet for app.duconodl.com (SSL vhost include).
+# Path:
+#   /etc/apache2/conf.d/userdata/ssl/2_4/appducon/app.duconodl.com/ducon-proxy.conf
+#
+# Do NOT wrap in <VirtualHost> — cPanel already includes this inside the vhost.
+# After editing:
+#   /scripts/ensure_vhost_includes --user=appducon
+#   /scripts/rebuildhttpdconf
+#   apachectl configtest && /scripts/restartsrv_httpd
+#
+# NOTE: ProxyTimeout is vhost-level only on this Apache build (not in LocationMatch).
+
+ProxyPreserveHost On
+ProxyRequests Off
+LimitRequestBody 62914560
+ProxyTimeout 600
+
+# WebSocket (voice)
+RewriteEngine On
+RewriteCond %{HTTP:Upgrade} websocket [NC]
+RewriteCond %{HTTP:Connection} upgrade [NC]
+RewriteRule ^/ws/(.*)$ ws://127.0.0.1:8000/ws/$1 [P,L]
+ProxyPass        /ws/ ws://127.0.0.1:8000/ws/
+ProxyPassReverse /ws/ ws://127.0.0.1:8000/ws/
+
+# SSE — flushpackets required or Cloudflare idle-kills (~100s)
+ProxyPass        /generate-multi-image http://127.0.0.1:8000/generate-multi-image flushpackets=on
+ProxyPassReverse /generate-multi-image http://127.0.0.1:8000/generate-multi-image
+ProxyPass        /studio/directions    http://127.0.0.1:8000/studio/directions flushpackets=on
+ProxyPassReverse /studio/directions    http://127.0.0.1:8000/studio/directions
+ProxyPass        /chat                 http://127.0.0.1:8000/chat flushpackets=on
+ProxyPassReverse /chat                 http://127.0.0.1:8000/chat
+
+ProxyPassMatch ^(/designer/jobs/.+/events)$ http://127.0.0.1:8000$1 flushpackets=on
+ProxyPassMatch ^(/generation/jobs/.+/events)$ http://127.0.0.1:8000$1 flushpackets=on
+ProxyPass        /generation http://127.0.0.1:8000/generation
+ProxyPassReverse /generation http://127.0.0.1:8000/generation
+ProxyPass        /designer   http://127.0.0.1:8000/designer
+ProxyPassReverse /designer   http://127.0.0.1:8000/designer
+
+<LocationMatch "^/(generate-multi-image|studio/directions|chat|designer/jobs/.+/events|generation/jobs/.+/events)">
+    SetEnv no-gzip 1
+    SetEnv no-brotli 1
+    Header always set Cache-Control "no-cache, no-transform"
+</LocationMatch>
+
+<IfModule mod_deflate.c>
+    SetEnvIfNoCase Request_URI "^/(generate-multi-image|studio/directions|chat|generation/)" no-gzip dont-vary
+</IfModule>
+
+# REST
+ProxyPass /auth http://127.0.0.1:8000/auth
+ProxyPassReverse /auth http://127.0.0.1:8000/auth
+ProxyPass /bookmarks http://127.0.0.1:8000/bookmarks
+ProxyPassReverse /bookmarks http://127.0.0.1:8000/bookmarks
+ProxyPass /generations http://127.0.0.1:8000/generations
+ProxyPassReverse /generations http://127.0.0.1:8000/generations
+ProxyPass /guest http://127.0.0.1:8000/guest
+ProxyPassReverse /guest http://127.0.0.1:8000/guest
+ProxyPass /images http://127.0.0.1:8000/images
+ProxyPassReverse /images http://127.0.0.1:8000/images
+ProxyPass /public http://127.0.0.1:8000/public
+ProxyPassReverse /public http://127.0.0.1:8000/public
+ProxyPass /quotation http://127.0.0.1:8000/quotation
+ProxyPassReverse /quotation http://127.0.0.1:8000/quotation
+ProxyPass /search http://127.0.0.1:8000/search
+ProxyPassReverse /search http://127.0.0.1:8000/search
+ProxyPass /contact http://127.0.0.1:8000/contact
+ProxyPassReverse /contact http://127.0.0.1:8000/contact
+ProxyPass /meta http://127.0.0.1:8000/meta
+ProxyPassReverse /meta http://127.0.0.1:8000/meta
+ProxyPass /admin/ http://127.0.0.1:8000/admin/
+ProxyPassReverse /admin/ http://127.0.0.1:8000/admin/

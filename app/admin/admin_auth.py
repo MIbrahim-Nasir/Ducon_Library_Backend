@@ -1,17 +1,25 @@
-"""Admin authentication: JWT role=admin + short-lived admin session token.
+"""Admin / analytics authentication: JWT role + short-lived admin session token.
+
+Roles (``users.role``):
+  • ``admin``     — full access: settings, secrets, user CRUD, metrics, errors
+  • ``analytics`` — read-only dashboards: metrics, usage, error logs (no settings/secrets/user CRUD)
 
 Flow:
-  1. User logs in normally → JWT (existing flow). Must have users.role='admin'.
+  1. User logs in normally → JWT. Must have role ``admin`` or ``analytics``.
   2. Frontend /admin route prompts for ADMIN_PASSWORD → POST /admin/auth/verify
      → returns a short-lived admin session token (signed JWT with
      admin_session=true claim, TTL ~30min).
   3. Frontend stores admin session token in memory only, sends it as
      X-Admin-Session header on all /admin/* requests alongside the Bearer JWT.
-  4. ``require_admin`` dependency validates BOTH: the Bearer JWT user has
-     role='admin' AND the X-Admin-Session token is valid and unexpired.
+  4. ``require_admin_or_analytics`` validates BOTH: privileged JWT role AND a
+     valid X-Admin-Session token. ``require_admin`` is stricter (admin only).
 
 Admin session tokens are revoked in-memory (cleared on restart, like the
 existing JWT revocation list).
+
+Env vars:
+  ADMIN_PASSWORD_HASH       — bcrypt hash for /admin/auth/verify (required in prod)
+  ADMIN_SESSION_TTL_MINUTES — session token lifetime (default 30)
 """
 from __future__ import annotations
 
@@ -102,21 +110,29 @@ def decode_admin_session_token(token: str) -> Optional[dict]:
         return None
 
 
-# ── Dependency ────────────────────────────────────────────────────────────────
+# ── Roles ─────────────────────────────────────────────────────────────────────
+
+ROLE_ADMIN = "admin"
+ROLE_ANALYTICS = "analytics"
+PRIVILEGED_ROLES = frozenset({ROLE_ADMIN, ROLE_ANALYTICS})
 
 
-async def require_admin(
-    x_admin_session: Optional[str] = Header(default=None, alias="X-Admin-Session"),
-    current_user: User = Depends(get_current_user),
-) -> User:
-    """Require an authenticated admin user with a valid admin session token.
+def is_admin_role(role: str) -> bool:
+    return role == ROLE_ADMIN
 
-    Returns the User row. Raises 403 if not admin, 401 if admin session missing
-    or invalid.
-    """
-    if current_user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
 
+def is_analytics_role(role: str) -> bool:
+    return role == ROLE_ANALYTICS
+
+
+def has_privileged_role(role: str) -> bool:
+    return role in PRIVILEGED_ROLES
+
+
+def _validate_admin_session(
+    x_admin_session: Optional[str],
+    current_user: User,
+) -> None:
     if not x_admin_session:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -128,18 +144,57 @@ async def require_admin(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired admin session",
         )
-    # token subject must match the authenticated user
     if str(current_user.id) != str(payload.get("sub")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Admin session user mismatch",
         )
+
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+
+
+async def require_admin(
+    x_admin_session: Optional[str] = Header(default=None, alias="X-Admin-Session"),
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Require role=admin with a valid admin session token (destructive ops)."""
+    if not is_admin_role(current_user.role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
+    _validate_admin_session(x_admin_session, current_user)
+    return current_user
+
+
+async def require_admin_or_analytics(
+    x_admin_session: Optional[str] = Header(default=None, alias="X-Admin-Session"),
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Require role=admin or analytics with a valid admin session token."""
+    if not has_privileged_role(current_user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or analytics role required",
+        )
+    _validate_admin_session(x_admin_session, current_user)
+    return current_user
+
+
+async def require_analytics_jwt_only(current_user: User = Depends(get_current_user)) -> User:
+    """Read-only metrics: JWT with role admin or analytics (no admin session password)."""
+    if not has_privileged_role(current_user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or analytics role required",
+        )
     return current_user
 
 
 async def require_admin_user_only(current_user: User = Depends(get_current_user)) -> User:
-    """Lighter check: just role=admin (no admin session). Used for endpoints
-    that bootstrap the admin session (e.g. /admin/auth/verify)."""
-    if current_user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
+    """Lighter check: admin or analytics JWT only (no session). Used to bootstrap
+    the admin session (e.g. /admin/auth/verify)."""
+    if not has_privileged_role(current_user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin or analytics role required",
+        )
     return current_user

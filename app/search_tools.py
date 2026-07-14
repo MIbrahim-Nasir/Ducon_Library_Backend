@@ -7,14 +7,32 @@ KeywordSearch / keyword_search — exact names, modular product tiles, advanced 
 
 from __future__ import annotations
 
+from typing import Any
+
 from app.catalog_filter_context import get_keyword_filter_context
 
 
 AI_SEARCH_WHEN = (
     "PREFERRED for almost all catalog discovery: inspiration, mood, style, layout ideas, "
     "vague descriptions, themes, materials, project vibes, and 'show me designs like…'. "
-    "Uses semantic + visual matching."
+    "Uses semantic + visual matching. "
+    "Accepts text query, an optional user image (upload/space photo), or both. "
+    "Text-only, image-only, and text+image each produce different vector-search rankings — "
+    "use text for named styles/materials, image when matching a space photo's look, "
+    "and both when the user wants designs that fit their photo AND a described vibe."
 )
+
+AI_SEARCH_IMAGE_PARAM = {
+    "type": "string",
+    "description": (
+        "Optional user space / reference image for visual similarity search. "
+        "Pass a chat upload id, UploadImage upload_id, or other frontend-resolvable "
+        "image ref the user provided. Omit for text-only search. "
+        "When set without query, runs image-only embedding search. "
+        "When set with query, runs multimodal (text+image) embedding search — "
+        "results differ from text-only or image-only."
+    ),
+}
 
 KEYWORD_SEARCH_WHEN = (
     "Use ONLY when the user needs exact catalog filtering — NOT for inspiration or vague "
@@ -115,15 +133,20 @@ def ai_search_interactions_tool() -> dict[str, Any]:
             f"{AI_SEARCH_WHEN} "
             "Returns catalog image records shown inline in chat as a labeled AI slider. "
             "For concrete product types (pergola, fountain, paver…), pair with KeywordSearch "
-            "in the same turn. For vague/themed browse: call once, then reply briefly."
+            "in the same turn. For vague/themed browse: call once, then reply briefly. "
+            "Provide at least one of query or image_ref."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Natural-language or descriptive search query.",
+                    "description": (
+                        "Natural-language or descriptive search query. "
+                        "Optional when image_ref is provided (image-only search)."
+                    ),
                 },
+                "image_ref": AI_SEARCH_IMAGE_PARAM,
                 "show_user": {
                     "type": "boolean",
                     "description": (
@@ -137,7 +160,7 @@ def ai_search_interactions_tool() -> dict[str, Any]:
                     "description": "Legacy alias for show_user. Prefer show_user boolean.",
                 },
             },
-            "required": ["query"],
+            "required": [],
         },
     }
 
@@ -177,15 +200,20 @@ def ai_search_live_declaration() -> dict[str, Any]:
             f"{AI_SEARCH_WHEN} "
             "Opens the AI search modal and returns CatalogImage records "
             "{id, name, filename, class, theme, project, tags, url, _type:'catalog_image'}. "
-            "Treat results as metadata — call get_image to inspect pixels when needed."
+            "Treat results as metadata — call get_image to inspect pixels when needed. "
+            "Provide at least one of query or image_ref (upload_id from UploadImage or chat)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Natural-language or descriptive search query.",
+                    "description": (
+                        "Natural-language or descriptive search query. "
+                        "Optional when image_ref is provided (image-only search)."
+                    ),
                 },
+                "image_ref": AI_SEARCH_IMAGE_PARAM,
                 "show_user": {
                     "type": "boolean",
                     "description": (
@@ -194,7 +222,7 @@ def ai_search_live_declaration() -> dict[str, Any]:
                     ),
                 },
             },
-            "required": ["query"],
+            "required": [],
         },
     }
 

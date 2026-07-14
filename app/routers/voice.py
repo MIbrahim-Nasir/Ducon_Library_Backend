@@ -9,6 +9,8 @@ Endpoint
     token  (optional) — JWT access token for authenticated users.
            Pass as ?token=<jwt> because browsers cannot set the
            Authorization header on WebSocket connections.
+    guest_session_id — Guest session UUID (required for unauthenticated voice).
+    turnstile_token  — Cloudflare Turnstile token (required for guest voice).
 
   Session lifetime
   ----------------
@@ -107,7 +109,6 @@ Error codes
 from __future__ import annotations
 
 import asyncio
-from app.hashing import sha256_hex
 import json
 import logging
 import uuid
@@ -121,19 +122,17 @@ from app.db.models import User
 from app.live_session import GeminiLiveSession, LiveEvent, LiveEventType, _dbg
 from app.auth import resolve_user_from_token
 from app import chat_session
+from app.guest_identity import GuestRequestIdentity, build_guest_request_identity
 from app.guest_usage import (
     GuestUsageKind,
     enforce_guest_limit,
     increment_guest_usage,
 )
-from app.routers.guest import get_or_create_guest_session
+from app.routers.guest import get_or_create_guest_session, verify_turnstile
+from app.error_logger import log_error
 
 router = APIRouter(tags=["voice"])
 logger = logging.getLogger(__name__)
-
-
-def _hash_ip(ip: str) -> str:
-    return sha256_hex(ip)
 
 
 # ── Auth helper ───────────────────────────────────────────────────────────────
@@ -153,6 +152,10 @@ async def voice_ws(
         default=None,
         description="Guest session UUID (required for unauthenticated voice)",
     ),
+    turnstile_token: Optional[str] = Query(
+        default=None,
+        description="Cloudflare Turnstile token (required for guest voice)",
+    ),
 ):
     """
     Bidirectional WebSocket bridge between the client and Gemini Live API.
@@ -163,11 +166,11 @@ async def voice_ws(
     """
     await websocket.accept()
     session_id = str(uuid.uuid4())
-    client_ip = websocket.client.host if websocket.client else "unknown"
 
     # ── Resolve user or guest session ─────────────────────────────────────────
     user: Optional[User] = None
     guest_db_session_id: Optional[str] = None
+    guest_identity: Optional[GuestRequestIdentity] = None
 
     if token:
         async for db in get_db():
@@ -180,12 +183,37 @@ async def voice_ws(
 
     elif guest_session_id:
         guest_db_session_id = guest_session_id
+    else:
+        from app.guest_session_token import resolve_guest_session_id_from_parts
+
+        guest_db_session_id = resolve_guest_session_id_from_parts(
+            websocket.headers,
+            websocket.cookies,
+        )
+
+    if guest_db_session_id:
+        guest_identity = build_guest_request_identity(
+            websocket.headers,
+            peer_host=websocket.client.host if websocket.client else None,
+            raw_fingerprint=websocket.headers.get("x-guest-fingerprint"),
+        )
+        if not await verify_turnstile(turnstile_token or "", guest_identity.client_ip):
+            await _send_json(
+                websocket,
+                {
+                    "type": "error",
+                    "message": "Bot verification failed. Please try again.",
+                    "code": "TURNSTILE_FAILED",
+                },
+            )
+            await websocket.close(code=4003, reason="Bot verification failed")
+            return
         try:
             async for db in get_db():
                 await get_or_create_guest_session(
                     db,
-                    guest_session_id,
-                    client_ip,
+                    guest_db_session_id,
+                    identity=guest_identity,
                     usage_kind=GuestUsageKind.VOICE,
                 )
                 await db.commit()
@@ -215,15 +243,20 @@ async def voice_ws(
 
     async def _increment_guest_voice() -> bool:
         """Count one completed voice turn; return False when guest limit is exhausted."""
-        if not guest_db_session_id:
+        if not guest_db_session_id or guest_identity is None:
             return True
         try:
             async for db in get_db():
                 row = await enforce_guest_limit(
                     db,
                     guest_db_session_id,
-                    _hash_ip(client_ip),
+                    guest_identity.ip_hash,
                     GuestUsageKind.VOICE,
+                    fingerprint_hash=guest_identity.fingerprint_hash,
+                    composite_hash=guest_identity.composite_hash,
+                    subnet_key=guest_identity.subnet_key,
+                    ja4_fingerprint=guest_identity.ja4_fingerprint,
+                    asn=guest_identity.asn,
                 )
                 await increment_guest_usage(db, row, GuestUsageKind.VOICE)
                 await db.commit()
@@ -241,7 +274,7 @@ async def voice_ws(
         guest_session_id=guest_db_session_id,
     )
     if user_id is not None:
-        seed_turns = chat_session.get_voice_seed_turns(user_id)
+        seed_turns = await chat_session.get_voice_seed_turns(user_id)
         if seed_turns:
             gemini_session.seed_history(seed_turns)
             logger.info(
@@ -249,7 +282,7 @@ async def voice_ws(
                 len(seed_turns), user_id, session_id,
             )
     elif guest_db_session_id:
-        seed_turns = chat_session.get_guest_voice_seed_turns(guest_db_session_id)
+        seed_turns = await chat_session.get_guest_voice_seed_turns(guest_db_session_id)
         if seed_turns:
             gemini_session.seed_history(seed_turns)
             logger.info(
@@ -262,6 +295,15 @@ async def voice_ws(
         await gemini_session.start(event_queue)
     except Exception as exc:
         logger.exception("Failed to start Gemini Live session — %s", user_label)
+        await log_error(
+            "voice",
+            "voice.gemini_session.start",
+            str(exc),
+            user_id=user_id,
+            guest_session_id=guest_db_session_id,
+            endpoint="/ws/voice",
+            exc=exc,
+        )
         await _send_json(websocket, {"type": "error", "message": str(exc)})
         await websocket.close(code=4003, reason="Gemini session start failed")
         return
@@ -405,6 +447,13 @@ async def _relay_client_to_gemini(
         pass
     except Exception:
         logger.exception("Voice WS client relay error — session=%s", session_id)
+        await log_error(
+            "voice",
+            "voice.relay_client_to_gemini",
+            "Voice WebSocket client relay error",
+            endpoint="/ws/voice",
+            extra={"session_id": session_id},
+        )
 
 
 # ── Relay: Gemini → client ────────────────────────────────────────────────────
@@ -477,6 +526,13 @@ async def _relay_gemini_to_client(
         pass
     except Exception:
         logger.exception("Voice WS Gemini relay error — session=%s", session_id)
+        await log_error(
+            "voice",
+            "voice.relay_gemini_to_client",
+            "Voice WebSocket Gemini relay error",
+            endpoint="/ws/voice",
+            extra={"session_id": session_id},
+        )
 
 
 # ── Utility ────────────────────────────────────────────────────────────────────

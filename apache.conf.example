@@ -1,0 +1,94 @@
+# Example Apache 2.4 vhost for Ducon Library (production).
+# See VPS_DEPLOYMENT.md §4 for full context.
+#
+# Enable modules:
+#   a2enmod proxy proxy_http proxy_wstunnel ssl rewrite headers deflate
+
+<VirtualHost *:443>
+    ServerName app.duconodl.com
+
+    SSLEngine on
+    # SSLCertificateFile /etc/letsencrypt/live/app.duconodl.com/fullchain.pem
+    # SSLCertificateKeyFile /etc/letsencrypt/live/app.duconodl.com/privkey.pem
+
+    DocumentRoot /var/www/ducon/dist
+    LimitRequestBody 62914560
+
+    <Directory /var/www/ducon/dist>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ProxyPreserveHost On
+    ProxyRequests Off
+    # HostGator EA4: ProxyTimeout must be VirtualHost-level, not inside LocationMatch.
+    ProxyTimeout 600
+
+    # ---- WebSocket (voice) ----
+    RewriteEngine On
+    RewriteCond %{HTTP:Upgrade} websocket [NC]
+    RewriteCond %{HTTP:Connection} upgrade [NC]
+    RewriteRule ^/ws/(.*)$ ws://127.0.0.1:8000/ws/$1 [P,L]
+
+    ProxyPass        /ws/ ws://127.0.0.1:8000/ws/
+    ProxyPassReverse /ws/ ws://127.0.0.1:8000/ws/
+
+    # ---- SSE: flushpackets + long timeout + no gzip ----
+    # Without flushpackets=on, Apache buffers and Cloudflare idle-kills (~100s).
+    # Primary multi-image path is /generation/jobs/{id}/events; keep legacy too.
+    ProxyPass        /generate-multi-image  http://127.0.0.1:8000/generate-multi-image flushpackets=on
+    ProxyPassReverse /generate-multi-image  http://127.0.0.1:8000/generate-multi-image
+    ProxyPass        /studio/directions     http://127.0.0.1:8000/studio/directions flushpackets=on
+    ProxyPassReverse /studio/directions     http://127.0.0.1:8000/studio/directions
+    ProxyPass        /chat                  http://127.0.0.1:8000/chat flushpackets=on
+    ProxyPassReverse /chat                  http://127.0.0.1:8000/chat
+
+        # Note: ProxyTimeout is NOT valid inside LocationMatch on some hosts
+        # (e.g. HostGator EA4). Set it at VirtualHost / userdata top-level instead.
+        SetEnv no-gzip 1
+        SetEnv no-brotli 1
+        Header always set Cache-Control "no-cache, no-transform"
+    </LocationMatch>
+
+    <IfModule mod_deflate.c>
+    </IfModule>
+
+    # Designer + generation-job SSE (path varies by job id)
+    ProxyPassMatch   ^(/designer/jobs/.+/events)$ http://127.0.0.1:8000$1 flushpackets=on
+    ProxyPassReverse /designer/ http://127.0.0.1:8000/designer/
+    ProxyPassMatch   ^(/generation/jobs/.+/events)$ http://127.0.0.1:8000$1 flushpackets=on
+    ProxyPass        /generation  http://127.0.0.1:8000/generation
+    ProxyPassReverse /generation  http://127.0.0.1:8000/generation
+
+    # ---- REST API ----
+    ProxyPass        /auth        http://127.0.0.1:8000/auth
+    ProxyPassReverse /auth        http://127.0.0.1:8000/auth
+    ProxyPass        /bookmarks   http://127.0.0.1:8000/bookmarks
+    ProxyPassReverse /bookmarks   http://127.0.0.1:8000/bookmarks
+    ProxyPass        /generations http://127.0.0.1:8000/generations
+    ProxyPassReverse /generations http://127.0.0.1:8000/generations
+    ProxyPass        /guest       http://127.0.0.1:8000/guest
+    ProxyPassReverse /guest       http://127.0.0.1:8000/guest
+    ProxyPass        /images      http://127.0.0.1:8000/images
+    ProxyPassReverse /images      http://127.0.0.1:8000/images
+    ProxyPass        /public      http://127.0.0.1:8000/public
+    ProxyPassReverse /public      http://127.0.0.1:8000/public
+    ProxyPass        /quotation   http://127.0.0.1:8000/quotation
+    ProxyPassReverse /quotation   http://127.0.0.1:8000/quotation
+    ProxyPass        /search      http://127.0.0.1:8000/search
+    ProxyPassReverse /search      http://127.0.0.1:8000/search
+    ProxyPass        /contact     http://127.0.0.1:8000/contact
+    ProxyPassReverse /contact     http://127.0.0.1:8000/contact
+    ProxyPass        /meta        http://127.0.0.1:8000/meta
+    ProxyPassReverse /meta        http://127.0.0.1:8000/meta
+    ProxyPass        /designer    http://127.0.0.1:8000/designer
+    ProxyPassReverse /designer    http://127.0.0.1:8000/designer
+    # Admin API only — bare /admin is the React SPA under DocumentRoot
+    ProxyPass        /admin/      http://127.0.0.1:8000/admin/
+    ProxyPassReverse /admin/      http://127.0.0.1:8000/admin/
+
+    <LocationMatch "^/(auth|bookmarks|generations|guest|images|public|quotation|search|contact|meta|admin/)">
+        ProxyTimeout 120
+    </LocationMatch>
+</VirtualHost>

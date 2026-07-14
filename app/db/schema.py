@@ -207,6 +207,8 @@ class GenerationResponse(BaseModel):
     generation_name: str
     url: str              # R2 object key, e.g. "generations/1/file.png"
     signed_url: Optional[str] = None  # freshly generated presigned GET URL
+    source_image_url: Optional[str] = None  # storage key for the user's before photo
+    before_url: Optional[str] = None  # fresh URL to display the before photo
     generated_at: datetime
     user_id: int
     ducon_image_id: Optional[int] = None

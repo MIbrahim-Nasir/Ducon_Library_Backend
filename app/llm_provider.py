@@ -38,7 +38,7 @@ except Exception as exc:  # pragma: no cover - import guard
     _ANTHROPIC_IMPORT_ERROR = exc
 
 
-from app.admin.settings_store import cfg, cfg_bool, cfg_str
+from app.admin.settings_store import cfg, cfg_bool, cfg_str, cfg_int
 
 # ── Config ────────────────────────────────────────────────────────────────────
 

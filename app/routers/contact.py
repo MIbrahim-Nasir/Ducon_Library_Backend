@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -279,7 +280,10 @@ async def submit_designer_contact(
 <p><strong>Uploaded space images:</strong> {len(file_attachments)}</p>
 """
 
-    send_contact_email(
+    # Resend HTTP call is blocking — offload so the async route doesn't stall
+    # the event loop (and other in-flight requests) while waiting on the API.
+    await asyncio.to_thread(
+        send_contact_email,
         to=DESIGNER_CONTACT_EMAIL,
         subject=f"Designer consultation — {current_user.name}",
         text=text_body,
@@ -330,7 +334,10 @@ async def submit_customer_service_contact(
 <p><strong>Issue / message:</strong><br>{body.replace(chr(10), '<br>')}</p>
 """
 
-    send_contact_email(
+    # Resend HTTP call is blocking — offload so the async route doesn't stall
+    # the event loop (and other in-flight requests) while waiting on the API.
+    await asyncio.to_thread(
+        send_contact_email,
         to=CUSTOMER_SERVICE_EMAIL,
         subject=f"Customer service — {current_user.name}",
         text=text_body,

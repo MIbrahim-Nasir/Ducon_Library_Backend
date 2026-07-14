@@ -81,14 +81,16 @@ from typing import AsyncIterator, List, Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_optional_user
 from app.db.database import get_db, async_session_maker
 from app.db.models import GuestSession, User
 from app.image_utils import normalize_user_image
-from app.routers.guest import get_or_create_guest_session, verify_turnstile
+from app.routers.guest import resolve_guest_context
 from app.sse import SSE_HEADERS
+from app.error_logger import log_error, log_warning
 from app.tool_generate_image import (
     MAX_IMAGES,
     ImageDescriptor,
@@ -135,22 +137,52 @@ async def _stream_generation(
         # from a background task (SQLAlchemy AsyncSession is not concurrency-safe).
         try:
             async with async_session_maker() as worker_db:
+                worker_guest_session = None
+                if guest_session_id:
+                    result = await worker_db.execute(
+                        select(GuestSession).where(GuestSession.session_id == guest_session_id)
+                    )
+                    worker_guest_session = result.scalar_one_or_none()
+                    if worker_guest_session is None:
+                        raise RuntimeError("Guest session was not found before saving generation.")
+
+                # Chat/voice/studio quick-gen: always use the ImageGenAgent
+                # prompt writer + evaluate + retry loop (enable_verify=True).
                 result = await generate_multi_image(
                     user_id=user_id,
                     guest_session_id=guest_session_id,
-                    guest_session=guest_session,
+                    guest_session=worker_guest_session,
                     prompt=prompt,
                     descriptors=descriptors,
                     model=model,
                     aspect_ratio=aspect_ratio or None,
                     db=worker_db,
+                    enable_verify=True,
                 )
                 await worker_db.commit()
             await queue.put(("done", result))
         except (ValueError, RuntimeError) as exc:
+            await log_error(
+                "multi_image",
+                "multi_image_gen.worker",
+                str(exc),
+                user_id=user_id,
+                guest_session_id=guest_session_id,
+                endpoint="/generate-multi-image",
+                exc=exc,
+            )
             await queue.put(("error", str(exc)))
         except Exception as exc:
             logger.exception("[MultiImageGen] Unexpected error in generation worker")
+            await log_error(
+                "multi_image",
+                "multi_image_gen.worker",
+                "Unexpected multi-image generation error",
+                user_id=user_id,
+                guest_session_id=guest_session_id,
+                endpoint="/generate-multi-image",
+                exc=exc,
+            )
             await queue.put(("error", f"Unexpected error: {exc}"))
 
     task = asyncio.create_task(worker())
@@ -216,34 +248,69 @@ async def create_multi_image_generation(
     guest_session_id: str | None = None
     guest_session_row: GuestSession | None = None
     if current_user is None:
-        guest_session_id = request.headers.get("x-guest-session-id")
-        if not guest_session_id:
-            raise HTTPException(
-                status_code=401,
-                detail="Authentication required. Provide a Bearer token or X-Guest-Session-Id header.",
-            )
-        try:
-            uuid.UUID(guest_session_id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid X-Guest-Session-Id. Must be a valid UUID.")
-
-        client_ip = request.client.host if request.client else "unknown"
-        if not await verify_turnstile(cf_turnstile_token or "", client_ip):
-            raise HTTPException(
-                status_code=403,
-                detail="Bot verification failed. Please try again.",
-            )
-        guest_session_row = await get_or_create_guest_session(db, guest_session_id, client_ip)
+        guest_session_row = await resolve_guest_context(
+            request, db,
+            turnstile_token=cf_turnstile_token,
+            endpoint="/generate-multi-image",
+            source="multi_image_gen",
+        )
+        # Fingerprint remapping may return a different canonical UUID than the
+        # header/cookie. Always persist and reload under the row's session_id
+        # so the SSE worker's FK lookup cannot miss.
+        guest_session_id = guest_session_row.session_id
 
     user_id = current_user.id if current_user else None
 
-    # ── Validate basic params ─────────────────────────────────────────────────
+    descriptors = await parse_multi_image_request(
+        prompt=prompt,
+        model=model,
+        aspect_ratio=aspect_ratio,
+        images_meta=images_meta,
+        image_specs=image_specs,
+        files=files,
+        log_tag="MultiImageGen",
+    )
+
+    # ── Generate (SSE so keepalive pings prevent Cloudflare proxy timeouts) ───
+    if guest_session_row is not None:
+        # The generation worker uses its own AsyncSession; commit the guest row
+        # first so the worker can satisfy guest_generations' FK constraint.
+        await db.commit()
+
+    return StreamingResponse(
+        _stream_generation(
+            descriptors=descriptors,
+            prompt=prompt,
+            model=model,
+            aspect_ratio=aspect_ratio,
+            user_id=user_id,
+            guest_session_id=guest_session_id,
+            guest_session=guest_session_row,
+            db=db,
+        ),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
+
+
+async def parse_multi_image_request(
+    *,
+    prompt: str,
+    model: str,
+    aspect_ratio: Optional[str],
+    images_meta: Optional[str],
+    image_specs: Optional[str],
+    files: List[UploadFile],
+    log_tag: str = "MultiImageGen",
+) -> list[ImageDescriptor]:
+    """Shared request validation + descriptor building for the multi-image
+    endpoints (/generate-multi-image and /generation/jobs). One implementation
+    so the two entry points cannot drift. Raises HTTPException(422) on any
+    invalid input; returns the ordered ImageDescriptor list."""
     if not prompt.strip():
         raise HTTPException(status_code=422, detail="prompt must not be empty.")
-
     if model not in _VALID_MODELS:
         raise HTTPException(status_code=422, detail=f"model must be one of: {_VALID_MODELS}.")
-
     if aspect_ratio and aspect_ratio not in _VALID_RATIOS:
         raise HTTPException(status_code=422, detail=f"aspect_ratio must be one of: {_VALID_RATIOS}.")
 
@@ -251,7 +318,6 @@ async def create_multi_image_generation(
     if not images_payload:
         raise HTTPException(status_code=422, detail="images_meta is required.")
 
-    # ── Parse images_meta JSON ────────────────────────────────────────────────
     try:
         raw_meta: list[dict] = json.loads(images_payload)
     except json.JSONDecodeError as exc:
@@ -259,26 +325,28 @@ async def create_multi_image_generation(
 
     if not isinstance(raw_meta, list) or len(raw_meta) == 0:
         raise HTTPException(status_code=422, detail="images_meta must be a non-empty JSON array.")
-
     if len(raw_meta) > MAX_IMAGES:
         raise HTTPException(
             status_code=422,
             detail=f"Too many images: {len(raw_meta)} provided, maximum is {MAX_IMAGES}.",
         )
+    if len(raw_meta) < 2:
+        logger.warning(
+            "[%s] Only %d image(s) — ImageGenAgent QC loop needs ≥2 "
+            "(user space + Ducon design direction). Proceeding with best-effort single-pass.",
+            log_tag, len(raw_meta),
+        )
 
-    # ── Normalize and validate each descriptor ────────────────────────────────
     normalized_meta: list[dict] = []
     for i, entry in enumerate(raw_meta):
         if not isinstance(entry, dict):
             raise HTTPException(status_code=422, detail=f"images_meta[{i}] must be an object.")
         if not entry.get("label"):
             raise HTTPException(status_code=422, detail=f"images_meta[{i}].label is required.")
-
         try:
             normalized = _normalize_meta_entry(entry)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=f"images_meta[{i}]: {exc}")
-
         t = normalized["type"]
         if t not in _VALID_TYPES:
             raise HTTPException(
@@ -292,9 +360,10 @@ async def create_multi_image_generation(
             )
         normalized_meta.append(normalized)
 
-    # ── Validate file references ──────────────────────────────────────────────
-    file_refs = [e for e in normalized_meta if e["type"] == "file"]
-    for entry in file_refs:
+    # Pre-check explicit file indexes before decoding uploads.
+    for entry in normalized_meta:
+        if entry["type"] != "file":
+            continue
         file_index = entry.get("file_index")
         if file_index is None:
             continue
@@ -307,15 +376,14 @@ async def create_multi_image_generation(
                 ),
             )
 
-    # Read and normalise uploaded files
+    # Read and normalise uploaded files (CPU-bound decode off the event loop).
     file_pils: list = []
     for upload in files:
         raw_bytes = await upload.read()
         if not raw_bytes:
             raise HTTPException(status_code=422, detail=f"Uploaded file '{upload.filename}' is empty.")
-        file_pils.append(normalize_user_image(raw_bytes))
+        file_pils.append(await asyncio.to_thread(normalize_user_image, raw_bytes))
 
-    # ── Build ImageDescriptor list ────────────────────────────────────────────
     file_idx = 0
     descriptors: list[ImageDescriptor] = []
     for entry in normalized_meta:
@@ -341,22 +409,7 @@ async def create_multi_image_generation(
                 type=t,
                 source=entry["source"],
             ))
-
-    # ── Generate (SSE so keepalive pings prevent Cloudflare proxy timeouts) ───
-    return StreamingResponse(
-        _stream_generation(
-            descriptors=descriptors,
-            prompt=prompt,
-            model=model,
-            aspect_ratio=aspect_ratio,
-            user_id=user_id,
-            guest_session_id=guest_session_id,
-            guest_session=guest_session_row,
-            db=db,
-        ),
-        media_type="text/event-stream",
-        headers=SSE_HEADERS,
-    )
+    return descriptors
 
 
 def _normalize_meta_entry(entry: dict) -> dict:

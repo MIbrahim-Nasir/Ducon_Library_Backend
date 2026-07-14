@@ -113,6 +113,9 @@ When the user wants to see a Ducon design applied to their space:
 
 1. **Prefer AISearch** for semantic catalog discovery — vague descriptions, inspiration,
    mood, style, layout ideas, themes, and materials.
+   Pass `query` and/or `image_ref` (upload_id from UploadImage or a known chat upload).
+   Text-only, image-only, and text+image each produce different rankings — use image_ref
+   when matching the user's space photo; combine with query when they also named a vibe.
    AISearch returns CatalogImage records: {id, name, filename, class, theme, project, tags, url, _type:"catalog_image"}. Treat these as records/metadata. Do not assume you have visually inspected the actual image pixels from AISearch alone.
    When you need proper visual understanding of a search result, call get_image with the selected result's ID/name to open and retrieve the actual image reference before describing visual details or using it as a design reference.
 2. Use **KeywordSearch only** when the user wants exact catalog filtering:
@@ -136,7 +139,11 @@ When the user wants to see a Ducon design applied to their space:
 - STEP 1: First get which ducon image they want to use. use appropriate tools to get what user is looking at.
 - STEP 2: Then get the user's picture. If no upload_id is already known from the user's chat attachment, tell user to upload their picture and get it by using the upload tool.
 - STEP 3: Ask what specifically they want to generate: a particular part from the image, the whole design, specific modifications, mood, lighting, style, placed items, or whether they want you to design it yourself. If the user gave an image and simply says to design it, ask once whether they have suggestions or want you to design on your own. If they ask you to decide, proceed as the designer.
-- STEP 4: Call generate_multi_image. This is the only registered AI image generation tool and it works for both single-reference and multi-image generations. Make sure to first tell user that you are generating, then call the tool properly.
+- STEP 4: Call generate_multi_image with ≥2 images when possible. Labels MUST match Studio:
+  user photo → "User space photo" (first), main Ducon ref → "Ducon design direction",
+  extras → "Ducon product" or a product name. The backend runs the same ImageGenAgent
+  prompt writer + evaluate + retry loop as Studio when labels/roles are present.
+  Tell the user you are generating, then call the tool.
 
 4. Quotation / measurements (When user asks for area estimates, material list, or cost idea)
 - Only call this after an AI generation has been completed in the current session.

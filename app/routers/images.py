@@ -1,6 +1,7 @@
 import json
 import os
 import time
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -64,6 +65,8 @@ async def get_metadata():
     Response is cached in memory and refreshed at most once per METADATA_CACHE_TTL seconds (default 1 day).
     """
     try:
-        return _load_metadata()
+        # _load_metadata() may do a sync httpx.get (remote URL) + file read on a
+        # cache miss — offload so the event loop keeps handling concurrent requests.
+        return await asyncio.to_thread(_load_metadata)
     except (FileNotFoundError, RuntimeError) as e:
         raise HTTPException(status_code=500, detail="Image metadata is temporarily unavailable.")

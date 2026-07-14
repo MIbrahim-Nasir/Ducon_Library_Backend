@@ -9,6 +9,10 @@ outputs/
 *outputs/
 */output_folder
 *secret*
+*Local_Files*
+
+# Dev benchmark dashboard — local run/test-case/combo/upload/output artifacts
+benchmark_data/
 # C extensions
 *.so
 
@@ -211,3 +215,18 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ── Local / deploy hygiene ───────────────────────────────────────────────────
+presentation.zip
+*.zip
+dev_dashboard/node_modules/
+dev_dashboard/designer_agent_folder_backup/
+dev_dashboard/dist/
+
+# Repo debris — never track
+presentation.zip
+dev_dashboard/node_modules/
+dev_dashboard/dist/
+dev_dashboard/*.tsbuildinfo
+dev_dashboard/designer_agent_folder_backup/
+app.zip

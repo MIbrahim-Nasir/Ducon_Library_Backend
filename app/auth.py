@@ -1,5 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+import asyncio
+import logging
 import uuid
 
 from jose import JWTError, jwt
@@ -15,6 +17,8 @@ from google.auth.transport import requests as google_requests
 
 from app.db.database import get_db
 from app.db.models import User
+
+logger = logging.getLogger(__name__)
 
 # ── Config ─────────────────────────────────────────────
 from app.config import IS_PRODUCTION
@@ -35,7 +39,7 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=False)
 
-# ── Token revocation (in-memory; cleared on server restart) ───────────────────
+# ── Token revocation (memory + Postgres for multi-worker) ─────────────────────
 # Maps jti → expiry timestamp so we can prune expired entries.
 _revoked_jtis: dict[str, float] = {}
 
@@ -47,10 +51,51 @@ def revoke_token(jti: str, exp: float) -> None:
     stale = [k for k, v in _revoked_jtis.items() if v < now]
     for k in stale:
         del _revoked_jtis[k]
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_persist_revoked_jti(jti, exp))
+    except RuntimeError:
+        pass
 
 
 def _is_revoked(jti: str) -> bool:
-    return jti in _revoked_jtis
+    return bool(jti) and jti in _revoked_jtis
+
+
+async def _persist_revoked_jti(jti: str, exp: float) -> None:
+    try:
+        from app.db.database import async_session_maker
+        from app.db.models import RevokedJti
+
+        expires_at = datetime.fromtimestamp(exp, tz=timezone.utc)
+        async with async_session_maker() as db:
+            existing = await db.get(RevokedJti, jti)
+            if existing is None:
+                db.add(RevokedJti(jti=jti, expires_at=expires_at))
+            else:
+                existing.expires_at = expires_at
+            await db.commit()
+    except Exception:
+        logger.exception("Failed to persist revoked jti=%s", jti)
+
+
+async def is_token_revoked(jti: str, db: AsyncSession) -> bool:
+    """Memory-first, then Postgres — works across gunicorn workers."""
+    if not jti:
+        return False
+    if jti in _revoked_jtis:
+        return True
+    try:
+        from app.db.models import RevokedJti
+
+        row = await db.get(RevokedJti, jti)
+        if row is None:
+            return False
+        _revoked_jtis[jti] = row.expires_at.timestamp()
+        return True
+    except Exception:
+        logger.exception("revoked_jtis lookup failed")
+        return False
 
 
 # ── Password helpers ───────────────────────────────────
@@ -133,7 +178,7 @@ async def resolve_user_from_token(
     """Decode a token and return the User row, or None on any failure.
 
     Single source of truth for the "optional auth" paths (REST optional-user
-    dependency and the voice WebSocket). Honors the in-memory revocation list.
+    dependency and the voice WebSocket). Honors memory + Postgres revocation.
     """
     if not token:
         return None
@@ -143,7 +188,7 @@ async def resolve_user_from_token(
         jti: str = payload.get("jti", "")
         if user_id is None:
             return None
-        if jti and _is_revoked(jti):
+        if await is_token_revoked(jti, db):
             return None
         result = await db.execute(select(User).where(User.id == int(user_id)))
         return result.scalar_one_or_none()
@@ -168,19 +213,7 @@ async def get_current_user(
         detail="Invalid or expired token",
         headers={"WWW-Authenticate": "Bearer"},
     )
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id: str = payload.get("sub")
-        jti: str = payload.get("jti", "")
-        if user_id is None:
-            raise credentials_exception
-        if jti and _is_revoked(jti):
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
-
-    result = await db.execute(select(User).where(User.id == int(user_id)))
-    user = result.scalar_one_or_none()
+    user = await resolve_user_from_token(token, db)
     if user is None:
         raise credentials_exception
     return user

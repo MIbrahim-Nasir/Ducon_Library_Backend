@@ -288,12 +288,16 @@ _TOOLS: list[dict] = [
                 "description": (
                     "Generate a new design image by compositing multiple source images with a custom prompt. "
                     "Use this for both simple single-reference generations and advanced multi-image tasks. "
-                    "It accepts any combination of images in any order with individual labels. "
-                    "Use it to apply Ducon products/textures to a user's space, combine multiple Ducon "
-                    "references, refine a previous generation, or use inspiration/mood-board images. "
-                    "Sources can be catalog IDs, catalog names/filenames, generation refs like 'gen:123', "
-                    "upload IDs from UploadImage or chat attachments, 'upload' to open the picker, or URLs. "
-                    "Max 10 images. Returns {id/generation_id, generation_name, signed_url, ...}."
+                    "Prefer ≥2 images so the backend can run the same ImageGenAgent prompt writer + "
+                    "evaluate + retry loop as Studio (not a bare single-pass).\n"
+                    "LABEL CONVENTIONS (required for quality — same as Studio):\n"
+                    "  - User's space photo → label MUST be 'User space photo'\n"
+                    "  - Main Ducon reference → label 'Ducon design direction'\n"
+                    "  - Extra catalog refs → label 'Ducon product' or descriptive product name\n"
+                    "  - Put user space FIRST, then design direction, then products.\n"
+                    "Sources: catalog IDs/names, 'gen:123', upload IDs from UploadImage or chat, "
+                    "'upload' to open the picker, or URLs. Max 10 images. "
+                    "Returns {id/generation_id, generation_name, approved, ...}."
                 ),
                 "parameters": {
                     "type": "object",
@@ -308,7 +312,10 @@ _TOOLS: list[dict] = [
                         },
                         "images": {
                             "type": "array",
-                            "description": "Ordered source images. Max 10. Order matters.",
+                            "description": (
+                                "Ordered source images. Max 10. Order: user space first, "
+                                "Ducon design direction second, then any product refs."
+                            ),
                             "maxItems": 10,
                             "items": {
                                 "type": "object",
@@ -321,7 +328,11 @@ _TOOLS: list[dict] = [
                                     },
                                     "label": {
                                         "type": "string",
-                                        "description": "Short image label used in the prompt, e.g. 'user terrace'.",
+                                        "description": (
+                                            "Required role label. User photo: 'User space photo'. "
+                                            "Main Ducon ref: 'Ducon design direction'. "
+                                            "Products: 'Ducon product' or specific product name."
+                                        ),
                                     },
                                 },
                                 "required": ["source", "label"],
@@ -522,6 +533,9 @@ class GeminiLiveSession:
         # Maps call_id → asyncio.Task (the timeout task).
         # Cleared / cancelled when submit_tool_result is called or on reconnect.
         self._pending_tool_calls: dict[str, asyncio.Task] = {}
+        # Background intent-check tasks — cancelled on close() so they cannot
+        # outlive the session.
+        self._bg_tasks: set[asyncio.Task] = set()
 
         # ── Conversation history ───────────────────────────────────────────────
         # Completed turns in Gemini Content dict format:
@@ -674,6 +688,10 @@ class GeminiLiveSession:
         for task in list(self._pending_tool_calls.values()):
             task.cancel()
         self._pending_tool_calls.clear()
+
+        for task in list(self._bg_tasks):
+            task.cancel()
+        self._bg_tasks.clear()
 
         if self._runner_task and not self._runner_task.done():
             self._runner_task.cancel()
@@ -1186,13 +1204,20 @@ class GeminiLiveSession:
                 )
 
         # ── GoAway ─────────────────────────────────────────────────────────────
+        # Gemini's ~10-min session limit. We reconnect transparently with the
+        # internal resumption handle. Do NOT forward go_away to the client —
+        # older frontends tear down the whole WebSocket on go_away, fighting
+        # this self-heal and forcing a brand-new session every ~10 minutes.
         go_away = getattr(message, "go_away", None)
         if go_away is not None:
             time_left = getattr(go_away, "time_left", None)
             ms_left = int(time_left.total_seconds() * 1000) if time_left else 0
-            await q.put(LiveEvent(type=LiveEventType.GO_AWAY, time_left_ms=ms_left))
+            await q.put(LiveEvent(
+                type=LiveEventType.RECONNECTING,
+                message=f"Refreshing voice session ({max(ms_left, 0)}ms)…",
+            ))
             logger.info(
-                "GoAway — user=%s time_left_ms=%d handle=%s",
+                "GoAway (internal reconnect) — user=%s time_left_ms=%d handle=%s",
                 self.user_id, ms_left, self.resumption_handle,
             )
             _dbg(f"[LIVE ⚠ AWAY ] session closing in {ms_left/1000:.0f}s — will reconnect with resumption handle  (user={self.user_id})")
@@ -1302,7 +1327,7 @@ class GeminiLiveSession:
                 self._last_turn_audio_bytes = self._pending_audio_bytes
                 self._pending_audio_bytes = 0
 
-                self._commit_turn()
+                await self._commit_turn()
                 logger.info(
                     "← Gemini: TURN_COMPLETE — user=%s history_turns=%d",
                     self.user_id, len(self._conversation_history),
@@ -1319,10 +1344,12 @@ class GeminiLiveSession:
                 # reads the model's transcript and answers "did this turn announce
                 # an action without executing it?".  Works in any language.
                 if self._tools_called_this_turn == 0:
-                    asyncio.create_task(
+                    task = asyncio.create_task(
                         self._maybe_retry_tool_call(model_output, self._last_turn_audio_bytes),
                         name=f"intent-check-{self.user_id}",
                     )
+                    self._bg_tasks.add(task)
+                    task.add_done_callback(self._bg_tasks.discard)
                 else:
                     # Tool was actually called — reset retry counter.
                     self._execute_now_retries = 0
@@ -1394,7 +1421,7 @@ class GeminiLiveSession:
 
 
 
-    def _commit_turn(self) -> None:
+    async def _commit_turn(self) -> None:
         """
         Commit the pending input/output transcript to conversation history.
 
@@ -1421,10 +1448,10 @@ class GeminiLiveSession:
         if user_text or model_text:
             if self.user_id is not None:
                 from app import chat_session
-                chat_session.append_turn(self.user_id, user_text, model_text)
+                await chat_session.append_turn(self.user_id, user_text, model_text)
             elif self.guest_session_id:
                 from app import chat_session
-                chat_session.append_guest_turn(
+                await chat_session.append_guest_turn(
                     self.guest_session_id, user_text, model_text,
                 )
 
@@ -1494,6 +1521,29 @@ def _compact_designer_job_result(result: object) -> dict:
     }
 
 
+def _compact_generate_multi_image_result(result: object) -> dict:
+    """Keep generation ids/refs for Live; drop long signed URLs / binary fields."""
+    if not isinstance(result, dict):
+        return {"raw": str(result)[:500]}
+    gid = result.get("id") or result.get("generation_id")
+    compact: dict = {
+        "id": gid,
+        "generation_id": gid,
+        "generation_name": result.get("generation_name"),
+        "generation_ref": f"gen:{gid}" if gid else result.get("generation_ref"),
+        "model_used": result.get("model_used"),
+        "images_used": result.get("images_used"),
+        "approved": result.get("approved"),
+        "input_quality": result.get("input_quality"),
+        "generation_warnings": result.get("generation_warnings"),
+        "note": (
+            "Generation complete. Call get_image(generation_ref) to open it. "
+            "Offer get_quotation if the user wants measurements."
+        ),
+    }
+    return {k: v for k, v in compact.items() if v is not None}
+
+
 def _compact_send_to_chat_result(result: object) -> dict:
     """Compact delegation result for the voice model."""
     if not isinstance(result, dict):
@@ -1532,6 +1582,8 @@ def _compact_tool_result(name: str, result: object) -> object:
         return _compact_send_to_chat_result(result)
     if name == "start_designer_job":
         return _compact_designer_job_result(result)
+    if name == "generate_multi_image":
+        return _compact_generate_multi_image_result(result)
 
     if name != "AISearch":
         return _truncate_jsonish(result, _live_tool_result_max_chars())

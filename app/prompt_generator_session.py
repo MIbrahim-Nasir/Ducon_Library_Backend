@@ -16,9 +16,13 @@ from typing import Any, Optional
 from PIL import Image
 from google.genai.types import Content, GenerateContentConfig, Part, ThinkingConfig
 
-from app.gemini import get_gemini_client, PROMPT_GEN_MODEL, _PROMPT_THINKING_LEVEL
+from app.gemini import get_gemini_client, prompt_gen_model, _PROMPT_THINKING_LEVEL
 from app import prompt_loader
 from app import llm_provider
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from app.benchmark.types import StepMetrics
 
 
 def _strip_prompt_fences(text: str) -> str:
@@ -103,7 +107,9 @@ camera lock, fixed-structure preservation, zone mapping, direct visual reference
 for complex patterns, no creative licence, and photorealistic close.
 """.strip()
 
-        self._append_user_turn(list(images), user_text)
+        # _append_user_turn encodes each image to JPEG (CPU-bound) — offload so
+        # the event loop keeps handling concurrent SSE streams.
+        await asyncio.to_thread(self._append_user_turn, list(images), user_text)
         return await self._complete_turn()
 
     async def revise_from_qc(
@@ -170,7 +176,13 @@ Revise your prompt to fix every failed criterion. Keep what worked. Return the f
         self._append_model_turn(prompt)
         self.last_prompt = prompt
 
-    async def _complete_turn(self) -> str:
+    async def _complete_turn(
+        self,
+        *,
+        prompt_model: Optional[str] = None,
+        prompt_thinking: Optional[str] = None,
+        metrics: "Optional[StepMetrics]" = None,
+    ) -> str:
         prompt_loader.ensure_prompts_loaded()
         if llm_provider.use_claude():
             msg = await llm_provider.acomplete_message(
@@ -181,15 +193,20 @@ Revise your prompt to fix every failed criterion. Keep what worked. Return the f
             text = _strip_prompt_fences(llm_provider.extract_text(msg))
         else:
             client = get_gemini_client()
+            _model = prompt_model or prompt_gen_model()
+            _think = prompt_thinking or _PROMPT_THINKING_LEVEL
             response = await asyncio.to_thread(
                 client.models.generate_content,
-                model=PROMPT_GEN_MODEL,
+                model=_model,
                 contents=self._conversation,
                 config=GenerateContentConfig(
                     system_instruction=prompt_loader.DESIGNER_PROMPT_WRITER_SYSTEM,
-                    thinking_config=ThinkingConfig(thinking_level=_PROMPT_THINKING_LEVEL),
+                    thinking_config=ThinkingConfig(thinking_level=_think),
                 ),
             )
+            if metrics is not None:
+                from app.gemini import _record_metrics
+                _record_metrics(response, agent="bench_prompt", model=_model, metrics=metrics)
             text = _strip_prompt_fences(response.text or "")
         if not text:
             raise RuntimeError("Prompt generator returned empty text.")

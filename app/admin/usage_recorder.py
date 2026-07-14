@@ -192,6 +192,12 @@ class UsageRecorder:
             self._written += len(events)
         except Exception:
             logger.exception("failed to batch-insert %d usage events", len(events))
+            from app.error_logger import log_error
+            await log_error(
+                "admin",
+                "usage_recorder._flush",
+                f"Failed to batch-insert {len(events)} usage events",
+            )
             # don't re-enqueue (could loop forever); they're lost but logged
 
     async def _insert_events(self, db: AsyncSession, events: list[UsageEvent]) -> None:

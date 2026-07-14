@@ -51,10 +51,19 @@ D1 PHOTOREALISM: Must look like a real photograph. Severe compositing artefacts
 or unnatural material rendering is a FAIL. Minor edge imperfections are acceptable.
 D2 LIGHTING: Cast shadows and ambient colour temperature should match the original.
 
+SECTION F — USER MARKS / COLOUR ANNOTATIONS
+When Image 1 has coloured marks (red, blue, green, yellow, purple, white), they are
+spatial instructions. If none → F1/F2 = na.
+F1 MARK FOLLOW-THROUGH: FAIL if the user's stated intent for a mark is missing,
+applied in the wrong place, or contradicted.
+F2 MARK CLEANUP: FAIL if any coloured mark, stroke, arrow, circle, box, scribble,
+or note remains visible in Image 2. The generation must look like a clean photo.
+
 DECISION RULES:
 - PASS only if the prompt's main requested transformation is visibly fulfilled.
-- PASS only if score >= {{DESIGNER_AGENT_PASS_SCORE}} AND A1, A2, A3, B1, B2, B3, C1, and C2 are pass or genuinely not-applicable.
-- FAIL if the candidate used the wrong reference, applied the design to the wrong zone, omitted the requested Ducon product/material, changed permanent architecture, added unrelated objects, or looks materially different from the reference.
+- PASS only if score >= {{DESIGNER_AGENT_PASS_SCORE}} AND A1, A2, A3, B1, B2, B3, C1, C2,
+  and (when marks exist) F1 and F2 are pass or genuinely not-applicable.
+- FAIL if the candidate used the wrong reference, applied the design to the wrong zone, omitted the requested Ducon product/material, changed permanent architecture, added unrelated objects, looks materially different from the reference, ignored user marks, applied mark intents in the wrong place, or left annotation drawings visible.
 - Do not let an attractive image pass if it is not faithful to the user's space, selected Ducon references, and prompt.
 
 SCORING: 0=completely wrong, 5=partially correct, 7=acceptable but still fails if any critical section fails, 8=good, 10=excellent.
@@ -73,7 +82,8 @@ Return ONLY valid JSON:
     "A3_scene": "pass/fail/na", "B1_area_products": "pass/fail/na",
     "B2_fixed_products": "pass/fail/na", "B3_zones": "pass/fail/na",
     "C1_no_extra": "pass/fail/na", "C2_no_missing": "pass/fail/na",
-    "D1_photorealism": "pass/fail/na", "D2_lighting": "pass/fail/na"
+    "D1_photorealism": "pass/fail/na", "D2_lighting": "pass/fail/na",
+    "F1_mark_followthrough": "pass/fail/na", "F2_mark_cleanup": "pass/fail/na"
   },
   "improvements": "specific changes for the next generation prompt — must directly address every failed section and preserve sections that passed"
 }

@@ -1,27 +1,35 @@
-"""Admin router: auth, settings, metrics, user management, audit log.
+"""Admin router: auth, settings, metrics, user management, audit log, error logs.
 
-All /admin/* routes (except /admin/auth/verify) require the ``require_admin``
-dependency: a valid Bearer JWT with role=admin AND a valid X-Admin-Session
-header (short-lived admin session token obtained via /admin/auth/verify).
+Route protection:
+  • ``require_admin`` — settings, secrets, user CRUD, audit log, error archive
+  • ``require_admin_or_analytics`` — admin session bootstrap (auth verify/logout/status)
+  • ``require_analytics_jwt_only`` — metrics, pricing, error log read (Bearer JWT only)
 """
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin import metrics as M
 from app.admin.admin_auth import (
+    ROLE_ADMIN,
+    ROLE_ANALYTICS,
     create_admin_session_token,
     decode_admin_session_token,
     is_admin_password_configured,
+    is_admin_role,
     revoke_admin_session,
     verify_admin_password,
     _ADMIN_SESSION_TTL_MIN,
     require_admin,
+    require_admin_or_analytics,
     require_admin_user_only,
+    require_analytics_jwt_only,
 )
 from app.admin.pricing import list_pricing
 from app.admin.schemas import (
@@ -39,13 +47,14 @@ from app.admin.settings_catalog import (
 )
 from app.admin.settings_store import get_settings_store
 from app.admin.usage_recorder import get_usage_recorder
-from app.auth import get_current_user
 from app.db.database import get_db
-from app.db.models import AdminAuditLog, User
+from app.db.models import AdminAuditLog, AppErrorLog, User
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+
+_VALID_ROLES = ("customer", ROLE_ADMIN, ROLE_ANALYTICS)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -76,6 +85,33 @@ async def _audit(
     await db.commit()
 
 
+def _error_summary(row: AppErrorLog) -> dict:
+    return {
+        "id": row.id,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "severity": row.severity,
+        "category": row.category,
+        "source": row.source,
+        "user_id": row.user_id,
+        "guest_session_id": row.guest_session_id,
+        "endpoint": row.endpoint,
+        "model": row.model,
+        "error_type": row.error_type,
+        "message": row.message[:500] if row.message else "",
+        "http_status": row.http_status,
+        "provider_status": row.provider_status,
+        "request_id": row.request_id,
+    }
+
+
+def _error_detail(row: AppErrorLog) -> dict:
+    out = _error_summary(row)
+    out["message"] = row.message
+    out["detail"] = row.detail
+    out["archived_at"] = row.archived_at.isoformat() if row.archived_at else None
+    return out
+
+
 # ── auth ──────────────────────────────────────────────────────────────────────
 
 
@@ -88,10 +124,10 @@ async def admin_verify(
 ):
     """Verify the admin password and issue a short-lived admin session token.
 
-    Requires the caller to already be authenticated with role=admin (Bearer JWT).
+    Requires the caller to already be authenticated with role=admin or analytics.
     """
     from app.rate_limiter import require_rate_limit
-    require_rate_limit(request, max_requests=5, window_seconds=60, key_prefix="admin_verify")
+    await require_rate_limit(request, max_requests=5, window_seconds=60, key_prefix="admin_verify")
 
     if not is_admin_password_configured():
         raise HTTPException(
@@ -111,12 +147,9 @@ async def admin_verify(
 @router.post("/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
 async def admin_logout(
     x_admin_session: Optional[str] = Header(default=None, alias="X-Admin-Session"),
-    current_user: User = Depends(require_admin),
+    current_user: User = Depends(require_admin_or_analytics),
     db: AsyncSession = Depends(get_db),
 ):
-    # require_admin already validated the header; revoke its jti so it can't be
-    # reused. Reading the header via Header() (not a bare param) is required —
-    # a bare param would be parsed as a query string and always be None here.
     if x_admin_session:
         p = decode_admin_session_token(x_admin_session)
         if p:
@@ -125,18 +158,26 @@ async def admin_logout(
 
 
 @router.get("/auth/status")
-async def admin_status(current_user: User = Depends(require_admin)):
-    """Confirm admin session is valid. Returns basic info."""
+async def admin_status(current_user: User = Depends(require_admin_or_analytics)):
+    """Confirm admin/analytics session is valid. Returns role and capabilities."""
     return {
         "ok": True,
         "user_id": current_user.id,
         "email": current_user.email,
         "role": current_user.role,
         "password_configured": is_admin_password_configured(),
+        "capabilities": {
+            "settings": is_admin_role(current_user.role),
+            "secrets": is_admin_role(current_user.role),
+            "users": is_admin_role(current_user.role),
+            "audit_log": is_admin_role(current_user.role),
+            "metrics": True,
+            "errors": True,
+        },
     }
 
 
-# ── settings ──────────────────────────────────────────────────────────────────
+# ── settings (admin only) ─────────────────────────────────────────────────────
 
 
 @router.get("/settings")
@@ -151,10 +192,8 @@ async def get_settings(current_user: User = Depends(require_admin)):
             "label": item["namespace_label"],
             "settings": [],
         })
-        # drop the namespace_label from per-item to avoid repetition
         item2 = {k: v for k, v in item.items() if k != "namespace_label"}
         ns["settings"].append(item2)
-    # preserve canonical order
     ordered = [by_ns[ns.name] for ns in [*EDITABLE_NAMESPACES, get_namespace("secrets")] if ns.name in by_ns]
     return {"namespaces": ordered}
 
@@ -185,12 +224,11 @@ async def update_settings(
         if not spec.editable:
             errors.append({"key": item.key, "error": "not editable"})
             continue
-        # verify the key belongs to this namespace
         if not any(s.key == item.key for s in ns.settings):
             errors.append({"key": item.key, "error": "key not in namespace"})
             continue
         try:
-            cast_value(spec, item.value)  # validate
+            cast_value(spec, item.value)
             await store.put(namespace, item.key, item.value, current_user.id, db)
             updated.append(item.key)
         except ValueError as e:
@@ -214,8 +252,7 @@ async def reveal_secret(
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Reveal a secret's raw value. Requires admin session (already enforced by
-    require_admin). Always audit-logged. Returns the raw env value."""
+    """Reveal a secret's raw value. Admin only. Always audit-logged."""
     spec = get_spec(key)
     if spec is None or not spec.is_secret:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such secret")
@@ -225,13 +262,13 @@ async def reveal_secret(
     return {"key": key, "value": val, "is_set": val is not None and val != ""}
 
 
-# ── metrics ───────────────────────────────────────────────────────────────────
+# ── metrics (admin + analytics) ───────────────────────────────────────────────
 
 
 @router.get("/metrics/overview")
 async def metrics_overview(
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_analytics_jwt_only),
 ):
     return await M.overview(db)
 
@@ -239,7 +276,7 @@ async def metrics_overview(
 @router.get("/metrics/users")
 async def metrics_users(
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_analytics_jwt_only),
 ):
     return await M.per_user_aggregates(db)
 
@@ -248,7 +285,7 @@ async def metrics_users(
 async def metrics_active(
     days: int = 1,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_analytics_jwt_only),
 ):
     days = max(1, min(days, 365))
     return await M.active_users(db, days)
@@ -258,7 +295,7 @@ async def metrics_active(
 async def metrics_daily(
     days: int = 30,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_analytics_jwt_only),
 ):
     days = max(1, min(days, 365))
     return {"days": days, "series": await M.daily_active_series(db, days)}
@@ -268,7 +305,7 @@ async def metrics_daily(
 async def metrics_agents(
     days: int = 30,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_analytics_jwt_only),
 ):
     days = max(1, min(days, 365))
     return {"days": days, "agents": await M.agent_breakdown(db, days)}
@@ -278,7 +315,7 @@ async def metrics_agents(
 async def metrics_models(
     days: int = 30,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_analytics_jwt_only),
 ):
     days = max(1, min(days, 365))
     return {"days": days, "models": await M.model_breakdown(db, days)}
@@ -288,7 +325,7 @@ async def metrics_models(
 async def metrics_time_spent(
     days: int = 30,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_analytics_jwt_only),
 ):
     days = max(1, min(days, 365))
     return await M.time_spent(db, days)
@@ -298,7 +335,7 @@ async def metrics_time_spent(
 async def metrics_retention(
     weeks: int = 8,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    _: User = Depends(require_analytics_jwt_only),
 ):
     weeks = max(1, min(weeks, 52))
     return {"weeks": weeks, "cohorts": await M.retention_cohort(db, weeks)}
@@ -306,19 +343,19 @@ async def metrics_retention(
 
 @router.get("/metrics/recorder")
 async def metrics_recorder(
-    _: User = Depends(require_admin),
+    _: User = Depends(require_analytics_jwt_only),
 ):
     """Internal stats about the usage recorder (queue depth, dropped events)."""
     return get_usage_recorder().stats()
 
 
 @router.get("/pricing")
-async def get_pricing(_: User = Depends(require_admin)):
+async def get_pricing(_: User = Depends(require_analytics_jwt_only)):
     """Read-only model pricing reference used for cost calculations."""
     return {"models": list_pricing()}
 
 
-# ── users ─────────────────────────────────────────────────────────────────────
+# ── users (admin only) ────────────────────────────────────────────────────────
 
 
 @router.get("/users")
@@ -353,17 +390,19 @@ async def admin_patch_user(
     current_user: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    from sqlalchemy import select
     from app.db.models import User as UserModel
     user = (await db.execute(select(UserModel).where(UserModel.id == user_id))).scalar_one_or_none()
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     changes: dict = {}
     if payload.role is not None:
-        if payload.role not in ("customer", "admin"):
-            raise HTTPException(status_code=400, detail="role must be 'customer' or 'admin'")
-        if user.id == current_user.id and payload.role != "admin":
-            raise HTTPException(status_code=400, detail="You cannot remove your own admin role")
+        if payload.role not in _VALID_ROLES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"role must be one of: {', '.join(_VALID_ROLES)}",
+            )
+        if user.id == current_user.id and payload.role not in (ROLE_ADMIN, ROLE_ANALYTICS):
+            raise HTTPException(status_code=400, detail="You cannot remove your own privileged role")
         if user.role != payload.role:
             user.role = payload.role
             changes["role"] = payload.role
@@ -382,7 +421,7 @@ async def admin_patch_user(
     }
 
 
-# ── audit log ─────────────────────────────────────────────────────────────────
+# ── audit log (admin only) ────────────────────────────────────────────────────
 
 
 @router.get("/audit-log")
@@ -393,3 +432,104 @@ async def admin_audit_log(
     _: User = Depends(require_admin),
 ):
     return await M.audit_log(db, limit=limit, offset=offset)
+
+
+# ── error logs (read: admin + analytics; archive: admin only) ─────────────────
+
+
+@router.get("/errors")
+async def list_errors(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_analytics_jwt_only),
+    category: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    user_id: Optional[int] = Query(None),
+    guest_session_id: Optional[str] = Query(None),
+    since: Optional[str] = Query(None, description="ISO8601 datetime lower bound"),
+    until: Optional[str] = Query(None, description="ISO8601 datetime upper bound"),
+    include_archived: bool = Query(False),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    q = select(AppErrorLog)
+    count_q = select(func.count()).select_from(AppErrorLog)
+
+    if not include_archived:
+        q = q.where(AppErrorLog.archived_at.is_(None))
+        count_q = count_q.where(AppErrorLog.archived_at.is_(None))
+    if category:
+        q = q.where(AppErrorLog.category == category)
+        count_q = count_q.where(AppErrorLog.category == category)
+    if severity:
+        q = q.where(AppErrorLog.severity == severity)
+        count_q = count_q.where(AppErrorLog.severity == severity)
+    if user_id is not None:
+        q = q.where(AppErrorLog.user_id == user_id)
+        count_q = count_q.where(AppErrorLog.user_id == user_id)
+    if guest_session_id:
+        q = q.where(AppErrorLog.guest_session_id == guest_session_id)
+        count_q = count_q.where(AppErrorLog.guest_session_id == guest_session_id)
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            q = q.where(AppErrorLog.created_at >= since_dt)
+            count_q = count_q.where(AppErrorLog.created_at >= since_dt)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid since datetime")
+    if until:
+        try:
+            until_dt = datetime.fromisoformat(until.replace("Z", "+00:00"))
+            q = q.where(AppErrorLog.created_at <= until_dt)
+            count_q = count_q.where(AppErrorLog.created_at <= until_dt)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid until datetime")
+
+    total = int((await db.execute(count_q)).scalar() or 0)
+    rows = (
+        await db.execute(
+            q.order_by(AppErrorLog.created_at.desc()).limit(limit).offset(offset)
+        )
+    ).scalars().all()
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "items": [_error_summary(r) for r in rows],
+    }
+
+
+@router.get("/errors/{error_id}")
+async def get_error(
+    error_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_analytics_jwt_only),
+):
+    row = (
+        await db.execute(select(AppErrorLog).where(AppErrorLog.id == error_id))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Error log not found")
+    return _error_detail(row)
+
+
+@router.delete("/errors/{error_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def archive_error(
+    error_id: int,
+    request: Request,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Soft-archive an error log entry (admin only)."""
+    row = (
+        await db.execute(select(AppErrorLog).where(AppErrorLog.id == error_id))
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Error log not found")
+    if row.archived_at is None:
+        row.archived_at = datetime.now(timezone.utc)
+        await db.commit()
+        await _audit(
+            db, current_user.id, "error.archive",
+            target=str(error_id),
+            request=request,
+        )
