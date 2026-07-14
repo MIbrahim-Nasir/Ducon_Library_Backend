@@ -142,42 +142,38 @@ class ImageGenAgent:
         image1_metadata: dict[str, Any] | None = None,
         image2_metadata: dict[str, Any] | None = None,
     ) -> str:
-        if len(self.labels) > 2 or self.product_indices:
-            role_block = "\n".join(
-                f"- {self._role_line(i)}" for i in range(len(self.labels))
+        # Always identify inputs by role + Image N (Studio/chat order is label-based;
+        # never assume Image 1 = Ducon / Image 2 = user).
+        role_block = "\n".join(
+            f"- {self._role_line(i)}" for i in range(len(self.labels))
+        )
+        product_note = ""
+        if self.product_indices:
+            product_note = (
+                " Integrate EACH product reference as a distinct Ducon product "
+                "with identity and placement from its own image number."
             )
-            context = (
-                "Multi-image studio generation. Input roles:\n"
-                f"{role_block}\n\n"
-                "Write the complete Nano Banana Pro generation prompt. Apply the design "
-                "direction to eligible zones in the user's space. Integrate EACH product "
-                "reference image as a distinct Ducon product with placement from its own image number."
-            )
-        elif self.image2_is_user_space:
-            context = (
-                f'Image 1 is a Ducon catalog image named "{self.image1_name}". '
-                f"Image 2 is the user's outdoor space to transform. "
-                f"Write the complete Nano Banana Pro generation prompt."
-            )
-        else:
-            context = (
-                f'Image 1 is a Ducon catalog image named "{self.image1_name}". '
-                f'Image 2 is a Ducon catalog image named "{self.image2_name}". '
-                f"Write the complete Nano Banana Pro generation prompt to combine them."
-            )
+        context = (
+            "Label-based generation (2+ images). Input roles:\n"
+            f"{role_block}\n\n"
+            "Write the complete Nano Banana Pro generation prompt. Apply only what the "
+            "user asked for from the design direction onto eligible zones in the user's "
+            "space."
+            f"{product_note}"
+        )
 
         if image1_metadata:
-            context += f"\n\nMetadata for Image 1:\n{json.dumps(image1_metadata, indent=2)}"
+            context += f"\n\nMetadata for design-direction image:\n{json.dumps(image1_metadata, indent=2)}"
         if image2_metadata:
-            context += f"\n\nMetadata for Image 2:\n{json.dumps(image2_metadata, indent=2)}"
+            context += f"\n\nMetadata for second catalog image:\n{json.dumps(image2_metadata, indent=2)}"
         if user_hint:
             context += (
                 f'\n\nUser direction (incorporate when consistent with images): "{user_hint}"'
             )
 
         context += (
-            "\n\nReturn ONLY the full generation prompt text. Self-check all V1–V16 rules "
-            "before responding."
+            "\n\nReturn ONLY the full generation prompt text. Self-check extraction-only "
+            "rules, camera lock, user-request scope, and mark cleanup before responding."
         )
         return context
 

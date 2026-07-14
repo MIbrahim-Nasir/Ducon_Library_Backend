@@ -9,7 +9,7 @@ Features
 - Streaming text/thinking via SSE
 - Multimodal input (text + images via Gemini Files API)
 - Frontend tool calling (same tools as the voice agent)
-- Long-running tasks (AI generation, quotation)
+- Long-running tasks (AI generation)
 
 Architecture
 ------------
@@ -182,7 +182,7 @@ CHAT_TOOLS: list[dict] = [
         "description": (
             "Resolve a catalog image, AI generation, or user upload by reference. "
             "In chat, results appear inline — do NOT use after AISearch browse flows. "
-            "Use only when generation/quotation needs a concrete ref. "
+            "Use only when generation needs a concrete image ref. "
             "Catalog: numeric id or name. AI generation: always gen:ID (ids collide with catalog)."
         ),
         "parameters": {
@@ -380,48 +380,6 @@ CHAT_TOOLS: list[dict] = [
                 },
             },
             "required": ["prompt", "images"],
-        },
-    },
-    {
-        "type": "function",
-        "name": "get_quotation",
-        "description": (
-            "Requests a Gemini AI quotation analysis for an AI-generated visualisation. "
-            "Opens the Quotation modal, lets the user confirm their original space photo "
-            "(if not pre-supplied), then returns a full area-measurement and fixed-items breakdown. "
-            "Call this after generate_multi_image when the user asks for measurements, a material "
-            "list, or a cost estimate. Pass generationRef from the generation result. "
-            "If the user already uploaded a photo this session, pass it as userImageRef. "
-            "If the user provides any known room dimensions, pass them as referenceMeasurements. "
-            "Returns void after opening the quotation modal."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "generationRef": {
-                    "type": "string",
-                    "description": "Generation reference: id, name, or JSON object string.",
-                },
-                "userImageRef": {
-                    "type": "object",
-                    "description": "Optional. User's original space photo upload object.",
-                    "properties": {
-                        "id":              {"type": "integer"},
-                        "name":            {"type": "string"},
-                        "filename":        {"type": "string"},
-                        "_isUpload":       {"type": "boolean"},
-                        "_type":           {"type": "string"},
-                    },
-                },
-                "referenceMeasurements": {
-                    "type": "string",
-                    "description": (
-                        "Optional. Known real-world dimensions, "
-                        "e.g. 'Terrace is 8 m wide and 12 m deep. Pool is 4×8 m.'"
-                    ),
-                },
-            },
-            "required": ["generationRef"],
         },
     },
 ]

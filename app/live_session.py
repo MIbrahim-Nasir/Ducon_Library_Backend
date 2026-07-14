@@ -206,54 +206,6 @@ _TOOLS: list[dict] = [
                 "parameters": {"type": "object", "properties": {}},
             },
             {
-                "name": "get_quotation",
-                "description": (
-                    "Requests a Gemini AI quotation analysis for an AI-generated visualisation. "
-                    "Opens the Quotation modal, lets the user confirm their original space photo "
-                    "(if not pre-supplied), then returns a full area-measurement and fixed-items breakdown. "
-                    "Call this after generate_multi_image when the user asks for measurements, a material "
-                    "list, or a cost estimate. Pass generationRef from the generation result. "
-                    "If the user already uploaded a photo this session, pass it as userImageRef to skip "
-                    "the before-photo picker. If the user provides any known room or space dimensions, "
-                    "pass them as referenceMeasurements — this raises estimate accuracy significantly. "
-                    "Returns void after opening the quotation modal."
-                ),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "generationRef": {
-                            "type": "string",
-                            "description": (
-                                "Generation reference: id, name, or JSON object string."
-                            ),
-                        },
-                        "userImageRef": {
-                            "type": "object",
-                            "description": (
-                                "Optional. The user's original space photo upload object."
-                            ),
-                            "properties": {
-                                "id":              {"type": "integer"},
-                                "name":            {"type": "string"},
-                                "filename":        {"type": "string"},
-                                "_isUpload":       {"type": "boolean"},
-                                "_type":           {"type": "string"},
-                            },
-                        },
-                        "referenceMeasurements": {
-                            "type": "string",
-                            "description": (
-                                "Optional. Known real-world dimensions that help Gemini calibrate area "
-                                "estimates, e.g. 'Terrace is 8 m wide and 12 m deep. Pool is 4×8 m.' "
-                                "Omit or pass null when dimensions are unknown. When provided, confidence "
-                                "levels in the response will be higher."
-                            ),
-                        },
-                    },
-                    "required": ["generationRef"],
-                },
-            },
-            {
                 "name": "send_to_chat",
                 "description": (
                     "Delegate a design task to the shared text chat agent (same session as the "
@@ -379,7 +331,6 @@ _NO_TIMEOUT_TOOLS: frozenset[str] = frozenset({
     "UploadImage",
     "generate_multi_image",
     "send_to_chat",
-    "get_quotation",   # Gemini 3.1 Pro analysis can take 15–30 s
 })
 
 _LIVE_AISEARCH_MAX_ITEMS = 8        # default; live via cfg("CHAT_AISEARCH_MAX_ITEMS", ...)
@@ -1537,8 +1488,7 @@ def _compact_generate_multi_image_result(result: object) -> dict:
         "input_quality": result.get("input_quality"),
         "generation_warnings": result.get("generation_warnings"),
         "note": (
-            "Generation complete. Call get_image(generation_ref) to open it. "
-            "Offer get_quotation if the user wants measurements."
+            "Generation complete. Call get_image(generation_ref) to open it."
         ),
     }
     return {k: v for k, v in compact.items() if v is not None}

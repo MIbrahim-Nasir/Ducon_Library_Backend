@@ -1,8 +1,33 @@
 # Changelog — Ducon Library Backend
 
-**Session date:** 2026-07-11 (updated) / 2026-07-10 / 2026-07-09 / 2026-07-08  
+**Session date:** 2026-07-14 (updated) / 2026-07-11 / 2026-07-10 / 2026-07-09 / 2026-07-08  
 **Branch:** `FastprodCloudflare` (uncommitted working tree at time of writing)  
-**Scope:** Watermarks, AI search image input, generation pipeline audit, guest identity & limits, abuse protection, cache flush, cookies, platform hardening, tests, Resend burst handling, Selenium E2E.
+**Scope:** Prod cut 14 Jul 2026 live; guest chat/gen UX fixes; PGE/evaluator colour marks & scope; image-gen agent cleanup; remove `get_quotation`; local uvicorn indentation fix. Prior: watermarks, AI search, guest identity, abuse protection, cache flush, Selenium E2E.
+
+### 2026-07-14 — Prod cut live + guest / gen agent polish
+
+- **Prod** — Jul 2026 deploy checklist completed and live; archive
+  `Local_Files/prodtodo14072026.md`; ongoing todo reset in `Local_Files/prodtodo.md`.
+- **Guest chat stream** — emit SSE `done` only after transcript / persistence
+  completes (avoids empty-history races on reload).
+- **Guest gen-limit → signup** — on limit, surface signup instead of retrying
+  `generate_multi_image` in a loop.
+- **Guest → login** — reset chat state when a guest session becomes an
+  authenticated user.
+- **Colour marks / annotations (PGE + evaluator)** — F1/F2 prompt + rubric
+  guidance so marks are applied correctly and must not remain visible in output.
+- **PGE user-request scope** — change only what the user asked for (plus colour
+  marks); do not invent extra edits from reference images.
+- **`image-gen-agent.md` + ImageGenAgent** — drop legacy two-image pipeline
+  wording; label-based roles; fix Studio 2-image context order so roles stay
+  correct.
+- **Remove `get_quotation`** — dropped from chat/voice agents and prompts
+  (tool no longer offered).
+- **Benchmark `designer_agent`** — indentation fix that blocked local
+  `uvicorn` startup.
+- **Build id / cache flush** — continue matching `APP_BUILD_ID` ↔
+  `VITE_APP_BUILD_ID` on each deploy (`GET /meta/build`); see deploy docs /
+  archived prodtodo for ops detail (no change to the mechanism this cut).
 
 ### 2026-07-11 — Selenium E2E suite (production UI smoke)
 

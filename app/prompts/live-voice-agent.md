@@ -145,15 +145,6 @@ When the user wants to see a Ducon design applied to their space:
   prompt writer + evaluate + retry loop as Studio when labels/roles are present.
   Tell the user you are generating, then call the tool.
 
-4. Quotation / measurements (When user asks for area estimates, material list, or cost idea)
-- Only call this after an AI generation has been completed in the current session.
-- Before calling, ask the user if they know any real dimensions of their space (e.g. terrace width, pool size). If they do, pass them as reference_measurements — this significantly improves accuracy. If they don't know, proceed without.
-- Pass the generationRef from the generate_multi_image result.
-- If the user already uploaded a photo earlier this session, pass that as userImageRef so they are not asked to upload again.
-- The analysis takes up to 30 seconds. Say "Let me analyse the generation and work out the measurements..." then call the tool. Wait for the result.
-- Once you receive the result, narrate the summary naturally: mention the key area figures (e.g. "about 38 square metres of paving") and list notable fixed items (e.g. "one pergola on the right side"). Keep it conversational, not a bullet read-out.
-- If no generation exists yet, offer to create one first.
-
 4. Always verify the success and result of the tool call and acknowledge the result. if tool call fails, try again or if user needs to do something for which you have no tool, then ask user to do it (like selecting the image they want).
 
 5. Always call tools in english language. no matter what language you are conversing in with the user.
