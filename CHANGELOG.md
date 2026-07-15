@@ -1,8 +1,16 @@
 # Changelog — Ducon Library Backend
 
-**Session date:** 2026-07-14 (updated) / 2026-07-11 / 2026-07-10 / 2026-07-09 / 2026-07-08  
-**Branch:** `FastprodCloudflare` (uncommitted working tree at time of writing)  
-**Scope:** Prod cut 14 Jul 2026 live; guest chat/gen UX fixes; PGE/evaluator colour marks & scope; image-gen agent cleanup; remove `get_quotation`; local uvicorn indentation fix. Prior: watermarks, AI search, guest identity, abuse protection, cache flush, Selenium E2E.
+**Session date:** 2026-07-15 / 2026-07-14 / 2026-07-11 / 2026-07-10 / 2026-07-09 / 2026-07-08  
+**Branch:** `FastprodCloudflare`  
+**Scope:** Chat SSE keepalive fix + `CHAT_MEDIA_RESOLUTION`; frontend PlasmaOrb / DesignerChat WebGL; Apache cheat-sheet ops. Prior: prod cut 14 Jul, guest UX, PGE marks, image-gen cleanup.
+
+### 2026-07-15 — Chat SSE stability + media resolution
+
+- **Chat SSE keepalive** (`app/routers/chat.py`) — queue-based keepalive (same pattern as multi-image / studio) so idle gaps no longer cancel in-flight Gemini/Claude streams via `wait_for` on `__anext__` (root cause of “SSE closed without done”). Immediate first keepalive; Gemini file uploads moved into the stream producer so proxies see traffic during Files API / TTFT.
+- **`CHAT_MEDIA_RESOLUTION`** (`app/chat_agent.py`) — Interactions API per-part `resolution` for attached media (`low` / `medium` / `high` / `ultra_high`; unset → API default). Default `high`. Admin catalog + `env_template.txt`.
+- **Tests** (`tests/test_chat_stream_completion.py`) — keepalives during slow streams without cancelling the producer; leading keepalive allowed.
+- **Frontend (Ducon_Library)** — `PlasmaOrb` stronger unmount dispose (WebGL context leak); `DesignerChat` single orb during voice (header owns it).
+- **Ops** — `CheatSheet.md`: HostGator Apache userdata path for `ducon-proxy.conf`, verify `flushpackets=on`, rebuild/restart scripts (`ProxyPass` is not a bash command).
 
 ### 2026-07-14 — Prod cut live + guest / gen agent polish
 

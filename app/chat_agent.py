@@ -51,9 +51,51 @@ from app.error_logger import log_error
 
 CHAT_MODEL = "gemini-3.5-flash"                      # default; live value via cfg("CHAT_MODEL", CHAT_MODEL)
 CHAT_THINKING_LEVEL = "low"
+# Interactions API image/PDF token budget: low | medium | high | ultra_high
+# (empty / unspecified = API default; Gemini 3 image default ≈ high / 1120 tokens)
+CHAT_MEDIA_RESOLUTION = "high"
 # Set CHAT_STREAM to "false" to disable streaming (useful for debugging).
 CHAT_STREAM: bool = True
 _LIVE_DEBUG: bool = False
+
+_CHAT_MEDIA_RESOLUTION_VALUES = frozenset({
+    "low", "medium", "high", "ultra_high", "unspecified",
+})
+
+
+def chat_media_resolution() -> str | None:
+    """
+    Normalized Interactions API ``resolution`` for image/document inputs.
+
+    Returns ``low`` / ``medium`` / ``high`` / ``ultra_high``, or ``None`` when
+    unset / unspecified so the API default applies.
+    """
+    raw = str(cfg("CHAT_MEDIA_RESOLUTION", CHAT_MEDIA_RESOLUTION) or "").strip().lower()
+    raw = raw.replace("-", "_").replace(" ", "_")
+    if raw.startswith("media_resolution_"):
+        raw = raw[len("media_resolution_"):]
+    if not raw or raw in {"none", "default", "unspecified"}:
+        return None
+    if raw in _CHAT_MEDIA_RESOLUTION_VALUES:
+        return raw if raw != "unspecified" else None
+    logger.warning("Invalid CHAT_MEDIA_RESOLUTION=%r — ignoring", raw)
+    return None
+
+
+def apply_chat_media_resolution(parts: list) -> list:
+    """Attach ``resolution`` to Gemini Interactions image/document input dicts."""
+    level = chat_media_resolution()
+    if not level or not parts:
+        return parts
+    out: list = []
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") in ("image", "document", "video", "audio"):
+            enriched = dict(part)
+            enriched.setdefault("resolution", level)
+            out.append(enriched)
+        else:
+            out.append(part)
+    return out
 
 
 def _dbg(*args) -> None:
@@ -76,6 +118,7 @@ def _summarize_input_parts(parts: list) -> list[dict]:
                     "type": ptype,
                     "uri": part.get("uri"),
                     "mime_type": part.get("mime_type"),
+                    "resolution": part.get("resolution"),
                 })
             elif ptype == "function_result":
                 result = part.get("result")
@@ -558,6 +601,8 @@ async def stream_chat(
     _chat_stream = cfg("CHAT_STREAM", CHAT_STREAM)
     chat_tools = get_chat_tools(user_id=user_id) if allow_tools else []
 
+    input_parts = apply_chat_media_resolution(list(input_parts or []))
+
     generation_config: dict = {}
     if _chat_thinking and _chat_thinking.lower() not in ("none", ""):
         generation_config["thinking_level"] = _chat_thinking
@@ -573,6 +618,7 @@ async def stream_chat(
                 "model": _chat_model,
                 "stream": _chat_stream,
                 "thinking_level": _chat_thinking,
+                "media_resolution": chat_media_resolution(),
                 "previous_interaction_id": previous_interaction_id,
                 "input_parts": _summarize_input_parts(input_parts),
                 "tools": [tool.get("name") for tool in chat_tools],

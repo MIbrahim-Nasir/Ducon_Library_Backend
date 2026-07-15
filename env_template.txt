@@ -86,6 +86,9 @@ FUSED_COLLECTION_BASE = fused_store
 LIVE_VOICE = Iapetus
 LIVE_MODEL = gemini-3.1-flash-live-preview
 CHAT_MODEL = gemini-3.5-flash
+# Image/PDF token budget for chat (Interactions API): unspecified | low | medium | high | ultra_high
+# Gemini 3 approx image tokens: low 280, medium 560, high 1120, ultra_high 2240
+CHAT_MEDIA_RESOLUTION = high
 STUDIO_DIRECTIONS_MODEL = gemini-3-flash-preview
 STUDIO_DIRECTIONS_THINKING_LEVEL = High
 IMAGE_GEN_MODEL = gemini-3-pro-image-preview

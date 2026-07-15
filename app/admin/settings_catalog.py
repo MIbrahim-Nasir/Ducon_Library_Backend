@@ -51,6 +51,16 @@ AI_MODELS = Namespace(
         SettingSpec("USE_CLAUDE", "Use Claude instead of Gemini (text agents)", "bool", "false",
                     "Routes chat / image-gen / designer agents through Anthropic Claude."),
         SettingSpec("CHAT_MODEL", "Chat agent model", "string", "gemini-3.5-flash"),
+        SettingSpec(
+            "CHAT_MEDIA_RESOLUTION",
+            "Chat media resolution (image/PDF token budget)",
+            "choice",
+            "high",
+            choices=["unspecified", "low", "medium", "high", "ultra_high"],
+            description="Gemini Interactions API resolution for attached images/PDFs. "
+            "Higher = more visual detail, tokens, latency, and cost. "
+            "Gemini 3 image defaults: low≈280, medium≈560, high≈1120, ultra_high≈2240 tokens.",
+        ),
         SettingSpec("CLAUDE_MODEL", "Claude model", "string", "claude-sonnet-4-6"),
         SettingSpec("LIVE_MODEL", "Live voice model", "string", "gemini-3.1-flash-live-preview"),
         SettingSpec("DESIGNER_AGENT_MODEL", "Designer agent model", "string", "gemini-3.5-flash"),

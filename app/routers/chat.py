@@ -144,6 +144,12 @@ class ToolResultRequest(BaseModel):
 from app.sse import SSE_HEADERS as _SSE_HEADERS
 
 
+# Cloudflare idle-kills ~100s; keep well under that. Must NOT wrap
+# ``aiter.__anext__()`` in ``asyncio.wait_for`` — a timeout cancels the
+# underlying Gemini/Claude stream and the client sees "SSE closed without done".
+_CHAT_SSE_KEEPALIVE_INTERVAL = 15.0
+
+
 async def _stream_with_session_save(
     user_id: int | None,
     generator,
@@ -154,6 +160,7 @@ async def _stream_with_session_save(
     user_text: str | None = None,
     record_transcript: bool = True,
     increment_guest_on_done: bool = False,
+    keepalive_interval: float | None = None,
 ):
     """Emit chat SSE, then persist final-turn metadata without hiding ``done``.
 
@@ -161,96 +168,128 @@ async def _stream_with_session_save(
     yielded before any best-effort persistence: a database/session failure must
     not truncate an otherwise completed model response and leave the composer
     permanently in its streaming state.
+
+    Keepalives are produced via a background producer + ``queue.get`` timeout
+    (same pattern as multi-image / studio SSE). Waiting on the async generator
+    with ``wait_for`` would cancel in-flight model calls on every idle gap.
     """
-    KEEPALIVE_INTERVAL = 15.0  # seconds — resets Cloudflare's 100 s idle timeout
+    interval = (
+        _CHAT_SSE_KEEPALIVE_INTERVAL
+        if keepalive_interval is None
+        else float(keepalive_interval)
+    )
     assistant_parts: list[str] = []
+    queue: asyncio.Queue = asyncio.Queue()
 
-    async def _next_or_timeout(aiter, timeout):
-        """Return (chunk, False) or (None, True) on timeout."""
+    async def _producer() -> None:
         try:
-            return await asyncio.wait_for(aiter.__anext__(), timeout=timeout), False
-        except StopAsyncIteration:
-            return None, False
-        except asyncio.TimeoutError:
-            return None, True
+            async for chunk in generator:
+                await queue.put(("chunk", chunk))
+            await queue.put(("end", None))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Chat SSE producer failed")
+            await queue.put(("error", exc))
 
-    aiter = generator.__aiter__()
-    while True:
-        chunk, timed_out = await _next_or_timeout(aiter, KEEPALIVE_INTERVAL)
-        if timed_out:
-            yield ": keepalive\n\n"
-            continue
-        if chunk is None:
-            break
-        if chunk.startswith("data:"):
+    task = asyncio.create_task(_producer())
+    try:
+        # First byte immediately so Cloudflare/proxies do not treat the origin
+        # as hung while Gemini uploads or TTFT are still in flight.
+        yield ": keepalive\n\n"
+        while True:
             try:
-                payload = json.loads(chunk[5:].strip())
-                if payload.get("type") == "text_delta":
-                    delta = payload.get("text") or ""
-                    if delta:
-                        assistant_parts.append(delta)
-                if payload.get("type") == "done" and payload.get("interaction_id"):
-                    iid = payload["interaction_id"]
-                    # `done` is the protocol boundary and is always the final
-                    # event from chat_agent. Deliver it before persistence so a
-                    # database/session error cannot suppress completion.
-                    yield chunk
-                    try:
-                        if user_id is not None:
-                            await chat_session.set_interaction_id(user_id, iid)
-                        elif guest_session_id:
-                            await chat_session.set_guest_interaction_id(
-                                guest_session_id, iid
-                            )
-                        if record_transcript:
-                            model_text = "".join(assistant_parts).strip()
-                            memory_user = (user_text or "").strip()
-                            if memory_user or model_text:
-                                if user_id is not None:
-                                    await chat_session.append_turn(
-                                        user_id, memory_user, model_text
-                                    )
-                                elif guest_session_id:
-                                    await chat_session.append_guest_turn(
-                                        guest_session_id, memory_user, model_text
-                                    )
-                        if (
-                            increment_guest_on_done
-                            and guest_session_row is not None
-                            and db is not None
-                        ):
-                            await increment_guest_usage(
-                                db, guest_session_row, GuestUsageKind.CHAT
-                            )
-                            await db.commit()
-                    except Exception as exc:
-                        logger.exception(
-                            "Chat turn completed but final persistence failed "
-                            "(user_id=%r guest_session_id=%r interaction_id=%r)",
-                            user_id,
-                            guest_session_id,
-                            iid,
-                        )
-                        if db is not None:
-                            try:
-                                await db.rollback()
-                            except Exception:
-                                logger.exception(
-                                    "Failed to roll back chat persistence transaction"
+                kind, payload = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+
+            if kind == "end":
+                break
+
+            if kind == "error":
+                yield chat_agent._sse_error(str(payload))
+                break
+
+            chunk = payload
+            if chunk.startswith("data:"):
+                try:
+                    event = json.loads(chunk[5:].strip())
+                    if event.get("type") == "text_delta":
+                        delta = event.get("text") or ""
+                        if delta:
+                            assistant_parts.append(delta)
+                    if event.get("type") == "done" and event.get("interaction_id"):
+                        iid = event["interaction_id"]
+                        # `done` is the protocol boundary and is always the final
+                        # event from chat_agent. Deliver it before persistence so a
+                        # database/session error cannot suppress completion.
+                        yield chunk
+                        try:
+                            if user_id is not None:
+                                await chat_session.set_interaction_id(user_id, iid)
+                            elif guest_session_id:
+                                await chat_session.set_guest_interaction_id(
+                                    guest_session_id, iid
                                 )
-                        await log_error(
-                            "chat",
-                            "chat._stream_with_session_save",
-                            str(exc),
-                            user_id=user_id,
-                            guest_session_id=guest_session_id,
-                            endpoint="/chat/message",
-                            exc=exc,
-                        )
-                    continue
-            except (json.JSONDecodeError, TypeError, ValueError):
+                            if record_transcript:
+                                model_text = "".join(assistant_parts).strip()
+                                memory_user = (user_text or "").strip()
+                                if memory_user or model_text:
+                                    if user_id is not None:
+                                        await chat_session.append_turn(
+                                            user_id, memory_user, model_text
+                                        )
+                                    elif guest_session_id:
+                                        await chat_session.append_guest_turn(
+                                            guest_session_id, memory_user, model_text
+                                        )
+                            if (
+                                increment_guest_on_done
+                                and guest_session_row is not None
+                                and db is not None
+                            ):
+                                await increment_guest_usage(
+                                    db, guest_session_row, GuestUsageKind.CHAT
+                                )
+                                await db.commit()
+                        except Exception as exc:
+                            logger.exception(
+                                "Chat turn completed but final persistence failed "
+                                "(user_id=%r guest_session_id=%r interaction_id=%r)",
+                                user_id,
+                                guest_session_id,
+                                iid,
+                            )
+                            if db is not None:
+                                try:
+                                    await db.rollback()
+                                except Exception:
+                                    logger.exception(
+                                        "Failed to roll back chat persistence transaction"
+                                    )
+                            await log_error(
+                                "chat",
+                                "chat._stream_with_session_save",
+                                str(exc),
+                                user_id=user_id,
+                                guest_session_id=guest_session_id,
+                                endpoint="/chat/message",
+                                exc=exc,
+                            )
+                        continue
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+            yield chunk
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
                 pass
-        yield chunk
+            except Exception:
+                logger.exception("Chat SSE producer cleanup failed")
 
 
 # ── GET /chat/session ─────────────────────────────────────────────────────────
@@ -355,12 +394,12 @@ async def chat_message(
         },
     )
 
-    # ── Attach files ──────────────────────────────────────────────────────────
-    # Gemini path → upload to the Files API and reference by URI.
-    # Claude path → Anthropic Messages API is stateless and cannot read Gemini
-    #   File URIs, so we send the bytes inline as base64 image/document blocks.
-    use_claude = llm_provider.use_claude()
-    file_parts: list[dict] = []
+    # ── Read + validate attachments locally (fast) ────────────────────────────
+    # Gemini Files API upload is slow and used to run *before* StreamingResponse,
+    # so Cloudflare/browsers often saw no first byte and raised
+    # ERR_HTTP2_PROTOCOL_ERROR / Failed to fetch. Uploads run inside the SSE
+    # producer below so keepalives can flow immediately.
+    pending_files: list[tuple[str, bytes, str]] = []
     for upload in files:
         if not upload.filename:
             continue
@@ -369,76 +408,7 @@ async def chat_message(
             continue
         _validate_upload(upload.filename, file_bytes)
         mime = upload.content_type or _infer_mime(upload.filename)
-
-        if use_claude:
-            import base64 as _b64
-            if mime.startswith("image/"):
-                claude_mime, claude_bytes = _normalize_image_for_claude(file_bytes, mime)
-                file_parts.append({
-                    "type": "image_b64",
-                    "data": _b64.b64encode(claude_bytes).decode("ascii"),
-                    "mime_type": claude_mime,
-                })
-            elif mime == "application/pdf":
-                file_parts.append({
-                    "type": "document_b64",
-                    "data": _b64.b64encode(file_bytes).decode("ascii"),
-                    "mime_type": mime,
-                })
-            else:
-                # Unsupported inline type for Claude — skip with a note.
-                logger.info("Skipping non-image/pdf attachment for Claude: %s (%s)", upload.filename, mime)
-            chat_agent._dbg(
-                "[CHAT ROUTER ▶ FILE INLINE (claude)]",
-                {"filename": upload.filename, "bytes": len(file_bytes), "mime_type": mime},
-            )
-            continue
-
-        try:
-            uploaded = await chat_agent.upload_file_to_gemini(
-                file_bytes=file_bytes,
-                filename=upload.filename,
-                mime_type=mime,
-            )
-            chat_agent._dbg(
-                "[CHAT ROUTER ▶ FILE UPLOADED]",
-                {
-                    "filename": upload.filename,
-                    "bytes": len(file_bytes),
-                    "mime_type": mime,
-                    "gemini_uri": uploaded.get("uri"),
-                    "gemini_mime_type": uploaded.get("mime_type"),
-                },
-            )
-        except Exception as exc:
-            logger.warning("File upload failed for %s: %s", upload.filename, exc)
-            await log_error(
-                "chat",
-                "chat_agent.upload_file_to_gemini",
-                f"Gemini file upload failed: {upload.filename}",
-                user_id=current_user.id if current_user else None,
-                guest_session_id=guest_session_id,
-                endpoint="/chat/message",
-                exc=exc,
-                http_status=502,
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="File upload failed. Please try again or use a different file.",
-            ) from exc
-
-        file_type = _gemini_type_from_mime(uploaded["mime_type"])
-        file_parts.append({
-            "type":      file_type,
-            "uri":       uploaded["uri"],
-            "mime_type": uploaded["mime_type"],
-        })
-
-    # ── Build input parts ─────────────────────────────────────────────────────
-    input_parts: list = []
-    if message:
-        input_parts.append({"type": "text", "text": message})
-    input_parts.extend(file_parts)
+        pending_files.append((upload.filename, file_bytes, mime))
 
     # Prefer server-persisted session (updated by voice_context injects) over a
     # possibly stale client previous_interaction_id.
@@ -450,18 +420,101 @@ async def chat_message(
         session_prev = await chat_session.get_guest_interaction_id(guest_session_id)
     effective_prev = session_prev or previous_interaction_id
     memory_user = (message or "").strip()
-    if not memory_user and file_parts:
+    if not memory_user and pending_files:
         memory_user = "[User sent image attachment(s)]"
     stream_user_id = current_user.id if current_user else None
+    use_claude = llm_provider.use_claude()
+
+    async def _produce_message_stream():
+        # Gemini path → upload to the Files API and reference by URI.
+        # Claude path → Anthropic Messages API is stateless and cannot read Gemini
+        #   File URIs, so we send the bytes inline as base64 image/document blocks.
+        file_parts: list[dict] = []
+        for filename, file_bytes, mime in pending_files:
+            if use_claude:
+                import base64 as _b64
+                if mime.startswith("image/"):
+                    claude_mime, claude_bytes = _normalize_image_for_claude(file_bytes, mime)
+                    file_parts.append({
+                        "type": "image_b64",
+                        "data": _b64.b64encode(claude_bytes).decode("ascii"),
+                        "mime_type": claude_mime,
+                    })
+                elif mime == "application/pdf":
+                    file_parts.append({
+                        "type": "document_b64",
+                        "data": _b64.b64encode(file_bytes).decode("ascii"),
+                        "mime_type": mime,
+                    })
+                else:
+                    logger.info(
+                        "Skipping non-image/pdf attachment for Claude: %s (%s)",
+                        filename,
+                        mime,
+                    )
+                chat_agent._dbg(
+                    "[CHAT ROUTER ▶ FILE INLINE (claude)]",
+                    {"filename": filename, "bytes": len(file_bytes), "mime_type": mime},
+                )
+                continue
+
+            try:
+                uploaded = await chat_agent.upload_file_to_gemini(
+                    file_bytes=file_bytes,
+                    filename=filename,
+                    mime_type=mime,
+                )
+                chat_agent._dbg(
+                    "[CHAT ROUTER ▶ FILE UPLOADED]",
+                    {
+                        "filename": filename,
+                        "bytes": len(file_bytes),
+                        "mime_type": mime,
+                        "gemini_uri": uploaded.get("uri"),
+                        "gemini_mime_type": uploaded.get("mime_type"),
+                    },
+                )
+            except Exception as exc:
+                logger.warning("File upload failed for %s: %s", filename, exc)
+                await log_error(
+                    "chat",
+                    "chat_agent.upload_file_to_gemini",
+                    f"Gemini file upload failed: {filename}",
+                    user_id=stream_user_id,
+                    guest_session_id=guest_session_id,
+                    endpoint="/chat/message",
+                    exc=exc,
+                    http_status=502,
+                )
+                yield chat_agent._sse_error(
+                    "File upload failed. Please try again or use a different file."
+                )
+                return
+
+            file_type = _gemini_type_from_mime(uploaded["mime_type"])
+            file_parts.append({
+                "type": file_type,
+                "uri": uploaded["uri"],
+                "mime_type": uploaded["mime_type"],
+            })
+
+        input_parts: list = []
+        if message:
+            input_parts.append({"type": "text", "text": message})
+        input_parts.extend(file_parts)
+
+        async for chunk in chat_agent.stream_chat(
+            input_parts=input_parts,
+            previous_interaction_id=effective_prev or None,
+            user_id=stream_user_id,
+            guest_session_id=guest_session_id,
+        ):
+            yield chunk
+
     return StreamingResponse(
         _stream_with_session_save(
             stream_user_id,
-            chat_agent.stream_chat(
-                input_parts=input_parts,
-                previous_interaction_id=effective_prev or None,
-                user_id=stream_user_id,
-                guest_session_id=guest_session_id,
-            ),
+            _produce_message_stream(),
             guest_session_id=guest_session_id,
             guest_session_row=guest_session_row,
             db=db if guest_session_row else None,
