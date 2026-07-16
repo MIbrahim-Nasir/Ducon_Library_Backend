@@ -8,16 +8,16 @@ on:
 
 jobs:
   backend:
-  runs-on: ubuntu-latest
+    runs-on: ubuntu-latest
 
-  steps:
-    - name: Check out the code
-      uses: actions/checkout@4
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@4
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v5
-      with:
-        python-version: '3.12'
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
 
-    - name: Install Dependencies
-      run: uv run pytest -q
+      - name: Install Dependencies
+        run: uv run pytest -q
