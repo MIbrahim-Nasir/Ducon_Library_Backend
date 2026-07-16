@@ -43,6 +43,8 @@ TRUSTED_EMAIL_DOMAINS: set[str] = {
     "samsung.com",
     # UAE providers
     "emirates.net.ae", "eim.ae", "du.ae", "etisalat.ae",
+    # Ducon
+    "duconodl.com",
 }
 
 
@@ -61,7 +63,7 @@ def validate_email_domain(email: str) -> str:
     if domain not in TRUSTED_EMAIL_DOMAINS:
         raise ValueError(
             f"Email domain '{domain}' is not accepted. "
-            "Please use an email from a known provider such as Gmail, Outlook, Yahoo, or iCloud."
+            "Please use an email from a known provider such as Gmail, Outlook, Yahoo, iCloud, or @duconodl.com."
         )
     return email
 
