@@ -1,5 +1,19 @@
 # VPS Cheat Sheet
 
+Active git branch for app work: **`main`** (FastprodCloudflare merged).
+
+## Auth email domains
+
+| Env | Values | Meaning |
+|-----|--------|---------|
+| `EMAIL_DOMAIN_POLICY` | `allowlist` (default) \| `allow_all` \| `block_disposable` | Server signup/login domain rules |
+| `ALLOW_ALL_EMAIL_DOMAINS` | `true` / `false` | Convenience toggle → forces `allow_all` |
+| Frontend | `VITE_EMAIL_DOMAIN_POLICY` / `VITE_ALLOW_ALL_EMAIL_DOMAINS` | Keep in sync with backend |
+
+`block_disposable` uses the `disposable-email-domains` PyPI package (community temp-mail blocklist).
+
+---
+
 ## Postgres
 
 ```bash

@@ -127,6 +127,15 @@ ADMIN_PASSWORD_HASH =
 # How long an X-Admin-Session token remains valid after password verification (minutes)
 ADMIN_SESSION_TTL_MINUTES = 30
 
+# ─── Auth email domains ───────────────────────────────────────────────────────
+# allowlist | allow_all | block_disposable
+#   allowlist         = only major providers + duconodl.com (default)
+#   allow_all         = any valid email domain
+#   block_disposable  = any domain except known temp/spam (disposable-email-domains)
+EMAIL_DOMAIN_POLICY = allowlist
+# Legacy bool: if true (and policy unset/invalid), same as allow_all
+ALLOW_ALL_EMAIL_DOMAINS = false
+
 # ─── Transactional email (Resend) ─────────────────────────────────────────────
 # Signup OTP + forgot-password OTP. Get API key at https://resend.com/api-keys
 # From address must use a domain verified in Resend.

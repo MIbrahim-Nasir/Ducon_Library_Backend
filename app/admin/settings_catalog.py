@@ -8,7 +8,7 @@ Single source of truth for:
 Keep ``SettingSpec.default`` values in sync with ``env_template.txt`` so the
 admin UI initial state matches a fresh deployment .env.
 
-Only the seven tunable namespaces are editable. Secrets are read-only and masked.
+Only the tunable namespaces are editable. Secrets are read-only and masked.
 """
 from __future__ import annotations
 
@@ -219,7 +219,41 @@ WATERMARK = Namespace(
 )
 
 
-# ── 8. Debug ──────────────────────────────────────────────────────────────────
+# ── 8. Auth ───────────────────────────────────────────────────────────────────
+
+AUTH = Namespace(
+    name="auth",
+    label="Auth & Signup",
+    description="Signup / login email domain policy.",
+    settings=[
+        SettingSpec(
+            "EMAIL_DOMAIN_POLICY",
+            "Email domain policy",
+            "choice",
+            "allowlist",
+            choices=["allowlist", "allow_all", "block_disposable"],
+            description=(
+                "allowlist = only TRUSTED_EMAIL_DOMAINS (Gmail, Outlook, …, duconodl.com). "
+                "allow_all = accept any valid email domain. "
+                "block_disposable = accept any domain except known temp/spam domains "
+                "(disposable-email-domains package)."
+            ),
+        ),
+        SettingSpec(
+            "ALLOW_ALL_EMAIL_DOMAINS",
+            "Allow all email domains (legacy toggle)",
+            "bool",
+            "false",
+            description=(
+                "When true and EMAIL_DOMAIN_POLICY is unset/invalid, behaves as allow_all. "
+                "Prefer EMAIL_DOMAIN_POLICY=allow_all."
+            ),
+        ),
+    ],
+)
+
+
+# ── 9. Debug ──────────────────────────────────────────────────────────────────
 
 DEBUG = Namespace(
     name="debug",
@@ -256,8 +290,12 @@ SECRETS = Namespace(
 )
 
 
-ALL_NAMESPACES: list[Namespace] = [AI_MODELS, THINKING, LIMITS, PATHS, GUEST, VOICE, WATERMARK, DEBUG, SECRETS]
-EDITABLE_NAMESPACES: list[Namespace] = [AI_MODELS, THINKING, LIMITS, PATHS, GUEST, VOICE, WATERMARK, DEBUG]
+ALL_NAMESPACES: list[Namespace] = [
+    AI_MODELS, THINKING, LIMITS, PATHS, GUEST, VOICE, WATERMARK, AUTH, DEBUG, SECRETS,
+]
+EDITABLE_NAMESPACES: list[Namespace] = [
+    AI_MODELS, THINKING, LIMITS, PATHS, GUEST, VOICE, WATERMARK, AUTH, DEBUG,
+]
 
 _SPEC_INDEX: dict[str, SettingSpec] = {}
 _NS_INDEX: dict[str, Namespace] = {}

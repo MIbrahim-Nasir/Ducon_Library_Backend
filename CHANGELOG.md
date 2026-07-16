@@ -1,8 +1,22 @@
 # Changelog — Ducon Library Backend
 
-**Session date:** 2026-07-15 / 2026-07-14 / 2026-07-11 / 2026-07-10 / 2026-07-09 / 2026-07-08  
-**Branch:** `FastprodCloudflare`  
-**Scope:** Chat SSE keepalive fix + `CHAT_MEDIA_RESOLUTION`; frontend PlasmaOrb / DesignerChat WebGL; Apache cheat-sheet ops. Prior: prod cut 14 Jul, guest UX, PGE marks, image-gen cleanup.
+**Session date:** 2026-07-16 / 2026-07-15 / 2026-07-14 / 2026-07-11 / 2026-07-10 / 2026-07-09 / 2026-07-08  
+**Branch:** `main` (`FastprodCloudflare` merged into `main`)  
+**Scope:** Email domain policy + disposable blocklist; UAE phone split input; prior SSE / media resolution / prod cut work.
+
+### 2026-07-16 — Email domain policy + signup phone UX
+
+- **Branch** — `FastprodCloudflare` merged into `main`; active work continues on `main` (backend + frontend).
+- **`EMAIL_DOMAIN_POLICY`** (`app/validators.py`) — `allowlist` (default) | `allow_all` | `block_disposable`.
+  - `allowlist`: existing trusted-provider set (+ `duconodl.com`).
+  - `allow_all`: any valid email domain.
+  - `block_disposable`: reject known temp/spam domains via PyPI package
+    [`disposable-email-domains`](https://pypi.org/project/disposable-email-domains/) (~8k domains; used by PyPI itself).
+- **`ALLOW_ALL_EMAIL_DOMAINS`** — convenience bool toggle; when `true`, forces `allow_all`.
+- Admin catalog (`auth` namespace) + `env_template.txt`.
+- Tests: `tests/test_email_domain_validation.py`.
+- Frontend: `VITE_EMAIL_DOMAIN_POLICY` / `VITE_ALLOW_ALL_EMAIL_DOMAINS` (must match backend).
+- **Signup phone UX (Ducon_Library)** — `UaePhoneInput` with fixed `+971` prefix; user types national digits only (`5X XXX XXXX`); still strips leading `0` / pasted `971`; stores E.164. Wired in SignupForm, PhoneModal, and Settings.
 
 ### 2026-07-15 — Chat SSE stability + media resolution
 

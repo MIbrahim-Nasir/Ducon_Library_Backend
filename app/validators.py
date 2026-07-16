@@ -3,10 +3,11 @@ app/validators.py
 ─────────────────
 Reusable field validators for email and phone number inputs.
 
-Email rules:
-  - Must be a valid email format (handled upstream by Pydantic EmailStr)
-  - Domain must belong to a known, trusted email provider
-  - Unknown / disposable / corporate-only domains are rejected
+Email rules (controlled by EMAIL_DOMAIN_POLICY):
+  - allowlist (default): domain must be in TRUSTED_EMAIL_DOMAINS
+  - allow_all: any syntactically valid email (Pydantic EmailStr upstream)
+  - block_disposable: reject known temp/spam domains via disposable-email-domains
+    (community blocklist used by PyPI and others)
 
 Phone number rules:
   - Must be a valid UAE phone number
@@ -15,10 +16,16 @@ Phone number rules:
   - Stored in E.164 international format: +971XXXXXXXXX
 """
 
+from __future__ import annotations
+
 import phonenumbers
 from phonenumbers import NumberParseException, PhoneNumberType, number_type
 
-# ── Trusted email provider domains ────────────────────────────────────────────
+from disposable_email_domains import blocklist as DISPOSABLE_EMAIL_BLOCKLIST
+
+from app.admin.settings_store import cfg
+
+# ── Trusted email provider domains (allowlist mode) ───────────────────────────
 # Extend this set as needed. All entries are lowercase.
 TRUSTED_EMAIL_DOMAINS: set[str] = {
     # Google
@@ -47,23 +54,77 @@ TRUSTED_EMAIL_DOMAINS: set[str] = {
     "duconodl.com",
 }
 
+EMAIL_DOMAIN_POLICY_DEFAULT = "allowlist"
+EMAIL_DOMAIN_POLICIES = frozenset({"allowlist", "allow_all", "block_disposable"})
+
+
+def email_domain_policy() -> str:
+    """
+    Effective email domain policy.
+
+    Values: allowlist | allow_all | block_disposable
+
+    ``ALLOW_ALL_EMAIL_DOMAINS=true`` is a convenience toggle that forces
+    ``allow_all`` (overrides EMAIL_DOMAIN_POLICY). Prefer setting
+    EMAIL_DOMAIN_POLICY explicitly.
+    """
+    allow_all = cfg("ALLOW_ALL_EMAIL_DOMAINS", False)
+    if allow_all is True or str(allow_all).strip().lower() in {"1", "true", "yes", "on"}:
+        return "allow_all"
+
+    raw = str(cfg("EMAIL_DOMAIN_POLICY", EMAIL_DOMAIN_POLICY_DEFAULT) or "").strip().lower()
+    raw = raw.replace("-", "_").replace(" ", "_")
+    if raw in EMAIL_DOMAIN_POLICIES:
+        return raw
+    return EMAIL_DOMAIN_POLICY_DEFAULT
+
+
+def is_disposable_email_domain(domain: str) -> bool:
+    """True if domain (or a parent suffix) is on the disposable blocklist."""
+    domain = (domain or "").strip().lower().rstrip(".")
+    if not domain or "." not in domain:
+        return False
+    parts = domain.split(".")
+    # Check domain and parent suffixes (mail.temp.com → temp.com)
+    for i in range(len(parts) - 1):
+        if ".".join(parts[i:]) in DISPOSABLE_EMAIL_BLOCKLIST:
+            return True
+    return False
+
 
 def validate_email_domain(email: str) -> str:
     """
-    Validates that the email domain belongs to a trusted provider.
+    Validates the email domain according to EMAIL_DOMAIN_POLICY.
     Returns the normalised lowercase email if valid.
     Raises ValueError with a human-readable message if not.
     """
     email = email.strip().lower()
     try:
-        domain = email.split("@")[1]
+        domain = email.split("@", 1)[1]
     except IndexError:
         raise ValueError("Invalid email address.")
+    if not domain:
+        raise ValueError("Invalid email address.")
 
+    policy = email_domain_policy()
+
+    if policy == "allow_all":
+        return email
+
+    if policy == "block_disposable":
+        if is_disposable_email_domain(domain):
+            raise ValueError(
+                "Temporary or disposable email addresses are not accepted. "
+                "Please use a permanent email address."
+            )
+        return email
+
+    # allowlist (default)
     if domain not in TRUSTED_EMAIL_DOMAINS:
         raise ValueError(
             f"Email domain '{domain}' is not accepted. "
-            "Please use an email from a known provider such as Gmail, Outlook, Yahoo, iCloud, or @duconodl.com."
+            "Please use an email from a known provider such as Gmail, Outlook, "
+            "Yahoo, iCloud, or @duconodl.com."
         )
     return email
 
