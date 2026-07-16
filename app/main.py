@@ -190,6 +190,7 @@ if os.getenv("DEV_DASHBOARD_ENABLED", "").lower() in ("1", "true", "yes") and no
     app.include_router(dev_benchmark_router)
 
 # Serve public library images statically
+os.makedirs("data/images", exist_ok=True)
 app.mount("/public/images", StaticFiles(directory="data/images"), name="public_images")
 
 # Request-ID outermost among app middlewares so contextvar covers route handlers
