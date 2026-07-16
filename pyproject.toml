@@ -39,6 +39,7 @@ dev = [
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+testpaths = ["tests"]
 markers = [
     "e2e: Selenium end-to-end tests against a live Ducon app (run with: pytest -m e2e tests/e2e)",
     "e2e_gen: E2E tests that may trigger paid AI generation (requires E2E_ALLOW_GEN=1)",

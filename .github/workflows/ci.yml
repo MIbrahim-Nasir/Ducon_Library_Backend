@@ -20,4 +20,4 @@ jobs:
           python-version: '3.12'
 
       - name: Install Dependencies
-        run: uv run pytest -q
+        run: uv run pytest --ignore=tests/e2e -q
