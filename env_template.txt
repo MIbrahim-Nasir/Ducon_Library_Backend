@@ -25,6 +25,10 @@ ENV = development
 # can flush stale PWA caches after a release. Set the same value as VITE_APP_BUILD_ID
 # in the frontend build.
 APP_BUILD_ID =
+# Path to a file rewritten on each deploy (contents = build id). Read on every
+# GET /meta/build so a SIGHUP reload picks up the new id without a full restart.
+# Empty = skip file and use APP_BUILD_ID / "dev".
+BUILD_ID_FILE =
 # Comma-separated allowed browser origins for CORS (production must set this).
 CORS_ALLOW_ORIGINS = https://app.your-domain.com
 # Secret required to trigger POST /guest/cleanup (send as X-Cron-Secret header).

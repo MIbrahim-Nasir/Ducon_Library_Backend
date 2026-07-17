@@ -20,6 +20,7 @@ STATIC_FLUSH = ROOT / "app" / "static" / "flushStaleCache.ts"
 @pytest_asyncio.fixture
 async def client(monkeypatch):
     monkeypatch.delenv("APP_BUILD_ID", raising=False)
+    monkeypatch.delenv("BUILD_ID_FILE", raising=False)
     import app.build_meta as build_meta
 
     importlib.reload(build_meta)
@@ -48,12 +49,90 @@ async def test_meta_build_returns_no_store_headers(client):
     assert "no-cache" in cache_control
 
 
-def test_get_build_id_reads_app_build_id_env(monkeypatch):
-    monkeypatch.setenv("APP_BUILD_ID", "deploy-abc123")
-    import app.build_meta as build_meta
+def test_get_build_id_defaults_to_dev(monkeypatch):
+    monkeypatch.delenv("APP_BUILD_ID", raising=False)
+    monkeypatch.delenv("BUILD_ID_FILE", raising=False)
+    from app.build_meta import get_build_id
 
-    importlib.reload(build_meta)
-    assert build_meta.get_build_id() == "deploy-abc123"
+    assert get_build_id() == "dev"
+
+
+def test_get_build_id_reads_app_build_id_env(monkeypatch):
+    monkeypatch.delenv("BUILD_ID_FILE", raising=False)
+    monkeypatch.setenv("APP_BUILD_ID", "deploy-abc123")
+    from app.build_meta import get_build_id
+
+    assert get_build_id() == "deploy-abc123"
+
+
+def test_get_build_id_reads_build_id_file(tmp_path, monkeypatch):
+    build_file = tmp_path / "build_id"
+    build_file.write_text("  file-sha-xyz  \n", encoding="utf-8")
+    monkeypatch.setenv("BUILD_ID_FILE", str(build_file))
+    monkeypatch.setenv("APP_BUILD_ID", "env-should-lose")
+    from app.build_meta import get_build_id
+
+    assert get_build_id() == "file-sha-xyz"
+
+
+def test_get_build_id_file_missing_falls_through_to_env(tmp_path, monkeypatch):
+    missing = tmp_path / "does-not-exist"
+    monkeypatch.setenv("BUILD_ID_FILE", str(missing))
+    monkeypatch.setenv("APP_BUILD_ID", "env-fallback")
+    from app.build_meta import get_build_id
+
+    assert get_build_id() == "env-fallback"
+
+
+def test_get_build_id_file_missing_falls_through_to_dev(tmp_path, monkeypatch):
+    missing = tmp_path / "does-not-exist"
+    monkeypatch.setenv("BUILD_ID_FILE", str(missing))
+    monkeypatch.delenv("APP_BUILD_ID", raising=False)
+    from app.build_meta import get_build_id
+
+    assert get_build_id() == "dev"
+
+
+def test_get_build_id_empty_file_falls_through(tmp_path, monkeypatch):
+    empty = tmp_path / "empty"
+    empty.write_text("", encoding="utf-8")
+    monkeypatch.setenv("BUILD_ID_FILE", str(empty))
+    monkeypatch.setenv("APP_BUILD_ID", "env-after-empty")
+    from app.build_meta import get_build_id
+
+    assert get_build_id() == "env-after-empty"
+
+
+def test_get_build_id_whitespace_file_falls_through(tmp_path, monkeypatch):
+    blank = tmp_path / "blank"
+    blank.write_text("   \n\t  ", encoding="utf-8")
+    monkeypatch.setenv("BUILD_ID_FILE", str(blank))
+    monkeypatch.setenv("APP_BUILD_ID", "env-after-whitespace")
+    from app.build_meta import get_build_id
+
+    assert get_build_id() == "env-after-whitespace"
+
+
+def test_get_build_id_file_wins_over_env(tmp_path, monkeypatch):
+    build_file = tmp_path / "build_id"
+    build_file.write_text("from-file", encoding="utf-8")
+    monkeypatch.setenv("BUILD_ID_FILE", str(build_file))
+    monkeypatch.setenv("APP_BUILD_ID", "from-env")
+    from app.build_meta import get_build_id
+
+    assert get_build_id() == "from-file"
+
+
+def test_get_build_id_rereads_file_each_call(tmp_path, monkeypatch):
+    build_file = tmp_path / "build_id"
+    build_file.write_text("id-A", encoding="utf-8")
+    monkeypatch.setenv("BUILD_ID_FILE", str(build_file))
+    monkeypatch.delenv("APP_BUILD_ID", raising=False)
+    from app.build_meta import get_build_id
+
+    assert get_build_id() == "id-A"
+    build_file.write_text("id-B", encoding="utf-8")
+    assert get_build_id() == "id-B"
 
 
 @pytest.mark.asyncio

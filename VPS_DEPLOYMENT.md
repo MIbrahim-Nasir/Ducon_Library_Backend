@@ -94,6 +94,9 @@ TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128
 # TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128,10.0.0.0/8
 # Or temporarily: TRUST_FORWARDED_IP_HEADERS=true  (less safe)
 APP_BUILD_ID=$(date -u +%Y%m%d%H%M%S)
+# Prefer a file for SIGHUP-friendly cache bust (env is frozen at process start):
+# BUILD_ID_FILE=/home/appducon/Ducon_Library_Backend/.build_id
+# echo -n "$APP_BUILD_ID" > "$BUILD_ID_FILE"
 ```
 
 Confirm admin `app_settings` namespace `guest` also has IP/subnet caps at **0**.
@@ -256,7 +259,9 @@ export VITE_API_BASE_URL=same-origin
 export VITE_APP_BUILD_ID=$(date -u +%Y%m%d%H%M%S)
 npm ci && npm run build
 sudo rsync -a --delete dist/ /var/www/ducon/dist/
-# Keep APP_BUILD_ID on the backend in sync with VITE_APP_BUILD_ID
+# Keep backend build id in sync with VITE_APP_BUILD_ID (prefer writing BUILD_ID_FILE
+# so a graceful reload sees the new id; APP_BUILD_ID alone stays stale until restart).
+# echo -n "$VITE_APP_BUILD_ID" > /home/appducon/Ducon_Library_Backend/.build_id
 ```
 
 Guest identity: the SPA calls `POST /guest/session` (HttpOnly cookie) and sends
