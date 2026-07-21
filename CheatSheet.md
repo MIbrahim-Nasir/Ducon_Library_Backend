@@ -2,6 +2,17 @@
 
 Active git branch for app work: **`main`** (FastprodCloudflare merged).
 
+## Langfuse (optional LLM tracing)
+
+```
+LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-...
+LANGFUSE_SECRET_KEY=sk-...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com   # optional; LANGFUSE_HOST also works
+```
+
+Off by default / fail-open when keys missing. See `app/observability/langfuse_client.py`.
+
 ## Auth email domains
 
 | Env | Values | Meaning |

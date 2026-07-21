@@ -155,6 +155,11 @@ async def lifespan(app: FastAPI):
         from app.error_logger import get_error_logger
         await get_error_logger().stop()
         await get_usage_recorder().stop()
+        try:
+            from app.observability.langfuse_client import shutdown as langfuse_shutdown
+            langfuse_shutdown()
+        except Exception:
+            logger.debug("Langfuse shutdown skipped", exc_info=True)
         logger.info("Shutdown: disposing database connection pool")
         await engine.dispose()
         logger.info("Shutdown complete")

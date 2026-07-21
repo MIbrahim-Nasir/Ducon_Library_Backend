@@ -321,6 +321,33 @@ def record(
     error_message: Optional[str] = None,
 ) -> None:
     """Module-level convenience wrapper around the singleton recorder."""
+    # Langfuse dual-write (fail-open). Runs even when the DB usage queue is
+    # not started so local/dev tracing still works when enabled.
+    try:
+        from app.observability.langfuse_client import record_generation
+
+        record_generation(
+            agent=agent,
+            model=model,
+            provider=provider,
+            user_id=user_id,
+            guest_session_id=guest_session_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            image_count=image_count,
+            latency_ms=latency_ms,
+            status=status,
+            error_message=error_message,
+            cost_usd=compute_cost(
+                model,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                image_count=image_count,
+                audio_input_tokens=audio_input_tokens,
+            ),
+        )
+    except Exception:
+        pass
     get_usage_recorder().record(
         agent=agent, model=model, provider=provider, user_id=user_id,
         guest_session_id=guest_session_id, input_tokens=input_tokens,

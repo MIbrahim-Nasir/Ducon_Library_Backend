@@ -279,21 +279,47 @@ def complete_message(
     thinking: bool = True,
 ):
     """Synchronous full completion. Returns the final anthropic Message."""
+    import time
+
+    from app.observability.langfuse_client import observe_generation
+
     client = get_anthropic_client()
     kwargs = _build_kwargs(
         system=system, messages=messages, tools=tools,
         max_tokens=max_tokens, thinking=thinking,
     )
-    with client.messages.stream(**kwargs) as stream:
-        msg = stream.get_final_message()
-    try:
-        from app.admin.usage_helpers import record_from_usage_dict
-        usage = getattr(msg, "usage", None)
-        if usage is not None:
-            u = usage.model_dump() if hasattr(usage, "model_dump") else usage
-            record_from_usage_dict(u, agent="chat", model=claude_model(), provider="claude")
-    except Exception:
-        pass
+    model = claude_model()
+    t0 = time.perf_counter()
+    with observe_generation(
+        "generate-response",
+        model=model,
+        metadata={"agent": "chat", "provider": "claude"},
+        tags=["chat", "claude"],
+    ) as generation:
+        with client.messages.stream(**kwargs) as stream:
+            msg = stream.get_final_message()
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        try:
+            usage = getattr(msg, "usage", None)
+            if usage is not None:
+                u = usage.model_dump() if hasattr(usage, "model_dump") else (
+                    usage if isinstance(usage, dict) else {}
+                )
+                inp = int(u.get("input_tokens") or 0)
+                out = int(u.get("output_tokens") or 0)
+                try:
+                    generation.update(
+                        usage_details={"input": inp, "output": out} if (inp or out) else None,
+                        metadata={"agent": "chat", "provider": "claude", "latency_ms": latency_ms},
+                    )
+                except Exception:
+                    pass
+                from app.admin.usage_helpers import record_from_usage_dict
+                record_from_usage_dict(
+                    u, agent="chat", model=model, provider="claude", latency_ms=latency_ms,
+                )
+        except Exception:
+            pass
     return msg
 
 
@@ -306,21 +332,47 @@ async def acomplete_message(
     thinking: bool = True,
 ):
     """Async full completion. Returns the final anthropic Message."""
+    import time
+
+    from app.observability.langfuse_client import observe_generation
+
     client = get_async_anthropic_client()
     kwargs = _build_kwargs(
         system=system, messages=messages, tools=tools,
         max_tokens=max_tokens, thinking=thinking,
     )
-    async with client.messages.stream(**kwargs) as stream:
-        msg = await stream.get_final_message()
-    try:
-        from app.admin.usage_helpers import record_from_usage_dict
-        usage = getattr(msg, "usage", None)
-        if usage is not None:
-            u = usage.model_dump() if hasattr(usage, "model_dump") else usage
-            record_from_usage_dict(u, agent="chat", model=claude_model(), provider="claude")
-    except Exception:
-        pass
+    model = claude_model()
+    t0 = time.perf_counter()
+    with observe_generation(
+        "generate-response",
+        model=model,
+        metadata={"agent": "chat", "provider": "claude"},
+        tags=["chat", "claude"],
+    ) as generation:
+        async with client.messages.stream(**kwargs) as stream:
+            msg = await stream.get_final_message()
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        try:
+            usage = getattr(msg, "usage", None)
+            if usage is not None:
+                u = usage.model_dump() if hasattr(usage, "model_dump") else (
+                    usage if isinstance(usage, dict) else {}
+                )
+                inp = int(u.get("input_tokens") or 0)
+                out = int(u.get("output_tokens") or 0)
+                try:
+                    generation.update(
+                        usage_details={"input": inp, "output": out} if (inp or out) else None,
+                        metadata={"agent": "chat", "provider": "claude", "latency_ms": latency_ms},
+                    )
+                except Exception:
+                    pass
+                from app.admin.usage_helpers import record_from_usage_dict
+                record_from_usage_dict(
+                    u, agent="chat", model=model, provider="claude", latency_ms=latency_ms,
+                )
+        except Exception:
+            pass
     return msg
 
 

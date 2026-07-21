@@ -582,6 +582,55 @@ async def stream_chat(
         step.stop                 → event.index
         interaction.completed     → event.interaction.id, event.interaction.status
     """
+    from app.observability.langfuse_client import (
+        preview_user_text,
+        start_trace,
+        update_trace_output,
+    )
+
+    # One trace per chat turn; session groups multi-turn via interaction id
+    # (or guest session). See https://langfuse.com/docs/observability/best-practices
+    session_key = previous_interaction_id or guest_session_id
+    if not session_key and user_id is not None:
+        session_key = f"user-{user_id}"
+    user_preview = preview_user_text(input_parts)
+    assistant_bits: list[str] = []
+
+    with start_trace(
+        "chat-response",
+        user_id=user_id,
+        session_id=session_key,
+        tags=["chat"],
+        metadata={"agent": "chat"},
+        input=user_preview,
+    ):
+        async for chunk in _stream_chat_inner(
+            input_parts,
+            previous_interaction_id,
+            allow_tools=allow_tools,
+            user_id=user_id,
+            guest_session_id=guest_session_id,
+        ):
+            if isinstance(chunk, str) and chunk.startswith("data: "):
+                try:
+                    payload = json.loads(chunk[6:].strip())
+                    if payload.get("type") == "text_delta" and payload.get("text"):
+                        assistant_bits.append(str(payload["text"]))
+                except Exception:
+                    pass
+            yield chunk
+        if assistant_bits:
+            update_trace_output("".join(assistant_bits))
+
+
+async def _stream_chat_inner(
+    input_parts: list,
+    previous_interaction_id: Optional[str] = None,
+    *,
+    allow_tools: bool = True,
+    user_id: Optional[int] = None,
+    guest_session_id: Optional[str] = None,
+) -> AsyncGenerator[str, None]:
     # Route to Claude when enabled — Claude has no server-managed Interactions
     # API, so we keep our own message transcript keyed by the conversation id.
     if llm_provider.use_claude():

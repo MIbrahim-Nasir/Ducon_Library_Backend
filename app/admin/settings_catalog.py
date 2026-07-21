@@ -264,6 +264,13 @@ DEBUG = Namespace(
                     "Enables _dbg() prints across chat / live / designer / multi-image."),
         SettingSpec("CHAT_STREAM", "Stream chat responses", "bool", "true",
                     "Set false to disable SSE streaming for debugging."),
+        SettingSpec(
+            "LANGFUSE_ENABLED",
+            "Enable Langfuse LLM tracing",
+            "bool",
+            "false",
+            "Optional observability. Requires LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY. Fail-open when off.",
+        ),
     ],
 )
 
@@ -277,6 +284,8 @@ SECRETS = Namespace(
     settings=[
         SettingSpec("GOOGLE_API_KEY", "Google API key", "string", "", is_secret=True, editable=False, use_env_fallback=False),
         SettingSpec("ANTHROPIC_API_KEY", "Anthropic API key", "string", "", is_secret=True, editable=False, use_env_fallback=False),
+        SettingSpec("LANGFUSE_PUBLIC_KEY", "Langfuse public key", "string", "", is_secret=True, editable=False, use_env_fallback=False),
+        SettingSpec("LANGFUSE_SECRET_KEY", "Langfuse secret key", "string", "", is_secret=True, editable=False, use_env_fallback=False),
         SettingSpec("JWT_SECRET_KEY", "JWT signing secret", "string", "", is_secret=True, editable=False, use_env_fallback=False),
         SettingSpec("GOOGLE_CLIENT_ID", "Google OAuth client ID", "string", "", is_secret=True, editable=False, use_env_fallback=False),
         SettingSpec("URL_SIGNING_SECRET", "URL signing secret", "string", "", is_secret=True, editable=False, use_env_fallback=False),

@@ -7,6 +7,14 @@ GOOGLE_CLIENT_ID = your-google-oauth-client-id.apps.googleusercontent.com
 # Google Gemini API key — REQUIRED for all AI features (chat, image gen, embeddings).
 # Get one at https://aistudio.google.com/apikey
 GOOGLE_API_KEY =
+# Langfuse LLM observability (optional, fail-open). Off unless LANGFUSE_ENABLED=true
+# and both keys are set. Host defaults to Langfuse Cloud if unset.
+# https://langfuse.com — EU: https://cloud.langfuse.com  US: https://us.cloud.langfuse.com
+LANGFUSE_ENABLED = false
+LANGFUSE_PUBLIC_KEY =
+LANGFUSE_SECRET_KEY =
+# Optional; alias LANGFUSE_HOST also accepted by the client.
+LANGFUSE_BASE_URL =
 # OpenRouter API key — optional, used by the dev benchmark dashboard model-router pairs.
 # Get one at https://openrouter.ai/keys
 OPENROUTER_API_KEY =
