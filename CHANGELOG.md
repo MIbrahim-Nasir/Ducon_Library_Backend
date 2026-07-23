@@ -1,8 +1,22 @@
 # Changelog — Ducon Library Backend
 
-**Session date:** 2026-07-16 / 2026-07-15 / 2026-07-14 / 2026-07-11 / 2026-07-10 / 2026-07-09 / 2026-07-08  
-**Branch:** `main` (`FastprodCloudflare` merged into `main`)  
-**Scope:** Email domain policy + disposable blocklist; UAE phone split input; prior SSE / media resolution / prod cut work.
+**Session date:** 2026-07-23 / 2026-07-16 / 2026-07-15 / 2026-07-14 / 2026-07-11 / 2026-07-10 / 2026-07-09 / 2026-07-08  
+**Branch:** `development` (backend); frontend notes from sibling `Ducon_Library`  
+**Scope:** Admin analytics date ranges + guest metrics; Gemini stale interaction retry; Langfuse observability; in-process weekly retention cleanup; app syntax smoke in deploy checks; Studio R2/fusion UX (FE).
+
+### 2026-07-23 — Admin analytics, stale Gemini interactions, Langfuse, weekly cleanup, Studio UX
+
+- **Admin analytics (backend + frontend)** — Date-range presets (`7d` / `30d` / `90d` / `ytd` / `all` / custom `from`/`to`), UTC calendar windows ending today, continuous zero-filled daily series (fixes charts ending early when trailing days had no auth usage), new metrics for daily new users / new guests / active guests + avg/day, series toggles, day/week granularity, expand charts, CSV export, URL query persistence. (`app/admin/metrics.py`, `app/routers/admin.py`; FE: `Dashboard.jsx`, `MetricsRangeToolbar`, `adminApi.js`; tests: `tests/test_admin_metrics.py`)
+- **Chat / Gemini Interactions** — On `NotFound`/404 for `previous_interaction_id`, clear stored session id, emit `interaction_reset`, and retry create once without chaining (expired ~55d / key change). (`app/chat_agent.py`, `app/routers/chat.py`; tests: `tests/test_stale_interaction_retry.py`, `tests/test_chat_stream_completion.py`)
+  - Matcher accepts shorter `"entity was not found"` (and full NotFound phrasing); malformed `.code` is tolerated.
+  - If the unchained retry still fails: emit `interaction_reset` then `error` (no loop; client drops stale id).
+  - Adversarial coverage: user+guest clear, rate-limit/500/timeout no-retry, empty previous, Claude `cld_` bypass, non-stream path, router double-clear then `done` persists new id.
+- **Langfuse LLM observability (optional, fail-open)** — Dual-write traces/generations when `LANGFUSE_ENABLED=true` + keys set; chat + usage sinks with session/user/tags; admin catalog + `env_template.txt`; unit tests. (`app/observability/`, `app/llm_provider.py`, `app/chat_agent.py`, `app/admin/usage_recorder.py`)
+- **Studio covers (Ducon_Library)** — R2 URLs at `{origin}/studio/…` with local `/assets/studio/` fallback; type cards fall through to catalog when R2 type covers miss.
+- **Fusion UX (Ducon_Library)** — Animation plays once → monotonic progress bar + ETA (asymptotes &lt;100% until reveal).
+- **Frontend unit tests (Ducon_Library)** — Studio R2 catalog + progress/ETA/once-callback/unmount (+43); full suite 102 passed.
+- **Weekly retention cleanup (in-process)** — Lifespan background loop (`app/cleanup_scheduler.py`) with Postgres `pg_try_advisory_xact_lock` single-flight; shared purge in `app/cleanup_service.py` (also used by `POST /guest/cleanup`). Deletes expired unclaimed guest gens older than `CLEANUP_MIN_AGE_DAYS` (default **7**), terminal designer jobs older than `DESIGNER_JOB_RETENTION_DAYS` (default **7**, was 30), and expired `revoked_jtis` / `email_otps`. Env/catalog: `CLEANUP_ENABLED`, `CLEANUP_INTERVAL_DAYS`, `CLEANUP_MIN_AGE_DAYS`, `DESIGNER_JOB_RETENTION_DAYS`; `env_template.txt` / `CheatSheet.md`; tests: `tests/test_weekly_cleanup.py` (in deploy checks). No external cron required.
+- **App syntax smoke (deploy checks)** — `tests/test_app_syntax_smoke.py` `py_compile`s all `app/**/*.py` and imports critical modules; wired into `scripts/run_deploy_checks.py` default pytest subset.
 
 ### 2026-07-16 — Email domain policy + signup phone UX
 

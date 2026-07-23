@@ -129,15 +129,21 @@ async def lifespan(app: FastAPI):
                 logger.exception("rate_limiter cleanup failed")
 
     cleanup_task = asyncio.create_task(_rate_limit_cleanup_loop(), name="rate-limit-cleanup")
+    from app.cleanup_scheduler import weekly_cleanup_loop
+    weekly_cleanup_task = asyncio.create_task(
+        weekly_cleanup_loop(), name="weekly-retention-cleanup"
+    )
     logger.info("Startup complete")
     try:
         yield
     finally:
+        weekly_cleanup_task.cancel()
         cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except asyncio.CancelledError:
-            pass
+        for _task in (weekly_cleanup_task, cleanup_task):
+            try:
+                await _task
+            except asyncio.CancelledError:
+                pass
         # Cancel in-flight generation jobs so their CancelledError handlers can
         # persist a terminal status — otherwise a worker restart strands rows
         # in status='running' and cross-worker SSE pollers loop forever.

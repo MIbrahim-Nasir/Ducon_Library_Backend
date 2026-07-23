@@ -11,14 +11,21 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_TESTS = [
+    "tests/test_app_syntax_smoke.py",
     "tests/test_tool_generate_image_regressions.py",
     "tests/test_multi_image_endpoint_deploy.py",
     "tests/test_chat_tools_deploy.py",
     "tests/test_designer_job_cross_worker.py",
     "tests/test_designer_job_cleanup.py",
+    "tests/test_weekly_cleanup.py",
     "tests/test_signup_multistep_deploy.py",
 ]
+# Keep in sync with tests/test_app_syntax_smoke.py CRITICAL_IMPORT_MODULES.
 IMPORT_SANITY_MODULES = [
+    "app.benchmark.designer_agent",
+    "app.designer_agent",
+    "app.chat_agent",
+    "app.cleanup_scheduler",
     "app.tool_generate_image",
     "app.routers.multi_image_gen",
 ]

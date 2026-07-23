@@ -24,6 +24,7 @@ Streaming SSE event types (emitted to frontend)
   {"type": "text_delta",    "text": "..."}         → incremental response text
   {"type": "thinking_delta","text": "..."}         → model reasoning (if enabled)
   {"type": "tool_call",     "id":"...","name":"...","args":{...}}  → execute this
+  {"type": "interaction_reset","reason":"previous_not_found"} → stale chain cleared; fresh turn
   {"type": "done",          "interaction_id": "..."} → turn complete; save this ID
   {"type": "error",         "message": "..."}       → something went wrong
 """
@@ -549,6 +550,50 @@ def _sse_error(message: str) -> str:
     return _sse({"type": "error", "message": message})
 
 
+def _is_previous_interaction_not_found(exc: BaseException) -> bool:
+    """True when Gemini rejects ``previous_interaction_id`` as missing/expired."""
+    name = type(exc).__name__.lower()
+    if "notfound" in name:
+        return True
+
+    code = getattr(exc, "code", None)
+    try:
+        code_i = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code_i = None
+    if code_i == 404:
+        return True
+
+    msg = f"{getattr(exc, 'message', None) or ''} {exc}".lower()
+    # Gemini wording varies: "Requested entity was not found" / "entity was not found".
+    if "entity was not found" in msg:
+        return True
+    if "404" in msg and "not found" in msg:
+        return True
+    return False
+
+
+async def _clear_stored_interaction_id(
+    *,
+    user_id: Optional[int] = None,
+    guest_session_id: Optional[str] = None,
+) -> None:
+    """Drop a stale interaction_id from Postgres before retrying create."""
+    from app import chat_session as _chat_session
+
+    try:
+        if user_id is not None:
+            await _chat_session.set_interaction_id(user_id, None)
+        elif guest_session_id:
+            await _chat_session.set_guest_interaction_id(guest_session_id, None)
+    except Exception:
+        logger.exception(
+            "Failed to clear stale interaction_id (user_id=%r guest_session_id=%r)",
+            user_id,
+            guest_session_id,
+        )
+
+
 # ── Core streaming generator ──────────────────────────────────────────────────
 
 async def stream_chat(
@@ -659,6 +704,44 @@ async def _stream_chat_inner(
     interaction_id: Optional[str] = None
     tool_calls: list[dict] = []
     emitted_tool_call_ids: set[str] = set()
+    # Set True once we drop a stale previous_interaction_id (even if retry fails).
+    stale_chain_cleared = False
+
+    async def _interactions_create(*, stream: bool):
+        kwargs: dict = {
+            "model": _chat_model,
+            "system_instruction": get_chat_system_instruction(),
+            "input": input_parts,
+            "tools": chat_tools or None,
+            "previous_interaction_id": previous_interaction_id,
+            "generation_config": generation_config or None,
+        }
+        if stream:
+            kwargs["stream"] = True
+        return await client.aio.interactions.create(**kwargs)
+
+    async def _create_with_stale_retry(*, stream: bool):
+        """Create; on expired previous_interaction_id, clear + retry once without it."""
+        nonlocal previous_interaction_id, stale_chain_cleared
+        try:
+            return await _interactions_create(stream=stream), False
+        except Exception as exc:
+            if not previous_interaction_id or not _is_previous_interaction_not_found(exc):
+                raise
+            logger.warning(
+                "Stale previous_interaction_id=%s (%s); clearing and retrying without chain",
+                previous_interaction_id,
+                exc,
+            )
+            previous_interaction_id = None
+            stale_chain_cleared = True
+            await _clear_stored_interaction_id(
+                user_id=user_id,
+                guest_session_id=guest_session_id,
+            )
+            # Exactly one retry — further NotFound (or any error) propagates.
+            result = await _interactions_create(stream=stream)
+            return result, True
 
     try:
         _dbg(
@@ -682,15 +765,9 @@ async def _stream_chat_inner(
             fc_by_index: dict[int, dict] = {}
             thinking_started = False
 
-            stream = await client.aio.interactions.create(
-                model=_chat_model,
-                system_instruction=get_chat_system_instruction(),
-                input=input_parts,
-                tools=chat_tools or None,
-                previous_interaction_id=previous_interaction_id,
-                generation_config=generation_config or None,
-                stream=True,
-            )
+            stream, did_reset = await _create_with_stale_retry(stream=True)
+            if did_reset:
+                yield _sse({"type": "interaction_reset", "reason": "previous_not_found"})
 
             async for event in stream:
                 etype = getattr(event, "event_type", None)
@@ -795,14 +872,9 @@ async def _stream_chat_inner(
 
         else:
             # ── Non-streaming mode ──────────────────────────────────────────
-            interaction = await client.aio.interactions.create(
-                model=_chat_model,
-                system_instruction=get_chat_system_instruction(),
-                input=input_parts,
-                tools=chat_tools or None,
-                previous_interaction_id=previous_interaction_id,
-                generation_config=generation_config or None,
-            )
+            interaction, did_reset = await _create_with_stale_retry(stream=False)
+            if did_reset:
+                yield _sse({"type": "interaction_reset", "reason": "previous_not_found"})
             interaction_id = getattr(interaction, "id", None)
             _dbg(
                 "[CHAT ◀ RESPONSE]",
@@ -850,6 +922,10 @@ async def _stream_chat_inner(
             endpoint="/chat/message",
             exc=exc,
         )
+        # If we already dropped the stale chain, tell the client even when the
+        # unchained retry failed — otherwise it keeps replaying the expired id.
+        if stale_chain_cleared:
+            yield _sse({"type": "interaction_reset", "reason": "previous_not_found"})
         yield _sse_error(str(exc))
         return
 

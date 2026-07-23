@@ -134,12 +134,20 @@ def test_run_cleanup_commits_when_designer_jobs_pruned(monkeypatch):
     from app.routers import guest as guest_router
 
     monkeypatch.setattr(
-        "app.designer_cleanup.cleanup_designer_jobs",
+        "app.cleanup_service.cleanup_designer_jobs",
         AsyncMock(return_value={"designer_jobs_marked_stale": 0, "designer_jobs_deleted": 2}),
     )
+    monkeypatch.setattr(
+        "app.cleanup_service.cfg_int",
+        lambda key, default=0: 7 if key == "CLEANUP_MIN_AGE_DAYS" else default,
+    )
+
+    empty = MagicMock()
+    empty.scalars.return_value.all.return_value = []
+    empty.rowcount = 0
 
     db = MagicMock()
-    db.execute = AsyncMock(return_value=MagicMock(scalars=MagicMock(return_value=MagicMock(all=MagicMock(return_value=[])))))
+    db.execute = AsyncMock(return_value=empty)
     db.commit = AsyncMock()
 
     stats = _run(guest_router._run_cleanup(db))

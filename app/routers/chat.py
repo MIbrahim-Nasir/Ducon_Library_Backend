@@ -215,6 +215,25 @@ async def _stream_with_session_save(
             if chunk.startswith("data:"):
                 try:
                     event = json.loads(chunk[5:].strip())
+                    if event.get("type") == "interaction_reset":
+                        # Stale Gemini previous_interaction_id — drop before any
+                        # retry/done so Postgres cannot keep serving the expired id.
+                        try:
+                            if user_id is not None:
+                                await chat_session.set_interaction_id(user_id, None)
+                            elif guest_session_id:
+                                await chat_session.set_guest_interaction_id(
+                                    guest_session_id, None
+                                )
+                        except Exception:
+                            logger.exception(
+                                "Failed to clear session on interaction_reset "
+                                "(user_id=%r guest_session_id=%r)",
+                                user_id,
+                                guest_session_id,
+                            )
+                        yield chunk
+                        continue
                     if event.get("type") == "text_delta":
                         delta = event.get("text") or ""
                         if delta:

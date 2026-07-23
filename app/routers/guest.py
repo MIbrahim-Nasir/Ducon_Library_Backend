@@ -7,7 +7,7 @@ Guest-user endpoints:
   GET  /guest/usage                     — { generations, chat, voice } used/limit
   GET  /guest/gen-count                 — legacy { used, limit } for generations
   POST /auth/claim-guest-generations    — migrates guest generations to an authenticated user
-  POST /guest/cleanup                   — deletes expired guest gens + stale designer job rows (cron)
+  POST /guest/cleanup                   — deletes expired guest gens + stale designer job rows (manual/ops; same as weekly scheduler)
   GET  /guest/generations/{id}/image    — serves guest generation (local file or R2 redirect/proxy)
 
 Guest session identity:
@@ -352,65 +352,10 @@ async def claim_guest_generations(
 # ── POST /guest/cleanup ────────────────────────────────────────────────────────
 
 async def _run_cleanup(db: AsyncSession) -> dict[str, int]:
-    from datetime import datetime, timezone
+    """Manual/ops entry point — same purge as the in-process weekly scheduler."""
+    from app.cleanup_service import run_cleanup
 
-    from app.designer_cleanup import cleanup_designer_jobs
-
-    now = datetime.now(timezone.utc)
-
-    result = await db.execute(
-        select(GuestGeneration).where(
-            GuestGeneration.expires_at < now,
-            GuestGeneration.user_id.is_(None),
-        )
-    )
-    expired = result.scalars().all()
-
-    for gen in expired:
-        try:
-            storage.delete_guest_generation(gen.url)
-        except Exception:
-            pass
-
-    guest_deleted = 0
-    if expired:
-        await db.execute(
-            delete(GuestGeneration).where(
-                GuestGeneration.id.in_([g.id for g in expired])
-            )
-        )
-        guest_deleted = len(expired)
-
-    designer_stats = await cleanup_designer_jobs(db)
-
-    # Generation jobs stranded by a worker restart mid-run: without this sweep
-    # they stay status='running' forever and cross-worker SSE pollers never
-    # see a terminal status. Same policy as designer jobs.
-    from sqlalchemy import text as _sql_text
-    stale_gen = await db.execute(
-        _sql_text(
-            "UPDATE generation_jobs "
-            "SET status = 'failed', error = 'stale: worker restarted mid-run', "
-            "    updated_at = NOW() "
-            "WHERE status IN ('queued', 'running') "
-            "  AND updated_at < NOW() - INTERVAL '2 hours'"
-        )
-    )
-    generation_jobs_marked_stale = stale_gen.rowcount or 0
-
-    if (
-        guest_deleted
-        or generation_jobs_marked_stale
-        or designer_stats.get("designer_jobs_deleted")
-        or designer_stats.get("designer_jobs_marked_stale")
-    ):
-        await db.commit()
-
-    return {
-        "guest_generations_deleted": guest_deleted,
-        "generation_jobs_marked_stale": generation_jobs_marked_stale,
-        **designer_stats,
-    }
+    return await run_cleanup(db, commit=True)
 
 
 @router.post("/guest/cleanup")

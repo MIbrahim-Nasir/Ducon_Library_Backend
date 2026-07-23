@@ -263,6 +263,37 @@ async def reveal_secret(
 
 
 # ── metrics (admin + analytics) ───────────────────────────────────────────────
+#
+# Shared date window query params (UTC calendar days, inclusive):
+#   range=7d|30d|90d|ytd|all   (default 30d when nothing else set)
+#   from / to = YYYY-MM-DD     (custom inclusive range; overrides range/days)
+#   days=N                     (legacy; N calendar days ending today)
+# Daily series always zero-fills missing days through ``to`` (today by default).
+
+
+def _metrics_window_params(
+    days: Optional[int],
+    range_key: Optional[str],
+    date_from: Optional[str],
+    date_to: Optional[str],
+) -> dict:
+    """Normalize route query params for metrics helpers."""
+    kwargs: dict = {
+        "days": None,
+        "range_key": None,
+        "date_from": date_from or None,
+        "date_to": date_to or None,
+    }
+    if date_from or date_to:
+        return kwargs
+    if range_key:
+        kwargs["range_key"] = range_key
+        return kwargs
+    if days is not None:
+        kwargs["days"] = max(1, min(int(days), 1095))
+        return kwargs
+    kwargs["range_key"] = "30d"
+    return kwargs
 
 
 @router.get("/metrics/overview")
@@ -283,52 +314,90 @@ async def metrics_users(
 
 @router.get("/metrics/active")
 async def metrics_active(
-    days: int = 1,
+    days: Optional[int] = Query(None, ge=1, le=1095),
+    range_key: Optional[str] = Query(None, alias="range"),
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_analytics_jwt_only),
 ):
-    days = max(1, min(days, 365))
-    return await M.active_users(db, days)
+    # Default window for this endpoint historically was 1 day when only ``days``
+    # was omitted by clients that passed nothing — keep 7d as a sensible KPI
+    # default when the UI omits params; callers that pass days=1 still work.
+    if days is None and not range_key and not date_from and not date_to:
+        range_key = "7d"
+    try:
+        return await M.active_users(db, **_metrics_window_params(days, range_key, date_from, date_to))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/metrics/daily")
 async def metrics_daily(
-    days: int = 30,
+    days: Optional[int] = Query(None, ge=1, le=1095),
+    range_key: Optional[str] = Query(None, alias="range"),
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
+    granularity: str = Query("day"),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_analytics_jwt_only),
 ):
-    days = max(1, min(days, 365))
-    return {"days": days, "series": await M.daily_active_series(db, days)}
+    gran = (granularity or "day").strip().lower()
+    if gran not in ("day", "week"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="granularity must be day or week")
+    try:
+        return await M.daily_active_series(
+            db,
+            granularity=gran,
+            **_metrics_window_params(days, range_key, date_from, date_to),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/metrics/agents")
 async def metrics_agents(
-    days: int = 30,
+    days: Optional[int] = Query(None, ge=1, le=1095),
+    range_key: Optional[str] = Query(None, alias="range"),
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_analytics_jwt_only),
 ):
-    days = max(1, min(days, 365))
-    return {"days": days, "agents": await M.agent_breakdown(db, days)}
+    try:
+        return await M.agent_breakdown(db, **_metrics_window_params(days, range_key, date_from, date_to))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/metrics/models")
 async def metrics_models(
-    days: int = 30,
+    days: Optional[int] = Query(None, ge=1, le=1095),
+    range_key: Optional[str] = Query(None, alias="range"),
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_analytics_jwt_only),
 ):
-    days = max(1, min(days, 365))
-    return {"days": days, "models": await M.model_breakdown(db, days)}
+    try:
+        return await M.model_breakdown(db, **_metrics_window_params(days, range_key, date_from, date_to))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/metrics/time-spent")
 async def metrics_time_spent(
-    days: int = 30,
+    days: Optional[int] = Query(None, ge=1, le=1095),
+    range_key: Optional[str] = Query(None, alias="range"),
+    date_from: Optional[str] = Query(None, alias="from"),
+    date_to: Optional[str] = Query(None, alias="to"),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_analytics_jwt_only),
 ):
-    days = max(1, min(days, 365))
-    return await M.time_spent(db, days)
+    try:
+        return await M.time_spent(db, **_metrics_window_params(days, range_key, date_from, date_to))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.get("/metrics/retention")

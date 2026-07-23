@@ -40,6 +40,22 @@ App runtime uses `DATABASE_URL` (async: `postgresql+asyncpg://...`) from `.env` 
 Unit file: `/etc/systemd/system/ducon-library.service`  
 Runs as user `appducon`, binds gunicorn to `127.0.0.1:8000`, loads `/home/appducon/Ducon_Library_Backend/.env`.
 
+### Weekly cleanup (in-process)
+
+No external cron required for guest/designer retention. Each gunicorn worker starts a
+lifespan loop; **Postgres `pg_try_advisory_xact_lock(788214002)`** ensures only one
+worker runs cleanup per tick. Last run is stored in `app_settings` (`system` /
+`CLEANUP_LAST_RUN_AT`).
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `CLEANUP_ENABLED` | `true` | Disable with `false` |
+| `CLEANUP_INTERVAL_DAYS` | `7` | Min days between successful runs |
+| `CLEANUP_MIN_AGE_DAYS` | `7` | Guest gens must be older than this to delete |
+| `DESIGNER_JOB_RETENTION_DAYS` | `7` | Terminal designer job row retention |
+
+Manual: `POST /guest/cleanup` with `X-Cron-Secret` (still works; same purge function).
+
 ```bash
 sudo systemctl start ducon-library
 sudo systemctl restart ducon-library

@@ -40,10 +40,16 @@ BUILD_ID_FILE =
 # Comma-separated allowed browser origins for CORS (production must set this).
 CORS_ALLOW_ORIGINS = https://app.your-domain.com
 # Secret required to trigger POST /guest/cleanup (send as X-Cron-Secret header).
-# Also prunes designer_jobs metadata (see DESIGNER_JOB_RETENTION_DAYS).
+# Manual/ops only — weekly cleanup also runs in-process (see CLEANUP_* below).
 GUEST_CLEANUP_SECRET =
-# Designer job row retention in designer_jobs (terminal jobs only; default 30 days).
-DESIGNER_JOB_RETENTION_DAYS = 30
+# In-process weekly retention cleanup (lifespan background task; Postgres advisory lock
+# so only one gunicorn worker runs per tick). Set CLEANUP_ENABLED=false to disable.
+CLEANUP_ENABLED = true
+CLEANUP_INTERVAL_DAYS = 7
+# Minimum age before deleting guest gens / aligning retention (strictly older than N days).
+CLEANUP_MIN_AGE_DAYS = 7
+# Designer job row retention in designer_jobs (terminal jobs only; default 7 days).
+DESIGNER_JOB_RETENTION_DAYS = 7
 # Mark in-flight designer jobs failed when updated_at is older than this (worker crash).
 DESIGNER_JOB_STALE_RUNNING_HOURS = 2
 # Secret used to sign local-mode guest image URLs (defaults to JWT_SECRET_KEY).

@@ -14,7 +14,8 @@ _TERMINAL = frozenset({"completed", "failed", "cancelled"})
 
 
 def _retention_days() -> int:
-    return max(1, int(os.getenv("DESIGNER_JOB_RETENTION_DAYS", "30")))
+    # Default 7 days — aligned with in-process weekly cleanup (CLEANUP_MIN_AGE_DAYS).
+    return max(1, int(os.getenv("DESIGNER_JOB_RETENTION_DAYS", "7")))
 
 
 def _stale_running_hours() -> int:
@@ -25,7 +26,7 @@ async def cleanup_designer_jobs(db: AsyncSession) -> dict[str, int]:
     """Prune old terminal job rows and mark crashed in-flight jobs as failed.
 
     Does not delete user ``generations`` — only the job metadata/event log in
-    ``designer_jobs``. Run from the same cron as ``POST /guest/cleanup``.
+    ``designer_jobs``. Run from ``POST /guest/cleanup`` and the weekly in-process scheduler.
     """
     now = datetime.now(timezone.utc)
     stale_cutoff = now - timedelta(hours=_stale_running_hours())
