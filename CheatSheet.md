@@ -64,31 +64,6 @@ sudo systemctl reload ducon-library
 sudo systemctl is-active ducon-library
 ```
 
-### API returns 503 (SPA HTML) while static assets load
-
-Apache is up; **gunicorn on `127.0.0.1:8000` is not**. Proxied routes (`/meta`, `/auth`, …)
-fail with 503; DocumentRoot still serves the Vite `index.html` (often as the 503 body).
-
-```bash
-# On the VPS — diagnose
-sudo systemctl is-active ducon-library
-sudo journalctl -u ducon-library -n 120 --no-pager
-curl -sS -i --max-time 5 http://127.0.0.1:8000/meta/build
-
-# Fix: sync deps (langfuse etc.) + restart + verify
-cd ~/Ducon_Library_Backend
-git fetch origin main && git reset --hard origin/main
-bash scripts/vps_deploy.sh
-# Or manual:
-#   uv sync   # or: .venv/bin/pip install .
-#   sudo systemctl restart ducon-library
-#   curl -sS http://127.0.0.1:8000/meta/build
-```
-
-Automated deploys (GitHub Actions → SSH) run `scripts/vps_deploy.sh` after
-`git reset --hard origin/main`. That script **must** install pyproject deps and
-refuse to exit 0 unless loopback `/meta/build` succeeds.
-
 After editing the unit file:
 
 ```bash

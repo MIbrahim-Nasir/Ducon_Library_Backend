@@ -8,6 +8,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import DesignerJobRow
+from app.designer_agent import JOBS
 
 _TERMINAL = frozenset({"completed", "failed", "cancelled"})
 
@@ -66,11 +67,7 @@ async def cleanup_designer_jobs(db: AsyncSession) -> dict[str, int]:
     if marked_stale or deleted:
         pass  # caller commits
 
-    # Lazy import: avoid pulling designer_agent into cleanup/scheduler import graph.
-    if old_ids:
-        from app.designer_agent import JOBS
-
-        for job_id in old_ids:
-            JOBS.pop(job_id, None)
+    for job_id in old_ids:
+        JOBS.pop(job_id, None)
 
     return {"designer_jobs_marked_stale": marked_stale, "designer_jobs_deleted": deleted}
