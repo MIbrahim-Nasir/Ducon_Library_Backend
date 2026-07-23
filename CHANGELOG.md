@@ -6,6 +6,7 @@
 
 ### 2026-07-23 — Admin analytics, stale Gemini interactions, Langfuse, weekly cleanup, Studio UX
 
+- **Prod 503 hotfix / deploy gate** — Apache 503 + SPA HTML on API routes meant gunicorn was down on `:8000` after deploy; CI now `git reset --hard origin/main` + `scripts/vps_deploy.sh` (`uv sync`/`pip install .` → restart → loopback `/meta/build` or fail with journalctl). Lifespan weekly cleanup start is fail-open; `designer_cleanup` lazy-imports `JOBS`. Ops notes in `CheatSheet.md` + `previous_mistakes_and_advice.md`.
 - **Admin analytics (backend + frontend)** — Date-range presets (`7d` / `30d` / `90d` / `ytd` / `all` / custom `from`/`to`), UTC calendar windows ending today, continuous zero-filled daily series (fixes charts ending early when trailing days had no auth usage), new metrics for daily new users / new guests / active guests + avg/day, series toggles, day/week granularity, expand charts, CSV export, URL query persistence. (`app/admin/metrics.py`, `app/routers/admin.py`; FE: `Dashboard.jsx`, `MetricsRangeToolbar`, `adminApi.js`; tests: `tests/test_admin_metrics.py`)
 - **Chat / Gemini Interactions** — On `NotFound`/404 for `previous_interaction_id`, clear stored session id, emit `interaction_reset`, and retry create once without chaining (expired ~55d / key change). (`app/chat_agent.py`, `app/routers/chat.py`; tests: `tests/test_stale_interaction_retry.py`, `tests/test_chat_stream_completion.py`)
   - Matcher accepts shorter `"entity was not found"` (and full NotFound phrasing); malformed `.code` is tolerated.

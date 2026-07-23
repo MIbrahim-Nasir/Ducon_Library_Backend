@@ -129,17 +129,28 @@ async def lifespan(app: FastAPI):
                 logger.exception("rate_limiter cleanup failed")
 
     cleanup_task = asyncio.create_task(_rate_limit_cleanup_loop(), name="rate-limit-cleanup")
-    from app.cleanup_scheduler import weekly_cleanup_loop
-    weekly_cleanup_task = asyncio.create_task(
-        weekly_cleanup_loop(), name="weekly-retention-cleanup"
-    )
+    # Fail-open: retention loop must never prevent workers from serving traffic.
+    weekly_cleanup_task: Optional[asyncio.Task] = None
+    try:
+        from app.cleanup_scheduler import weekly_cleanup_loop
+
+        weekly_cleanup_task = asyncio.create_task(
+            weekly_cleanup_loop(), name="weekly-retention-cleanup"
+        )
+    except Exception:
+        logger.exception(
+            "Startup: weekly cleanup scheduler failed to start — continuing without it"
+        )
     logger.info("Startup complete")
     try:
         yield
     finally:
-        weekly_cleanup_task.cancel()
+        if weekly_cleanup_task is not None:
+            weekly_cleanup_task.cancel()
         cleanup_task.cancel()
         for _task in (weekly_cleanup_task, cleanup_task):
+            if _task is None:
+                continue
             try:
                 await _task
             except asyncio.CancelledError:
