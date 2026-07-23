@@ -612,6 +612,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "google-auth" },
     { name = "google-genai" },
+    { name = "gunicorn" },
     { name = "langfuse" },
     { name = "passlib", extra = ["bcrypt"] },
     { name = "pathlib" },
@@ -624,7 +625,7 @@ dependencies = [
     { name = "requests" },
     { name = "sentence-transformers" },
     { name = "sqlalchemy", extra = ["asyncio"] },
-    { name = "uvicorn" },
+    { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
 ]
 
@@ -647,6 +648,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.128.0" },
     { name = "google-auth", specifier = ">=2.48.0" },
     { name = "google-genai", specifier = ">=2.0.0" },
+    { name = "gunicorn", specifier = ">=26.0.0" },
     { name = "langfuse", specifier = ">=4.14.0" },
     { name = "passlib", extras = ["bcrypt"], specifier = ">=1.7.4" },
     { name = "pathlib", specifier = ">=1.0.1" },
@@ -659,7 +661,7 @@ requires-dist = [
     { name = "requests", specifier = ">=2.32.5" },
     { name = "sentence-transformers", specifier = ">=5.2.2" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.47" },
-    { name = "uvicorn", specifier = ">=0.40.0" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.40.0" },
     { name = "websockets", specifier = ">=16.0" },
 ]
 
@@ -927,6 +929,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/3c/05/33a7a4985586f27e1de4803887c417ec7ced145ebd069bc38a9607059e2b/grpcio-1.78.0-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:207db540302c884b8848036b80db352a832b99dfdf41db1eb554c2c2c7800f65", size = 7696837, upload-time = "2026-02-06T09:56:40.173Z" },
     { url = "https://files.pythonhosted.org/packages/73/77/7382241caf88729b106e49e7d18e3116216c778e6a7e833826eb96de22f7/grpcio-1.78.0-cp314-cp314-win32.whl", hash = "sha256:57bab6deef2f4f1ca76cc04565df38dc5713ae6c17de690721bdf30cb1e0545c", size = 4142439, upload-time = "2026-02-06T09:56:43.258Z" },
     { url = "https://files.pythonhosted.org/packages/48/b2/b096ccce418882fbfda4f7496f9357aaa9a5af1896a9a7f60d9f2b275a06/grpcio-1.78.0-cp314-cp314-win_amd64.whl", hash = "sha256:dce09d6116df20a96acfdbf85e4866258c3758180e8c49845d6ba8248b6d0bbb", size = 4929852, upload-time = "2026-02-06T09:56:45.885Z" },
+]
+
+[[package]]
+name = "gunicorn"
+version = "26.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "packaging" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6d/b7/a4a3f632f823e432ce6bc65f62961b7980c898c77f075a2f7118cb3846fe/gunicorn-26.0.0.tar.gz", hash = "sha256:ca9346f85e3a4aeeb64d491045c16b9a35647abd37ea15efe53080eb8b090baf", size = 727286, upload-time = "2026-05-05T06:38:25.529Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e6/40/9c2384fc2be4ad25dd4a49decd5ad9ea5a3639814c11bd40ab77cb9f0a14/gunicorn-26.0.0-py3-none-any.whl", hash = "sha256:40233d26a5f0d1872916188c276e21641155111c2853f0c2cd55260aec0d24fc", size = 212009, upload-time = "2026-05-05T06:38:23.007Z" },
 ]
 
 [[package]]
