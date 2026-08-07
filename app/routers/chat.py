@@ -394,6 +394,10 @@ async def chat_message(
         # Fingerprint remapping may return a different canonical UUID than the
         # header/cookie — bind chat usage/history to the row that was enforced.
         guest_session_id = guest_session_row.session_id
+        # Commit before SSE so chat_session's separate DB connection can see the
+        # guest_sessions parent (FK on chat_sessions.guest_session_id). Flush-only
+        # leaves the row invisible mid-stream and raises ForeignKeyViolationError.
+        await db.commit()
 
     chat_agent._dbg(
         "[CHAT ROUTER ▶ MESSAGE]",
@@ -599,6 +603,8 @@ async def chat_tool_result(
             asn=guest_identity.asn,
         )
         guest_session_id = guest_row.session_id
+        # Same as /chat/message: commit guest parent before stream persistence.
+        await db.commit()
 
     stream_user_id = current_user.id if current_user else None
     if current_user is not None:

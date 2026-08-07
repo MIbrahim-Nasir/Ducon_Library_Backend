@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.db.database import async_session_maker
-from app.db.models import ChatSessionRow
+from app.db.models import ChatSessionRow, GuestSession
 
 _MAX_TRANSCRIPT_TURNS = 40
 
@@ -36,6 +36,47 @@ def _to_live_contents(raw: list[dict]) -> list[dict]:
     return seeded[-_MAX_TRANSCRIPT_TURNS:]
 
 
+async def _ensure_guest_session_exists(db, guest_session_id: str) -> None:
+    """Ensure ``guest_sessions`` has a row before ``chat_sessions`` FK insert.
+
+    Chat routers create guest rows on the request session (often flush-only until
+    end-of-stream). ``chat_session`` opens a separate connection, so an
+    uncommitted parent is invisible and Postgres raises
+    ``chat_sessions_guest_session_id_fkey``. Upsert here so mid-stream saves
+    never hard-fail; concurrent creators are handled via IntegrityError.
+    """
+    existing = (
+        await db.execute(
+            select(GuestSession.id).where(GuestSession.session_id == guest_session_id)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return
+
+    db.add(
+        GuestSession(
+            session_id=guest_session_id,
+            generation_count=0,
+            chat_turn_count=0,
+            voice_turn_count=0,
+        )
+    )
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Concurrent first-touch (e.g. request db commit vs this ensure).
+        await db.rollback()
+        existing = (
+            await db.execute(
+                select(GuestSession.id).where(
+                    GuestSession.session_id == guest_session_id
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            raise
+
+
 async def _get_or_create(
     db,
     *,
@@ -45,6 +86,9 @@ async def _get_or_create(
     now = datetime.now(timezone.utc)
     if user_id is None and not guest_session_id:
         raise ValueError("user_id or guest_session_id required")
+
+    if user_id is None and guest_session_id:
+        await _ensure_guest_session_exists(db, guest_session_id)
 
     where = (
         ChatSessionRow.user_id == int(user_id)
@@ -70,6 +114,9 @@ async def _get_or_create(
         return row
     except IntegrityError:
         await db.rollback()
+        # Rollback drops an ensure we just flushed; re-ensure then re-select.
+        if user_id is None and guest_session_id:
+            await _ensure_guest_session_exists(db, guest_session_id)
         row = (await db.execute(select(ChatSessionRow).where(where))).scalar_one_or_none()
         if row is None:
             raise
