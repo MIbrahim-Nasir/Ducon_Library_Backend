@@ -442,8 +442,13 @@ async def chat_message(
     else:
         session_prev = await chat_session.get_guest_interaction_id(guest_session_id)
     use_claude = llm_provider.use_claude()
+    # Empty client id = new visible chat. Do not resume the stored Gemini
+    # thread (that made "hello?" after a remount continue a prior pergola search).
     effective_prev = chat_agent.resolve_chain_previous_id(
-        session_prev, previous_interaction_id, use_claude=use_claude
+        session_prev,
+        previous_interaction_id,
+        use_claude=use_claude,
+        allow_session_fallback=False,
     )
     memory_user = (message or "").strip()
     if not memory_user and pending_files:

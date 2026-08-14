@@ -1,8 +1,17 @@
 # Changelog — Ducon Library Backend
 
-**Session date:** 2026-07-23 / 2026-07-16 / 2026-07-15 / 2026-07-14 / 2026-07-11 / 2026-07-10 / 2026-07-09 / 2026-07-08  
-**Branch:** `development` (backend); frontend notes from sibling `Ducon_Library`  
-**Scope:** Admin analytics date ranges + guest metrics; Gemini stale interaction retry; Langfuse observability; in-process weekly retention cleanup; app syntax smoke in deploy checks; Studio R2/fusion UX (FE).
+**Session date:** 2026-08-14 / 2026-07-23 / 2026-07-16 / 2026-07-15 / 2026-07-14 / 2026-07-11 / 2026-07-10 / 2026-07-09 / 2026-07-08  
+**Branch:** `main` / `development` (backend); frontend notes from sibling `Ducon_Library`  
+**Scope:** Chat session isolation + Gemini stream errors; guest chat FK; admin settings `updated_at`; stale-chain transcript rehydrate.
+
+### 2026-08-14 — Empty chat must not resume another session; surface Gemini errors
+
+- **Cross-session leak** — One Gemini `interaction_id` per user in `chat_sessions`. An empty DesignerChat still called `GET /chat/session` and `/chat/message` fell back to that id, so “hello?” after a remount continued a prior pergola search (and a new fountain/bench brief chained onto it).
+- **Fix** — `/chat/message` does not use `session_prev` when the client omits `previous_interaction_id` (`allow_session_fallback=False`). Voice / browse / studio / tool-result injects still may. Unchained Gemini/Claude turns no longer prepend the Postgres transcript; stale-id retry still does. (`app/chat_agent.py`, `app/routers/chat.py`)
+- **Gemini `error` events** — Stream `error` / `interaction.failed` now emit SSE `error` and return without `done`; stored chain id is cleared. Previously the event was only logged and the UI stopped silently.
+- **Already on main, now documented** — Stale-chain retry rehydrates from Postgres transcript (`transcript_turns_to_gemini_prefix`, `dd2702c`). Guest `chat_sessions` FK: commit guest row before SSE (`e8a07ec`). Admin settings PUT: stamp `updated_at` instead of NULL (`d9d2fff`).
+- **Tests** — `tests/test_chat_history_continuity.py` (no-chain isolation, Gemini error → SSE error, Claude new session).
+- **Frontend (Ducon_Library)** — Skip mount/send session sync when the visible chat is empty and has no local id; clear chain on stream error; restore attachment thumbs from IndexedDB `uploadId` after revoked `blob:` URLs.
 
 ### 2026-07-23 — Admin analytics, stale Gemini interactions, Langfuse, weekly cleanup, Studio UX
 

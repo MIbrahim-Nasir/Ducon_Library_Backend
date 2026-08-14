@@ -550,6 +550,26 @@ def _sse_error(message: str) -> str:
     return _sse({"type": "error", "message": message})
 
 
+def _gemini_stream_error_message(event: object) -> str:
+    """Human-readable text from a Gemini Interactions ``error`` stream event."""
+    err = getattr(event, "error", None)
+    if err is None:
+        err = getattr(event, "message", None)
+    if err is None:
+        interaction = getattr(event, "interaction", None)
+        if interaction is not None:
+            err = getattr(interaction, "error", None)
+    if err is None:
+        return "The model could not complete this reply. Please try again."
+    if isinstance(err, str) and err.strip():
+        return err.strip()
+    msg = getattr(err, "message", None) or getattr(err, "message_text", None)
+    if msg:
+        return str(msg).strip() or "The model could not complete this reply. Please try again."
+    text = str(err).strip()
+    return text or "The model could not complete this reply. Please try again."
+
+
 def _is_previous_interaction_not_found(exc: BaseException) -> bool:
     """True when Gemini rejects ``previous_interaction_id`` as missing/expired."""
     name = type(exc).__name__.lower()
@@ -700,7 +720,11 @@ async def _stream_chat_inner(
     history_prefix_applied = False
 
     async def _prepend_stored_transcript() -> None:
-        """Rehydrate Gemini input from Postgres when Interactions history is gone."""
+        """Rehydrate Gemini input from Postgres when a chain id expired.
+
+        Do not call this for a turn that never had a previous_interaction_id —
+        that is a new UI session and must not inherit the prior transcript.
+        """
         nonlocal input_parts, history_prefix_applied
         if history_prefix_applied:
             return
@@ -711,9 +735,6 @@ async def _stream_chat_inner(
         if prefix:
             input_parts = prefix + input_parts
             history_prefix_applied = True
-
-    if not previous_interaction_id:
-        await _prepend_stored_transcript()
 
     generation_config: dict = {}
     if _chat_thinking and _chat_thinking.lower() not in ("none", ""):
@@ -804,6 +825,16 @@ async def _stream_chat_inner(
                         interaction_id = getattr(_ia, "id", None)
                     if not interaction_id:
                         interaction_id = getattr(event, "interaction_id", None)
+
+                if etype in ("error", "interaction.failed"):
+                    err_msg = _gemini_stream_error_message(event)
+                    _dbg("[CHAT ◀ ERROR]", {"message": err_msg, "interaction_id": interaction_id})
+                    await _clear_stored_interaction_id(
+                        user_id=user_id,
+                        guest_session_id=guest_session_id,
+                    )
+                    yield _sse_error(err_msg)
+                    return
 
                 # ── step.start — track which index is which step type ───────
                 if etype == "step.start":
@@ -1005,6 +1036,7 @@ def resolve_chain_previous_id(
     client_prev: Optional[str],
     *,
     use_claude: Optional[bool] = None,
+    allow_session_fallback: bool = True,
 ) -> Optional[str]:
     """Pick the conversation id to chain onto for this turn.
 
@@ -1013,6 +1045,10 @@ def resolve_chain_previous_id(
     *previous* conversation. Preferring the server id here dropped the image
     + user request from the next turn (the model then greeted on a leftover
     ``?``).
+
+    ``allow_session_fallback`` is for voice / browse / studio / tool-result
+    injects that may omit the client id. ``/chat/message`` passes False so an
+    empty UI (client sends no id) cannot resume yesterday's Gemini thread.
 
     Provider families are not mixed: Claude ids are ``cld_…``; Gemini
     Interactions ids are typically ``v1_…``. An incompatible leftover is
@@ -1031,7 +1067,7 @@ def resolve_chain_previous_id(
 
     if _compatible(client_prev):
         return client_prev
-    if _compatible(session_prev):
+    if allow_session_fallback and _compatible(session_prev):
         return session_prev
     return None
 
@@ -1289,7 +1325,9 @@ async def _stream_chat_claude(
     """Claude equivalent of stream_chat — same SSE event contract."""
     conv_id = previous_interaction_id if (previous_interaction_id and str(previous_interaction_id).startswith("cld_")) else f"cld_{uuid.uuid4().hex}"
     messages: list[dict] = list(_CLAUDE_HISTORY.get(conv_id, []))
-    if not messages:
+    # Only hydrate when the client is continuing a known conversation.
+    # A missing previous_interaction_id is a new UI session.
+    if not messages and previous_interaction_id and str(previous_interaction_id).startswith("cld_"):
         seeded = await _load_claude_seed_messages(
             user_id=user_id,
             guest_session_id=guest_session_id,

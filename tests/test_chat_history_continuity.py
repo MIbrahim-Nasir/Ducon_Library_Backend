@@ -34,6 +34,22 @@ def test_resolve_chain_uses_server_when_client_has_none():
     )
 
 
+def test_resolve_chain_message_turn_does_not_inherit_server_id():
+    """Empty chat UI omits client id — must not resume the stored thread."""
+    assert (
+        chat_agent.resolve_chain_previous_id(
+            "v1_server", None, use_claude=False, allow_session_fallback=False
+        )
+        is None
+    )
+    assert (
+        chat_agent.resolve_chain_previous_id(
+            "v1_server", "v1_client", use_claude=False, allow_session_fallback=False
+        )
+        == "v1_client"
+    )
+
+
 def test_resolve_chain_does_not_mix_gemini_and_claude_ids():
     assert (
         chat_agent.resolve_chain_previous_id("v1_gemini", None, use_claude=True)
@@ -159,6 +175,60 @@ async def test_claude_hydrates_empty_worker_memory_from_transcript(monkeypatch):
     assert any("done" in c for c in chunks)
 
 
+@pytest.mark.asyncio
+async def test_claude_new_session_does_not_hydrate_transcript(monkeypatch):
+    chat_agent._CLAUDE_HISTORY.clear()
+
+    async def fake_seed(user_id):
+        raise AssertionError("new session must not load prior transcript")
+
+    captured: dict = {}
+
+    class _FakeStream:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def __aiter__(self):
+            if False:
+                yield None
+
+        async def get_final_message(self):
+            return type("Msg", (), {"content": []})()
+
+    class _FakeClient:
+        class messages:
+            @staticmethod
+            def stream(**kwargs):
+                captured["messages"] = kwargs["messages"]
+                return _FakeStream()
+
+    monkeypatch.setattr("app.chat_session.get_voice_seed_turns", fake_seed)
+    monkeypatch.setattr(llm_provider, "get_async_anthropic_client", lambda: _FakeClient())
+    monkeypatch.setattr(llm_provider, "_thinking_param", lambda: None)
+    monkeypatch.setattr(llm_provider, "serialize_content", lambda _m: [])
+    monkeypatch.setattr(llm_provider, "tool_use_blocks", lambda _m: [])
+    monkeypatch.setattr(chat_agent, "get_chat_system_instruction", lambda: "sys")
+    monkeypatch.setattr(chat_agent, "get_claude_chat_tools", lambda **_k: [])
+
+    async for _ in chat_agent._stream_chat_claude(
+        [{"type": "text", "text": "hello?"}],
+        None,
+        user_id=42,
+    ):
+        pass
+
+    texts = [
+        b["text"]
+        for m in captured["messages"]
+        for b in m["content"]
+        if isinstance(b, dict) and b.get("type") == "text"
+    ]
+    assert texts == ["hello?"]
+
+
 def test_transcript_turns_to_gemini_prefix_keeps_design_request():
     prefix = chat_agent.transcript_turns_to_gemini_prefix([
         {
@@ -250,7 +320,8 @@ async def test_gemini_stale_retry_prepends_transcript(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_gemini_no_chain_still_hydrates_transcript(monkeypatch):
+async def test_gemini_no_chain_does_not_hydrate_prior_session(monkeypatch):
+    """Empty UI / no client id must not inherit yesterday's transcript."""
     from unittest.mock import AsyncMock, MagicMock
 
     monkeypatch.setattr(llm_provider, "use_claude", lambda: False)
@@ -263,13 +334,11 @@ async def test_gemini_no_chain_still_hydrates_transcript(monkeypatch):
         lambda key, default="": default if key != "CHAT_THINKING_LEVEL" else "",
     )
     monkeypatch.setattr(chat_agent, "log_error", AsyncMock())
-    monkeypatch.setattr(
-        "app.chat_session.get_voice_seed_turns",
-        AsyncMock(return_value=[
-            {"role": "user", "parts": [{"text": "keep the fountain materials"}]},
-            {"role": "model", "parts": [{"text": "Noted."}]},
-        ]),
-    )
+    seed = AsyncMock(return_value=[
+        {"role": "user", "parts": [{"text": "show me pergola options"}]},
+        {"role": "model", "parts": [{"text": "Here are pergolas."}]},
+    ])
+    monkeypatch.setattr("app.chat_session.get_voice_seed_turns", seed)
 
     captured: dict = {}
 
@@ -292,12 +361,62 @@ async def test_gemini_no_chain_still_hydrates_transcript(monkeypatch):
     monkeypatch.setattr(chat_agent, "get_client", lambda: mock_client)
 
     async for _ in chat_agent._stream_chat_inner(
-        [{"type": "text", "text": "?"}],
+        [{"type": "text", "text": "hello?"}],
         previous_interaction_id=None,
         allow_tools=False,
         user_id=9,
     ):
         pass
 
-    assert "keep the fountain materials" in captured["input"][0]["text"]
-    assert captured["input"][-1]["text"] == "?"
+    assert captured["input"][-1]["text"] == "hello?"
+    assert all("pergola" not in (p.get("text") or "") for p in captured["input"])
+    seed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gemini_stream_error_emits_sse_error_without_done(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setattr(llm_provider, "use_claude", lambda: False)
+    monkeypatch.setattr(chat_agent, "get_chat_tools", lambda user_id=None: [])
+    monkeypatch.setattr(chat_agent, "get_chat_system_instruction", lambda: "sys")
+    monkeypatch.setattr(chat_agent, "cfg", lambda key, default=None: default)
+    monkeypatch.setattr(
+        chat_agent,
+        "cfg_str",
+        lambda key, default="": default if key != "CHAT_THINKING_LEVEL" else "",
+    )
+    monkeypatch.setattr(chat_agent, "log_error", AsyncMock())
+    clear_id = AsyncMock()
+    monkeypatch.setattr(chat_agent, "_clear_stored_interaction_id", clear_id)
+
+    class _Err:
+        event_type = "error"
+        index = None
+        interaction_id = "v1_failed"
+        error = MagicMock(message="INTERNAL")
+        interaction = MagicMock(id="v1_failed")
+
+    async def fake_create(**kwargs):
+        async def _stream():
+            yield _Err()
+
+        return _stream()
+
+    mock_client = MagicMock()
+    mock_client.aio.interactions.create = AsyncMock(side_effect=fake_create)
+    monkeypatch.setattr(chat_agent, "get_client", lambda: mock_client)
+
+    chunks = [
+        chunk
+        async for chunk in chat_agent._stream_chat_inner(
+            [{"type": "text", "text": "integrate the fountain"}],
+            previous_interaction_id="v1_prev",
+            allow_tools=False,
+            user_id=10,
+        )
+    ]
+
+    assert any('"type": "error"' in c and "INTERNAL" in c for c in chunks)
+    assert not any('"type": "done"' in c for c in chunks)
+    clear_id.assert_awaited()
