@@ -420,3 +420,110 @@ async def test_gemini_stream_error_emits_sse_error_without_done(monkeypatch):
     assert any('"type": "error"' in c and "INTERNAL" in c for c in chunks)
     assert not any('"type": "done"' in c for c in chunks)
     clear_id.assert_awaited()
+
+
+def test_gemini_media_type_from_mime():
+    assert chat_agent.gemini_media_type_from_mime("image/png") == "image"
+    assert chat_agent.gemini_media_type_from_mime("application/pdf") == "document"
+    assert chat_agent.gemini_media_type_from_mime("video/mp4") == "video"
+
+
+@pytest.mark.asyncio
+async def test_build_gemini_media_part_inlines_small_images(monkeypatch):
+    async def fake_upload(**kwargs):
+        raise AssertionError("small chat images must not use the Files API")
+
+    monkeypatch.setattr(chat_agent, "upload_file_to_gemini", fake_upload)
+    part = await chat_agent.build_gemini_media_part(
+        b"\x89PNG small", "image/png", "bench.png"
+    )
+    assert part["type"] == "image"
+    assert part["data"]
+    assert "uri" not in part
+
+
+@pytest.mark.asyncio
+async def test_build_gemini_media_part_uses_files_api_when_large(monkeypatch):
+    async def fake_upload(**kwargs):
+        assert kwargs["filename"] == "huge.png"
+        return {
+            "uri": "https://generativelanguage.googleapis.com/v1beta/files/abc",
+            "mime_type": "image/png",
+            "name": "files/abc",
+            "state": "ACTIVE",
+        }
+
+    monkeypatch.setattr(chat_agent, "_INLINE_CHAT_MEDIA_MAX_BYTES", 4)
+    monkeypatch.setattr(chat_agent, "upload_file_to_gemini", fake_upload)
+    part = await chat_agent.build_gemini_media_part(
+        b"12345", "image/png", "huge.png"
+    )
+    assert part["uri"] == "https://generativelanguage.googleapis.com/files/abc"
+    assert "data" not in part
+
+
+def test_interactions_file_api_uri_normalizes_sdk_shapes():
+    want = "https://generativelanguage.googleapis.com/files/abc"
+    assert chat_agent.interactions_file_api_uri(
+        "https://generativelanguage.googleapis.com/v1beta/files/abc",
+        "files/abc",
+    ) == want
+    assert chat_agent.interactions_file_api_uri("", "files/abc") == want
+    assert chat_agent.interactions_file_api_uri(want, "files/abc") == want
+    assert chat_agent.interactions_file_api_uri("files/abc") == want
+
+
+def test_apply_chat_media_resolution_skips_file_uri(monkeypatch):
+    monkeypatch.setattr(chat_agent, "chat_media_resolution", lambda: "high")
+    out = chat_agent.apply_chat_media_resolution([
+        {"type": "text", "text": "hi"},
+        {"type": "image", "uri": "https://x/files/a", "mime_type": "image/png"},
+        {"type": "image", "data": "abc", "mime_type": "image/png"},
+    ])
+    assert "resolution" not in out[1]
+    assert out[2]["resolution"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_gemini_permission_error_is_user_visible(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setattr(llm_provider, "use_claude", lambda: False)
+    monkeypatch.setattr(chat_agent, "get_chat_tools", lambda user_id=None: [])
+    monkeypatch.setattr(chat_agent, "get_chat_system_instruction", lambda: "sys")
+    monkeypatch.setattr(chat_agent, "cfg", lambda key, default=None: default)
+    monkeypatch.setattr(
+        chat_agent,
+        "cfg_str",
+        lambda key, default="": default if key != "CHAT_THINKING_LEVEL" else "",
+    )
+    monkeypatch.setattr(chat_agent, "log_error", AsyncMock())
+    monkeypatch.setattr(chat_agent, "_clear_stored_interaction_id", AsyncMock())
+
+    class _Err:
+        event_type = "error"
+        index = None
+        interaction_id = "v1_failed"
+        error = MagicMock(message="The caller does not have permission")
+        interaction = MagicMock(id="v1_failed")
+
+    async def fake_create(**kwargs):
+        async def _stream():
+            yield _Err()
+
+        return _stream()
+
+    mock_client = MagicMock()
+    mock_client.aio.interactions.create = AsyncMock(side_effect=fake_create)
+    monkeypatch.setattr(chat_agent, "get_client", lambda: mock_client)
+
+    chunks = [
+        chunk
+        async for chunk in chat_agent._stream_chat_inner(
+            [{"type": "text", "text": "see attached"}, {"type": "image", "uri": "x"}],
+            allow_tools=False,
+            user_id=10,
+        )
+    ]
+    assert any("could not read the attached image" in c for c in chunks)
+    assert not any('"type": "done"' in c for c in chunks)

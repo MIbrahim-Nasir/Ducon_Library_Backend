@@ -2,7 +2,13 @@
 
 **Session date:** 2026-08-14 / 2026-07-23 / 2026-07-16 / 2026-07-15 / 2026-07-14 / 2026-07-11 / 2026-07-10 / 2026-07-09 / 2026-07-08  
 **Branch:** `main` / `development` (backend); frontend notes from sibling `Ducon_Library`  
-**Scope:** Chat session isolation + Gemini stream errors; guest chat FK; admin settings `updated_at`; stale-chain transcript rehydrate.
+**Scope:** Chat session isolation + Gemini stream errors; chat image inline for Gemini 3.7; guest chat FK; admin settings `updated_at`; stale-chain transcript rehydrate.
+
+### 2026-08-14 — Chat images inline (Gemini 3.7 Files URI 403)
+
+- **Cause** — Chat is on `gemini-3.7-flash` (admin override; code default remains `gemini-3.5-flash`). 3.7 Flash GA launched 2026-08-13. Files API upload succeeds (`ACTIVE`), but Interactions returns `permission_denied` for every File URI shape (`/v1beta/files/<id>`, `/files/<id>`, `files/<id>`). Interactions docs still list 3.6/3.5, not 3.7.
+- **Fix** — Inline chat attachments under 20MB into Interactions. Files API + normalized `https://generativelanguage.googleapis.com/files/<id>` only for oversized files. Skip per-part `resolution` on File URIs. Wait until Files are `ACTIVE` before attaching. (`app/chat_agent.py`)
+- **Tests** — `tests/test_chat_history_continuity.py` (inline small images; Files API only when large; URI normalizer).
 
 ### 2026-08-14 — Empty chat must not resume another session; surface Gemini errors
 

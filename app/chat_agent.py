@@ -7,7 +7,7 @@ Features
 --------
 - Multi-turn conversation with server-managed history (previous_interaction_id)
 - Streaming text/thinking via SSE
-- Multimodal input (text + images via Gemini Files API)
+- Multimodal input (text + images; small files inline, large via Files API)
 - Frontend tool calling (same tools as the voice agent)
 - Long-running tasks (AI generation)
 
@@ -30,12 +30,14 @@ Streaming SSE event types (emitted to frontend)
 """
 from __future__ import annotations
 
+import base64
 import io
 import json
 import logging
 import os
 import asyncio
 import tempfile
+import time
 import uuid
 from typing import AsyncGenerator, Optional
 
@@ -91,6 +93,11 @@ def apply_chat_media_resolution(parts: list) -> list:
     out: list = []
     for part in parts:
         if isinstance(part, dict) and part.get("type") in ("image", "document", "video", "audio"):
+            # Files API URIs + per-part resolution has 403'd as
+            # "The caller does not have permission". Keep resolution on inline data only.
+            if part.get("uri"):
+                out.append(part)
+                continue
             enriched = dict(part)
             enriched.setdefault("resolution", level)
             out.append(enriched)
@@ -118,6 +125,7 @@ def _summarize_input_parts(parts: list) -> list[dict]:
                 summary.append({
                     "type": ptype,
                     "uri": part.get("uri"),
+                    "inline": bool(part.get("data")),
                     "mime_type": part.get("mime_type"),
                     "resolution": part.get("resolution"),
                 })
@@ -441,6 +449,127 @@ def get_chat_tools(*, user_id: Optional[int] = None) -> list[dict]:
 
 # ── File upload helper ────────────────────────────────────────────────────────
 
+def gemini_media_type_from_mime(mime: str) -> str:
+    """Map a MIME type to the Gemini Interactions API content type string."""
+    text = (mime or "").strip().lower()
+    if text.startswith("image/"):
+        return "image"
+    if text.startswith("video/"):
+        return "video"
+    if text.startswith("audio/"):
+        return "audio"
+    return "document"
+
+
+def _file_state_name(uploaded: object) -> str:
+    state = getattr(uploaded, "state", None)
+    if state is None:
+        return ""
+    name = getattr(state, "name", None)
+    if name:
+        return str(name).upper()
+    return str(state).upper()
+
+
+async def _wait_gemini_file_active(client: object, uploaded: object, *, timeout_s: float = 20.0):
+    """Poll Files API until ACTIVE. Interactions 403s if we attach too early."""
+    name = getattr(uploaded, "name", None)
+    if not name:
+        return uploaded
+    current = uploaded
+    deadline = time.monotonic() + timeout_s
+    while True:
+        state = _file_state_name(current)
+        if "ACTIVE" in state:
+            return current
+        if "FAIL" in state:
+            raise RuntimeError(f"Gemini file {name} failed processing ({state})")
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "Gemini file %s still %s after %.0fs — using it anyway",
+                name,
+                state or "unknown",
+                timeout_s,
+            )
+            return current
+        await asyncio.sleep(0.4)
+        current = await client.aio.files.get(name=name)
+
+
+# Interactions accepts inline data up to 100MB. Chat screenshots are far
+# smaller. Files API URIs 403 as permission_denied for every documented
+# shape (SDK /v1beta/files/<id>, /files/<id>, and files/<id>).
+_INLINE_CHAT_MEDIA_MAX_BYTES = 20 * 1024 * 1024
+
+
+async def build_gemini_media_part(
+    file_bytes: bytes,
+    mime_type: str,
+    filename: str = "",
+) -> dict:
+    """Build an Interactions media part. Small files are inlined."""
+    media_type = gemini_media_type_from_mime(mime_type)
+    if len(file_bytes) <= _INLINE_CHAT_MEDIA_MAX_BYTES:
+        return {
+            "type": media_type,
+            "data": base64.b64encode(file_bytes).decode("ascii"),
+            "mime_type": mime_type,
+        }
+    uploaded = await upload_file_to_gemini(
+        file_bytes=file_bytes,
+        filename=filename,
+        mime_type=mime_type,
+    )
+    _dbg(
+        "[CHAT ROUTER ▶ FILE UPLOADED]",
+        {
+            "filename": filename,
+            "bytes": len(file_bytes),
+            "mime_type": mime_type,
+            "gemini_uri": uploaded.get("uri"),
+            "gemini_name": uploaded.get("name"),
+            "gemini_state": uploaded.get("state"),
+            "gemini_mime_type": uploaded.get("mime_type"),
+        },
+    )
+    name = str(uploaded.get("name") or "")
+    sdk_uri = str(uploaded.get("uri") or "")
+    uri = interactions_file_api_uri(sdk_uri, name)
+    return {
+        "type": media_type,
+        "uri": uri,
+        "mime_type": uploaded["mime_type"],
+    }
+
+
+_INTERACTIONS_FILE_API_PREFIX = "https://generativelanguage.googleapis.com/files/"
+
+
+def interactions_file_api_uri(uri: str = "", name: str = "") -> str:
+    """Normalize a Files API object to the URI Interactions accepts.
+
+    Gemini rejects ``files/<id>`` and treats the SDK's
+    ``https://generativelanguage.googleapis.com/v1beta/files/<id>`` as a
+    generic HTTPS fetch (403). The required File API shape is
+    ``https://generativelanguage.googleapis.com/files/<id>``.
+    """
+    raw_uri = (uri or "").strip()
+    raw_name = (name or "").strip()
+    file_id = ""
+    for candidate in (raw_uri, raw_name):
+        if not candidate:
+            continue
+        if "/files/" in candidate:
+            file_id = candidate.rsplit("/files/", 1)[-1].split("?", 1)[0].strip("/")
+            break
+        if candidate.startswith("files/"):
+            file_id = candidate[6:].split("?", 1)[0].strip("/")
+            break
+    if file_id:
+        return f"{_INTERACTIONS_FILE_API_PREFIX}{file_id}"
+    return raw_uri or raw_name
+
+
 async def upload_file_to_gemini(
     file_bytes: bytes,
     filename: str,
@@ -478,7 +607,13 @@ async def upload_file_to_gemini(
                     file=tmp_path,
                     config={"mime_type": mime_type, "display_name": filename},
                 )
-                return {"uri": uploaded.uri, "mime_type": uploaded.mime_type}
+                uploaded = await _wait_gemini_file_active(client, uploaded)
+                return {
+                    "uri": uploaded.uri,
+                    "mime_type": uploaded.mime_type,
+                    "name": getattr(uploaded, "name", None),
+                    "state": _file_state_name(uploaded),
+                }
             except Exception as exc:
                 last_exc = exc
                 if not _is_transient_upload_error(exc) or attempt == max_attempts - 1:
@@ -833,6 +968,11 @@ async def _stream_chat_inner(
                         user_id=user_id,
                         guest_session_id=guest_session_id,
                     )
+                    if "does not have permission" in err_msg.lower():
+                        err_msg = (
+                            "Gemini could not read the attached image. "
+                            "Please try sending the photo again."
+                        )
                     yield _sse_error(err_msg)
                     return
 

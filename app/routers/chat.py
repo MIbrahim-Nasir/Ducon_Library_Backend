@@ -489,27 +489,17 @@ async def chat_message(
                 continue
 
             try:
-                uploaded = await chat_agent.upload_file_to_gemini(
-                    file_bytes=file_bytes,
-                    filename=filename,
-                    mime_type=mime,
-                )
-                chat_agent._dbg(
-                    "[CHAT ROUTER ▶ FILE UPLOADED]",
-                    {
-                        "filename": filename,
-                        "bytes": len(file_bytes),
-                        "mime_type": mime,
-                        "gemini_uri": uploaded.get("uri"),
-                        "gemini_mime_type": uploaded.get("mime_type"),
-                    },
+                file_parts.append(
+                    await chat_agent.build_gemini_media_part(
+                        file_bytes, mime, filename
+                    )
                 )
             except Exception as exc:
-                logger.warning("File upload failed for %s: %s", filename, exc)
+                logger.warning("File attach failed for %s: %s", filename, exc)
                 await log_error(
                     "chat",
-                    "chat_agent.upload_file_to_gemini",
-                    f"Gemini file upload failed: {filename}",
+                    "chat_agent.build_gemini_media_part",
+                    f"Gemini file attach failed: {filename}",
                     user_id=stream_user_id,
                     guest_session_id=guest_session_id,
                     endpoint="/chat/message",
@@ -520,13 +510,6 @@ async def chat_message(
                     "File upload failed. Please try again or use a different file."
                 )
                 return
-
-            file_type = _gemini_type_from_mime(uploaded["mime_type"])
-            file_parts.append({
-                "type": file_type,
-                "uri": uploaded["uri"],
-                "mime_type": uploaded["mime_type"],
-            })
 
         input_parts: list = []
         if message:
@@ -902,16 +885,7 @@ def _normalize_image_for_claude(data: bytes, mime: str) -> tuple[str, bytes]:
 
 
 def _gemini_type_from_mime(mime: str) -> str:
-    """Map a MIME type to the Gemini Interactions API content type string."""
-    if mime.startswith("image/"):
-        return "image"
-    if mime.startswith("video/"):
-        return "video"
-    if mime.startswith("audio/"):
-        return "audio"
-    if mime == "application/pdf":
-        return "document"
-    return "document"
+    return chat_agent.gemini_media_type_from_mime(mime)
 
 
 # ── POST /chat/voice_context ──────────────────────────────────────────────────
