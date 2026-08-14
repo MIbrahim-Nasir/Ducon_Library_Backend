@@ -697,6 +697,23 @@ async def _stream_chat_inner(
     chat_tools = get_chat_tools(user_id=user_id) if allow_tools else []
 
     input_parts = apply_chat_media_resolution(list(input_parts or []))
+    history_prefix_applied = False
+
+    async def _prepend_stored_transcript() -> None:
+        """Rehydrate Gemini input from Postgres when Interactions history is gone."""
+        nonlocal input_parts, history_prefix_applied
+        if history_prefix_applied:
+            return
+        prefix = await _load_gemini_history_prefix(
+            user_id=user_id,
+            guest_session_id=guest_session_id,
+        )
+        if prefix:
+            input_parts = prefix + input_parts
+            history_prefix_applied = True
+
+    if not previous_interaction_id:
+        await _prepend_stored_transcript()
 
     generation_config: dict = {}
     if _chat_thinking and _chat_thinking.lower() not in ("none", ""):
@@ -740,6 +757,7 @@ async def _stream_chat_inner(
                 user_id=user_id,
                 guest_session_id=guest_session_id,
             )
+            await _prepend_stored_transcript()
             # Exactly one retry — further NotFound (or any error) propagates.
             result = await _interactions_create(stream=stream)
             return result, True
@@ -1037,6 +1055,49 @@ def seed_turns_to_claude_messages(turns: list[dict]) -> list[dict]:
     while messages and messages[0].get("role") != "user":
         messages.pop(0)
     return messages
+
+
+def transcript_turns_to_gemini_prefix(turns: list[dict]) -> list[dict]:
+    """Rebuild Gemini input prefix from Postgres transcript when the chain id is gone."""
+    lines: list[str] = []
+    for turn in turns or []:
+        role = turn.get("role")
+        parts = turn.get("parts") or []
+        text = "".join(
+            (p.get("text") or "") if isinstance(p, dict) else str(p)
+            for p in parts
+        ).strip()
+        if not text:
+            continue
+        if role == "user":
+            lines.append(f"User: {text}")
+        elif role in ("model", "assistant"):
+            lines.append(f"Assistant: {text}")
+    if not lines:
+        return []
+    return [{
+        "type": "text",
+        "text": (
+            "Prior conversation (continue this thread; do not greet as a new chat):\n"
+            + "\n".join(lines)
+        ),
+    }]
+
+
+async def _load_gemini_history_prefix(
+    *,
+    user_id: Optional[int],
+    guest_session_id: Optional[str],
+) -> list[dict]:
+    from app import chat_session as _chat_session
+
+    if user_id is not None:
+        turns = await _chat_session.get_voice_seed_turns(int(user_id))
+    elif guest_session_id:
+        turns = await _chat_session.get_guest_voice_seed_turns(guest_session_id)
+    else:
+        return []
+    return transcript_turns_to_gemini_prefix(turns)
 
 
 async def _load_claude_seed_messages(

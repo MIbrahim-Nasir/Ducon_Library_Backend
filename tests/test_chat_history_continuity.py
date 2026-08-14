@@ -157,3 +157,147 @@ async def test_claude_hydrates_empty_worker_memory_from_transcript(monkeypatch):
     assert "keep the fountain materials" in texts[0]
     assert texts[-1] == "now push the fountain back"
     assert any("done" in c for c in chunks)
+
+
+def test_transcript_turns_to_gemini_prefix_keeps_design_request():
+    prefix = chat_agent.transcript_turns_to_gemini_prefix([
+        {
+            "role": "user",
+            "parts": [{
+                "text": (
+                    "the benches and fountains are ducon products used. "
+                    "make the same fountain pushed back"
+                ),
+            }],
+        },
+        {"role": "model", "parts": [{"text": "I'll integrate the fountain."}]},
+    ])
+    assert len(prefix) == 1
+    text = prefix[0]["text"]
+    assert "do not greet as a new chat" in text
+    assert "benches and fountains" in text
+    assert "I'll integrate the fountain." in text
+
+
+@pytest.mark.asyncio
+async def test_gemini_stale_retry_prepends_transcript(monkeypatch):
+    """Expired previous_interaction_id must not wipe the design request."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setattr(llm_provider, "use_claude", lambda: False)
+    monkeypatch.setattr(chat_agent, "get_chat_tools", lambda user_id=None: [])
+    monkeypatch.setattr(chat_agent, "get_chat_system_instruction", lambda: "sys")
+    monkeypatch.setattr(chat_agent, "cfg", lambda key, default=None: default)
+    monkeypatch.setattr(
+        chat_agent,
+        "cfg_str",
+        lambda key, default="": default if key != "CHAT_THINKING_LEVEL" else "",
+    )
+    monkeypatch.setattr(chat_agent, "log_error", AsyncMock())
+
+    async def fake_seed(user_id):
+        assert user_id == 7
+        return [
+            {
+                "role": "user",
+                "parts": [{"text": "the benches and fountains are ducon products used."}],
+            },
+            {"role": "model", "parts": [{"text": "Starting a design run."}]},
+        ]
+
+    monkeypatch.setattr("app.chat_session.get_voice_seed_turns", fake_seed)
+    monkeypatch.setattr("app.chat_session.set_interaction_id", AsyncMock())
+
+    captured: list[list] = []
+
+    class _Done:
+        event_type = "interaction.completed"
+        index = None
+        interaction_id = "v1_fresh"
+        interaction = MagicMock(id="v1_fresh", status="completed")
+
+    async def fake_create(**kwargs):
+        captured.append(list(kwargs.get("input") or []))
+        if kwargs.get("previous_interaction_id"):
+            raise Exception("404 Requested entity was not found")
+
+        async def _stream():
+            yield _Done()
+
+        return _stream()
+
+    mock_client = MagicMock()
+    mock_client.aio.interactions.create = AsyncMock(side_effect=fake_create)
+    monkeypatch.setattr(chat_agent, "get_client", lambda: mock_client)
+
+    chunks = [
+        chunk
+        async for chunk in chat_agent._stream_chat_inner(
+            [{"type": "text", "text": "now push the fountain back"}],
+            previous_interaction_id="v1_expired",
+            allow_tools=False,
+            user_id=7,
+        )
+    ]
+
+    assert len(captured) == 2
+    assert captured[0][0]["text"] == "now push the fountain back"
+    retry_text = captured[1][0]["text"]
+    assert "benches and fountains" in retry_text
+    assert "do not greet as a new chat" in retry_text
+    assert captured[1][-1]["text"] == "now push the fountain back"
+    assert any("interaction_reset" in c for c in chunks)
+
+
+@pytest.mark.asyncio
+async def test_gemini_no_chain_still_hydrates_transcript(monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    monkeypatch.setattr(llm_provider, "use_claude", lambda: False)
+    monkeypatch.setattr(chat_agent, "get_chat_tools", lambda user_id=None: [])
+    monkeypatch.setattr(chat_agent, "get_chat_system_instruction", lambda: "sys")
+    monkeypatch.setattr(chat_agent, "cfg", lambda key, default=None: default)
+    monkeypatch.setattr(
+        chat_agent,
+        "cfg_str",
+        lambda key, default="": default if key != "CHAT_THINKING_LEVEL" else "",
+    )
+    monkeypatch.setattr(chat_agent, "log_error", AsyncMock())
+    monkeypatch.setattr(
+        "app.chat_session.get_voice_seed_turns",
+        AsyncMock(return_value=[
+            {"role": "user", "parts": [{"text": "keep the fountain materials"}]},
+            {"role": "model", "parts": [{"text": "Noted."}]},
+        ]),
+    )
+
+    captured: dict = {}
+
+    class _Done:
+        event_type = "interaction.completed"
+        index = None
+        interaction_id = "v1_new"
+        interaction = MagicMock(id="v1_new", status="completed")
+
+    async def fake_create(**kwargs):
+        captured["input"] = list(kwargs.get("input") or [])
+
+        async def _stream():
+            yield _Done()
+
+        return _stream()
+
+    mock_client = MagicMock()
+    mock_client.aio.interactions.create = AsyncMock(side_effect=fake_create)
+    monkeypatch.setattr(chat_agent, "get_client", lambda: mock_client)
+
+    async for _ in chat_agent._stream_chat_inner(
+        [{"type": "text", "text": "?"}],
+        previous_interaction_id=None,
+        allow_tools=False,
+        user_id=9,
+    ):
+        pass
+
+    assert "keep the fountain materials" in captured["input"][0]["text"]
+    assert captured["input"][-1]["text"] == "?"

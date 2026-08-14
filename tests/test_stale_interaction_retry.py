@@ -85,6 +85,14 @@ def _patch_gemini_stream_deps(monkeypatch) -> None:
         lambda key, default="": default if key != "CHAT_THINKING_LEVEL" else "",
     )
     monkeypatch.setattr(chat_agent, "log_error", AsyncMock())
+    monkeypatch.setattr(
+        "app.chat_session.get_voice_seed_turns",
+        AsyncMock(return_value=[]),
+    )
+    monkeypatch.setattr(
+        "app.chat_session.get_guest_voice_seed_turns",
+        AsyncMock(return_value=[]),
+    )
 
 
 def _install_create(monkeypatch, fake_create) -> MagicMock:
