@@ -684,6 +684,7 @@ async def _stream_chat_inner(
             previous_interaction_id,
             allow_tools=allow_tools,
             user_id=user_id,
+            guest_session_id=guest_session_id,
         ):
             yield chunk
         return
@@ -981,6 +982,79 @@ def get_claude_chat_tools(*, user_id: Optional[int] = None) -> list[dict]:
     return _claude_guest_chat_tools_cache
 
 
+def resolve_chain_previous_id(
+    session_prev: Optional[str],
+    client_prev: Optional[str],
+    *,
+    use_claude: Optional[bool] = None,
+) -> Optional[str]:
+    """Pick the conversation id to chain onto for this turn.
+
+    A just-finished turn updates the client immediately. Postgres persist of
+    that id runs *after* SSE ``done``, so ``session_prev`` can still be the
+    *previous* conversation. Preferring the server id here dropped the image
+    + user request from the next turn (the model then greeted on a leftover
+    ``?``).
+
+    Provider families are not mixed: Claude ids are ``cld_…``; Gemini
+    Interactions ids are typically ``v1_…``. An incompatible leftover is
+    ignored so Claude can rehydrate from the Postgres transcript instead.
+    """
+    if use_claude is None:
+        use_claude = llm_provider.use_claude()
+
+    def _compatible(value: Optional[str]) -> bool:
+        if not value:
+            return False
+        text = str(value)
+        if use_claude:
+            return text.startswith("cld_")
+        return not text.startswith("cld_")
+
+    if _compatible(client_prev):
+        return client_prev
+    if _compatible(session_prev):
+        return session_prev
+    return None
+
+
+def seed_turns_to_claude_messages(turns: list[dict]) -> list[dict]:
+    """Convert chat_session voice-seed turns into Claude Messages API history."""
+    messages: list[dict] = []
+    for turn in turns or []:
+        role = turn.get("role")
+        parts = turn.get("parts") or []
+        text = "".join(
+            (p.get("text") or "") if isinstance(p, dict) else str(p)
+            for p in parts
+        ).strip()
+        if not text:
+            continue
+        if role == "user":
+            messages.append({"role": "user", "content": [llm_provider.text_block(text)]})
+        elif role in ("model", "assistant"):
+            messages.append({"role": "assistant", "content": [llm_provider.text_block(text)]})
+    while messages and messages[0].get("role") != "user":
+        messages.pop(0)
+    return messages
+
+
+async def _load_claude_seed_messages(
+    *,
+    user_id: Optional[int],
+    guest_session_id: Optional[str],
+) -> list[dict]:
+    from app import chat_session as _chat_session
+
+    if user_id is not None:
+        turns = await _chat_session.get_voice_seed_turns(int(user_id))
+    elif guest_session_id:
+        turns = await _chat_session.get_guest_voice_seed_turns(guest_session_id)
+    else:
+        return []
+    return seed_turns_to_claude_messages(turns)
+
+
 def _trim_history(messages: list[dict]) -> list[dict]:
     """
     Keep history bounded. Never split a tool_use/tool_result pair and never lead
@@ -1149,26 +1223,40 @@ async def _stream_chat_claude(
     *,
     allow_tools: bool = True,
     user_id: Optional[int] = None,
+    guest_session_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """Claude equivalent of stream_chat — same SSE event contract."""
     conv_id = previous_interaction_id if (previous_interaction_id and str(previous_interaction_id).startswith("cld_")) else f"cld_{uuid.uuid4().hex}"
     messages: list[dict] = list(_CLAUDE_HISTORY.get(conv_id, []))
-    if previous_interaction_id and str(previous_interaction_id).startswith("cld_") and not messages:
-        # KNOWN LIMITATION: _CLAUDE_HISTORY is per-worker in-memory. Under
-        # gunicorn -w N a continuation can land on a worker that never saw the
-        # conversation — context is lost and tool_result pairing can 400.
-        # Requires sticky sessions or -w 1 while USE_CLAUDE is enabled.
-        logger.warning(
-            "[CHAT · claude] continuation %s has no in-memory history on this "
-            "worker (multi-worker without sticky sessions?) — starting fresh",
-            conv_id,
+    if not messages:
+        seeded = await _load_claude_seed_messages(
+            user_id=user_id,
+            guest_session_id=guest_session_id,
         )
+        if seeded:
+            messages = seeded
+            logger.info(
+                "[CHAT · claude] hydrated %d transcript turns for %s "
+                "(worker miss or provider switch)",
+                len(messages),
+                conv_id,
+            )
+        elif previous_interaction_id and str(previous_interaction_id).startswith("cld_"):
+            # KNOWN LIMITATION: _CLAUDE_HISTORY is per-worker in-memory. Under
+            # gunicorn -w N a continuation can land on a worker that never saw the
+            # conversation — context is lost and tool_result pairing can 400.
+            # Requires sticky sessions or -w 1 while USE_CLAUDE is enabled.
+            logger.warning(
+                "[CHAT · claude] continuation %s has no in-memory history on this "
+                "worker (multi-worker without sticky sessions?) — starting fresh",
+                conv_id,
+            )
 
     user_msg = _build_claude_user_message(input_parts, messages)
     messages.append(user_msg)
 
     _dbg("[CHAT ▶ REQUEST · claude]", {
-        "model": llm_provider.CLAUDE_MODEL,
+        "model": llm_provider.claude_model(),
         "conv_id": conv_id,
         "history_messages": len(messages),
         "allow_tools": allow_tools,
@@ -1178,8 +1266,8 @@ async def _stream_chat_claude(
     try:
         client = llm_provider.get_async_anthropic_client()
         kwargs = {
-            "model": llm_provider.CLAUDE_MODEL,
-            "max_tokens": llm_provider.CLAUDE_MAX_TOKENS,
+            "model": llm_provider.claude_model(),
+            "max_tokens": llm_provider.claude_max_tokens(),
             "system": get_chat_system_instruction(),
             "messages": messages,
         }

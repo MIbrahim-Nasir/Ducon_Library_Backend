@@ -483,12 +483,16 @@ async def test_done_persists_new_id_after_double_clear(monkeypatch):
     assert chunks[-1] == _event("done", interaction_id="v1_after_reset")
 
 
-def test_session_prefers_server_id_over_client():
-    """Router chain: session_prev or client previous — server wins when present."""
-    session_prev = "v1_server"
-    client_prev = "v1_stale_client"
-    assert (session_prev or client_prev) == "v1_server"
-    # After reset, session is cleared so a stale client id would be used until
+def test_session_prefers_fresh_client_id_over_stale_server():
+    """Client `done` id wins; server persist can still hold the previous chain."""
+    assert (
+        chat_agent.resolve_chain_previous_id("v1_server", "v1_client", use_claude=False)
+        == "v1_client"
+    )
+    # After reset, session is cleared so a leftover client id is used until
     # the next successful done — which is why interaction_reset must clear both.
-    assert (None or client_prev) == "v1_stale_client"
-    assert (None or None) is None
+    assert (
+        chat_agent.resolve_chain_previous_id(None, "v1_stale_client", use_claude=False)
+        == "v1_stale_client"
+    )
+    assert chat_agent.resolve_chain_previous_id(None, None, use_claude=False) is None

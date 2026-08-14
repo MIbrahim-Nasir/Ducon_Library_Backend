@@ -433,20 +433,22 @@ async def chat_message(
         mime = upload.content_type or _infer_mime(upload.filename)
         pending_files.append((upload.filename, file_bytes, mime))
 
-    # Prefer server-persisted session (updated by voice_context injects) over a
-    # possibly stale client previous_interaction_id.
+    # Client id is preferred when both are set: persist of the latest id runs
+    # after SSE `done`, so session_prev can still be the previous conversation.
     # After guest → login, the client clears previous_interaction_id so this
-    # fallback cannot chain onto a guest turn.
+    # cannot chain onto a guest turn.
     if current_user is not None:
         session_prev = await chat_session.get_interaction_id(current_user.id)
     else:
         session_prev = await chat_session.get_guest_interaction_id(guest_session_id)
-    effective_prev = session_prev or previous_interaction_id
+    use_claude = llm_provider.use_claude()
+    effective_prev = chat_agent.resolve_chain_previous_id(
+        session_prev, previous_interaction_id, use_claude=use_claude
+    )
     memory_user = (message or "").strip()
     if not memory_user and pending_files:
         memory_user = "[User sent image attachment(s)]"
     stream_user_id = current_user.id if current_user else None
-    use_claude = llm_provider.use_claude()
 
     async def _produce_message_stream():
         # Gemini path → upload to the Files API and reference by URI.
@@ -608,12 +610,12 @@ async def chat_tool_result(
 
     stream_user_id = current_user.id if current_user else None
     if current_user is not None:
-        chain_prev = await chat_session.get_interaction_id(current_user.id) or body.previous_interaction_id
+        session_prev = await chat_session.get_interaction_id(current_user.id)
     else:
-        chain_prev = (
-            await chat_session.get_guest_interaction_id(guest_session_id)
-            or body.previous_interaction_id
-        )
+        session_prev = await chat_session.get_guest_interaction_id(guest_session_id)
+    chain_prev = chat_agent.resolve_chain_previous_id(
+        session_prev, body.previous_interaction_id
+    )
 
     chat_agent._dbg(
         "[CHAT ROUTER ▶ TOOL RESULT]",
@@ -985,7 +987,9 @@ async def inject_voice_context(
         return {"interaction_id": await chat_session.get_interaction_id(current_user.id)}
 
     session_prev = await chat_session.get_interaction_id(current_user.id)
-    chain_prev = session_prev or body.previous_interaction_id
+    chain_prev = chat_agent.resolve_chain_previous_id(
+        session_prev, body.previous_interaction_id
+    )
 
     # Normal voice turns are already stored by GeminiLiveSession._commit_turn.
     # Only async designer-job memory injects need an extra transcript row here.
@@ -1122,7 +1126,9 @@ async def inject_browse_context(
     input_parts = [{"type": "text", "text": memory_text}]
 
     session_prev = await chat_session.get_interaction_id(current_user.id)
-    chain_prev = session_prev or body.previous_interaction_id
+    chain_prev = chat_agent.resolve_chain_previous_id(
+        session_prev, body.previous_interaction_id
+    )
 
     interaction_id: Optional[str] = None
     async for raw in _stream_with_session_save(
@@ -1235,7 +1241,9 @@ async def inject_studio_context(
     input_parts = [{"type": "text", "text": memory_text}]
 
     session_prev = await chat_session.get_interaction_id(current_user.id)
-    chain_prev = session_prev or body.previous_interaction_id
+    chain_prev = chat_agent.resolve_chain_previous_id(
+        session_prev, body.previous_interaction_id
+    )
 
     interaction_id: Optional[str] = None
     async for raw in _stream_with_session_save(
