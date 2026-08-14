@@ -197,7 +197,12 @@ class AppSetting(Base):
     is_secret   = Column(Boolean, nullable=False, server_default='false')
     description = Column(Text, nullable=True)
     updated_by  = Column(BigInteger, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
-    updated_at  = Column(TIMESTAMP(timezone=True), nullable=False, server_default=func.now())
+    updated_at  = Column(
+        TIMESTAMP(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
 
     __table_args__ = (
         UniqueConstraint("namespace", "key", name="uq_app_settings_namespace_key"),

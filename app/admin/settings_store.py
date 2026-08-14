@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -135,6 +136,7 @@ class SettingsStore:
 
         coerced = cast_value(spec, value)
         encoded = encode_value(spec, coerced)
+        now = datetime.now(timezone.utc)
 
         result = await db.execute(
             select(AppSetting).where(
@@ -151,13 +153,16 @@ class SettingsStore:
                 is_secret=spec.is_secret,
                 description=spec.description,
                 updated_by=admin_user_id,
+                updated_at=now,
             )
             db.add(row)
         else:
             row.value = encoded
             row.value_type = spec.value_type
             row.updated_by = admin_user_id
-            row.updated_at = None  # let server_default re-apply on commit
+            # server_default only applies on INSERT. Setting None here emitted
+            # UPDATE ... SET updated_at=NULL and 500'd admin settings saves.
+            row.updated_at = now
         await db.commit()
         await db.refresh(row)
 
