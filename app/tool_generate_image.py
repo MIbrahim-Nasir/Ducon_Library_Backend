@@ -914,17 +914,46 @@ async def generate_multi_image(
         gen_sm = StepMetrics() if agg_metrics is not None else None
         await _emit("image_gen", model_id, image_thinking, "running", _t0, None, None)
         try:
-            image_bytes = await asyncio.to_thread(
-                _run_generation_sync,
-                model_id,
-                pil_images,
-                labels,
-                active_prompt,
-                resolved_aspect,
-                user_id,
-                image_thinking=image_thinking,
-                metrics=gen_sm,
-            )
+            from app.observability.langfuse_client import observe_generation
+
+            with observe_generation(
+                "multi-image-generation",
+                model=model_id,
+                metadata={
+                    "agent": "multi_image",
+                    "provider": "gemini",
+                    "round": gen_round + 1,
+                    "image_count": len(pil_images),
+                    "aspect_ratio": resolved_aspect,
+                },
+                input={
+                    "prompt": (active_prompt or "")[:1500],
+                    "labels": list(labels),
+                    "image_count": len(pil_images),
+                },
+                tags=["multi-image", "gemini"],
+            ) as generation:
+                image_bytes = await asyncio.to_thread(
+                    _run_generation_sync,
+                    model_id,
+                    pil_images,
+                    labels,
+                    active_prompt,
+                    resolved_aspect,
+                    user_id,
+                    image_thinking=image_thinking,
+                    metrics=gen_sm,
+                )
+                try:
+                    generation.update(
+                        output={
+                            "status": "ok",
+                            "bytes": len(image_bytes) if image_bytes else 0,
+                            "round": gen_round + 1,
+                        }
+                    )
+                except Exception:
+                    pass
             if gen_sm is not None and agg_metrics is not None:
                 agg_metrics.add(model=gen_sm.model, tokens_in=gen_sm.tokens_in,
                                 tokens_out=gen_sm.tokens_out, image_count=gen_sm.image_count,

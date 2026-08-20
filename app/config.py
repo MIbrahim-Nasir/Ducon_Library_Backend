@@ -40,9 +40,24 @@ _DEFAULT_DEV_ORIGINS = [
 
 
 def get_cors_origins() -> list[str]:
+    """
+    Browser origins allowed by CORSMiddleware.
+
+    Merges ``CORS_ALLOW_ORIGINS`` (SPA) with ``INTERNAL_TOOL_CORS_ORIGINS``
+    (explicit allowlist for browser-based internal tools). Never uses ``*``.
+    Curl/scripts are unaffected by CORS (browser-only).
+    """
     configured = _split_csv(os.getenv("CORS_ALLOW_ORIGINS", ""))
-    if configured:
-        return configured
+    internal = _split_csv(os.getenv("INTERNAL_TOOL_CORS_ORIGINS", ""))
+    if configured or internal:
+        # Preserve order, drop duplicates.
+        seen: set[str] = set()
+        merged: list[str] = []
+        for origin in configured + internal:
+            if origin not in seen:
+                seen.add(origin)
+                merged.append(origin)
+        return merged
     # No explicit config: allow local dev origins only. In production this should
     # be set explicitly; an empty list here means "no cross-origin access".
     return [] if IS_PRODUCTION else _DEFAULT_DEV_ORIGINS

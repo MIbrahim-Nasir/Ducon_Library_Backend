@@ -2,7 +2,15 @@
 
 **Session date:** 2026-08-14 / 2026-07-23 / 2026-07-16 / 2026-07-15 / 2026-07-14 / 2026-07-11 / 2026-07-10 / 2026-07-09 / 2026-07-08  
 **Branch:** `main` / `development` (backend); frontend notes from sibling `Ducon_Library`  
-**Scope:** Chat session isolation + Gemini stream errors; chat image inline for Gemini 3.7; guest chat FK; admin settings `updated_at`; stale-chain transcript rehydrate.
+**Scope:** Designer agent package split + internal jobs API; chat session isolation; Gemini 3.7 inline images.
+
+### 2026-08-20 — Designer agent package + internal jobs API
+
+- **Split** — Long-running designer loop moved into `app/designer/` (loop, tools, jobs, runner, budgets, catalog). `app/designer_agent.py` is a compatibility re-export.
+- **Internal API** — `POST/GET /internal/designer/jobs` for scripts/Revit (designer JWT + `X-Internal-Tool-Key`). Shutdown drains in-memory designer jobs.
+- **Observability** — Langfuse service name + structured generation I/O so traces are not empty.
+- **Catalog** — Richer class/type orientation for designer tool prompts (`catalog_filter_context.py`).
+- **Tests** — `tests/test_designer_agent_loop.py`, `tests/test_internal_designer.py`, Langfuse + smoke updates.
 
 ### 2026-08-14 — Chat images inline (Gemini 3.7 Files URI 403)
 

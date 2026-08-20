@@ -219,6 +219,26 @@ async def get_current_user(
     return user
 
 
+# ── Role helpers (designer internal tools) ────────────────────────────────────
+
+ROLE_DESIGNER = "designer"
+
+
+def is_designer_role(role: str | None) -> bool:
+    """True when ``users.role`` is designer (internal tools / designer pipeline)."""
+    return (role or "").strip().lower() == ROLE_DESIGNER
+
+
+async def require_designer(current_user: User = Depends(get_current_user)) -> User:
+    """Require an authenticated user with ``role == designer``."""
+    if not is_designer_role(current_user.role):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Designer role required",
+        )
+    return current_user
+
+
 def decode_token_payload(token: str) -> dict:
     """Decode a token without raising — returns empty dict on failure."""
     try:

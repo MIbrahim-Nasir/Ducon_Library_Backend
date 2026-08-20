@@ -277,11 +277,19 @@ def complete_message(
     tools: Optional[list[dict]] = None,
     max_tokens: Optional[int] = None,
     thinking: bool = True,
+    observation_name: str = "generate-response",
+    agent: str = "chat",
+    tags: Optional[list[str]] = None,
+    observation_input: Any = None,
 ):
     """Synchronous full completion. Returns the final anthropic Message."""
     import time
 
-    from app.observability.langfuse_client import observe_generation
+    from app.observability.langfuse_client import (
+        generation_output_summary,
+        observe_generation,
+        preview_agent_messages,
+    )
 
     client = get_anthropic_client()
     kwargs = _build_kwargs(
@@ -290,33 +298,58 @@ def complete_message(
     )
     model = claude_model()
     t0 = time.perf_counter()
+    obs_tags = list(tags) if tags is not None else [agent.replace("_", "-"), "claude"]
+    obs_input = observation_input
+    if obs_input is None:
+        obs_input = {
+            "system_preview": (system or "")[:500],
+            **preview_agent_messages(
+                [{"role": m.get("role"), "content": m.get("content")} for m in messages]
+            ),
+        }
     with observe_generation(
-        "generate-response",
+        observation_name,
         model=model,
-        metadata={"agent": "chat", "provider": "claude"},
-        tags=["chat", "claude"],
+        metadata={"agent": agent, "provider": "claude"},
+        input=obs_input,
+        tags=obs_tags,
     ) as generation:
         with client.messages.stream(**kwargs) as stream:
             msg = stream.get_final_message()
         latency_ms = int((time.perf_counter() - t0) * 1000)
         try:
+            text = extract_text(msg)
+            tool_calls = [
+                {"id": b.get("id"), "name": b.get("name"), "args": b.get("input") or {}}
+                for b in tool_use_blocks(msg)
+            ]
             usage = getattr(msg, "usage", None)
+            usage_details = None
+            u: dict = {}
             if usage is not None:
                 u = usage.model_dump() if hasattr(usage, "model_dump") else (
                     usage if isinstance(usage, dict) else {}
                 )
                 inp = int(u.get("input_tokens") or 0)
                 out = int(u.get("output_tokens") or 0)
-                try:
-                    generation.update(
-                        usage_details={"input": inp, "output": out} if (inp or out) else None,
-                        metadata={"agent": "chat", "provider": "claude", "latency_ms": latency_ms},
-                    )
-                except Exception:
-                    pass
+                if inp or out:
+                    usage_details = {"input": inp, "output": out}
+            try:
+                generation.update(
+                    output=generation_output_summary(
+                        text=text,
+                        tool_calls=tool_calls,
+                        finish_reason=getattr(msg, "stop_reason", None),
+                    ),
+                    usage_details=usage_details,
+                    metadata={"agent": agent, "provider": "claude", "latency_ms": latency_ms},
+                )
+            except Exception:
+                pass
+            if u:
                 from app.admin.usage_helpers import record_from_usage_dict
                 record_from_usage_dict(
-                    u, agent="chat", model=model, provider="claude", latency_ms=latency_ms,
+                    u, agent=agent, model=model, provider="claude", latency_ms=latency_ms,
                 )
         except Exception:
             pass
@@ -330,11 +363,19 @@ async def acomplete_message(
     tools: Optional[list[dict]] = None,
     max_tokens: Optional[int] = None,
     thinking: bool = True,
+    observation_name: str = "generate-response",
+    agent: str = "chat",
+    tags: Optional[list[str]] = None,
+    observation_input: Any = None,
 ):
     """Async full completion. Returns the final anthropic Message."""
     import time
 
-    from app.observability.langfuse_client import observe_generation
+    from app.observability.langfuse_client import (
+        generation_output_summary,
+        observe_generation,
+        preview_agent_messages,
+    )
 
     client = get_async_anthropic_client()
     kwargs = _build_kwargs(
@@ -343,33 +384,58 @@ async def acomplete_message(
     )
     model = claude_model()
     t0 = time.perf_counter()
+    obs_tags = list(tags) if tags is not None else [agent.replace("_", "-"), "claude"]
+    obs_input = observation_input
+    if obs_input is None:
+        obs_input = {
+            "system_preview": (system or "")[:500],
+            **preview_agent_messages(
+                [{"role": m.get("role"), "content": m.get("content")} for m in messages]
+            ),
+        }
     with observe_generation(
-        "generate-response",
+        observation_name,
         model=model,
-        metadata={"agent": "chat", "provider": "claude"},
-        tags=["chat", "claude"],
+        metadata={"agent": agent, "provider": "claude"},
+        input=obs_input,
+        tags=obs_tags,
     ) as generation:
         async with client.messages.stream(**kwargs) as stream:
             msg = await stream.get_final_message()
         latency_ms = int((time.perf_counter() - t0) * 1000)
         try:
+            text = extract_text(msg)
+            tool_calls = [
+                {"id": b.get("id"), "name": b.get("name"), "args": b.get("input") or {}}
+                for b in tool_use_blocks(msg)
+            ]
             usage = getattr(msg, "usage", None)
+            usage_details = None
+            u: dict = {}
             if usage is not None:
                 u = usage.model_dump() if hasattr(usage, "model_dump") else (
                     usage if isinstance(usage, dict) else {}
                 )
                 inp = int(u.get("input_tokens") or 0)
                 out = int(u.get("output_tokens") or 0)
-                try:
-                    generation.update(
-                        usage_details={"input": inp, "output": out} if (inp or out) else None,
-                        metadata={"agent": "chat", "provider": "claude", "latency_ms": latency_ms},
-                    )
-                except Exception:
-                    pass
+                if inp or out:
+                    usage_details = {"input": inp, "output": out}
+            try:
+                generation.update(
+                    output=generation_output_summary(
+                        text=text,
+                        tool_calls=tool_calls,
+                        finish_reason=getattr(msg, "stop_reason", None),
+                    ),
+                    usage_details=usage_details,
+                    metadata={"agent": agent, "provider": "claude", "latency_ms": latency_ms},
+                )
+            except Exception:
+                pass
+            if u:
                 from app.admin.usage_helpers import record_from_usage_dict
                 record_from_usage_dict(
-                    u, agent="chat", model=model, provider="claude", latency_ms=latency_ms,
+                    u, agent=agent, model=model, provider="claude", latency_ms=latency_ms,
                 )
         except Exception:
             pass

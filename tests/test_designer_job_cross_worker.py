@@ -8,7 +8,7 @@ GET /designer/jobs/{id} and /events.
 
 This test simulates two workers against a *shared* fake DB (a module-level dict
 standing in for the ``designer_jobs`` table) by swapping out
-``app.designer_agent.async_session_maker``. We:
+``app.designer.jobs.async_session_maker``. We:
 
 1. Worker A: create a job, persist it, emit a couple of progress events, then
    mark it terminal (completed) with a final payload.
@@ -85,7 +85,7 @@ def fake_db(monkeypatch):
         return _FakeDesignerSession()
 
     # Both the module-level name used by the helpers and any imported alias.
-    monkeypatch.setattr("app.designer_agent.async_session_maker", _maker)
+    monkeypatch.setattr("app.designer.jobs.async_session_maker", _maker)
     yield _FakeDesignerSession.store
     _FakeDesignerSession.store.clear()
 

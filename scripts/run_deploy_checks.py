@@ -24,10 +24,13 @@ DEFAULT_TESTS = [
 IMPORT_SANITY_MODULES = [
     "app.benchmark.designer_agent",
     "app.designer_agent",
+    "app.designer",
+    "app.designer.runner",
     "app.chat_agent",
     "app.cleanup_scheduler",
     "app.tool_generate_image",
     "app.routers.multi_image_gen",
+    "app.routers.internal_designer",
 ]
 CHECKLIST = ROOT / "tests" / "DEPLOYMENT_ENDPOINT_CHECKLIST.md"
 

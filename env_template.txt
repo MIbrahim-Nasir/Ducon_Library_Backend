@@ -15,6 +15,10 @@ LANGFUSE_PUBLIC_KEY =
 LANGFUSE_SECRET_KEY =
 # Optional; alias LANGFUSE_HOST also accepted by the client.
 LANGFUSE_BASE_URL =
+# OTEL / Langfuse service name (avoids UI label "unknown_service").
+# LANGFUSE_SERVICE_NAME wins; else OTEL_SERVICE_NAME; else ducon-library-backend.
+LANGFUSE_SERVICE_NAME = ducon-library-backend
+# OTEL_SERVICE_NAME = ducon-library-backend
 # OpenRouter API key — optional, used by the dev benchmark dashboard model-router pairs.
 # Get one at https://openrouter.ai/keys
 OPENROUTER_API_KEY =
@@ -39,6 +43,20 @@ APP_BUILD_ID =
 BUILD_ID_FILE =
 # Comma-separated allowed browser origins for CORS (production must set this).
 CORS_ALLOW_ORIGINS = https://app.your-domain.com
+# Optional extra CORS origins for browser-based internal tools (merged with CORS_ALLOW_ORIGINS).
+# Explicit allowlist only — never use *. Curl/scripts ignore CORS.
+# INTERNAL_TOOL_CORS_ORIGINS = https://tools.your-domain.com
+# Shared secret for POST /internal/designer/jobs (header X-Internal-Tool-Key).
+# Required together with a designer-role user JWT. Fail-closed when unset.
+INTERNAL_DESIGNER_API_KEY =
+# Optional tuning for the internal designer tools API (defaults shown).
+# INTERNAL_DESIGNER_RATE_LIMIT = 40
+# INTERNAL_DESIGNER_RATE_WINDOW_SECONDS = 3600
+# INTERNAL_DESIGNER_MAX_CONCURRENT = 10
+# INTERNAL_DESIGNER_PROMPT_MAX_CHARS = 8000
+# Max seconds POST /internal/designer/jobs?wait=true will block (default 15 min).
+# On timeout returns job_id with status still running/queued for client polling.
+# INTERNAL_DESIGNER_WAIT_TIMEOUT_SECONDS = 900
 # Secret required to trigger POST /guest/cleanup (send as X-Cron-Secret header).
 # Manual/ops only — weekly cleanup also runs in-process (see CLEANUP_* below).
 GUEST_CLEANUP_SECRET =
@@ -52,6 +70,17 @@ CLEANUP_MIN_AGE_DAYS = 7
 DESIGNER_JOB_RETENTION_DAYS = 7
 # Mark in-flight designer jobs failed when updated_at is older than this (worker crash).
 DESIGNER_JOB_STALE_RUNNING_HOURS = 2
+# Autonomous designer agent loop budgets (optional; defaults shown).
+# DESIGNER_AGENT_MODEL = gemini-3.5-flash
+# DESIGNER_AGENT_IMAGE_MODEL = flash
+# DESIGNER_AGENT_MAX_STEPS = 12
+# DESIGNER_AGENT_MAX_GENERATIONS = 3
+# DESIGNER_AGENT_MAX_SEARCHES = 12
+# DESIGNER_AGENT_WALL_TIME_SECONDS = 900
+# DESIGNER_AGENT_SEARCH_LIMIT = 12
+# DESIGNER_AGENT_MAX_REFERENCES = 7
+# DESIGNER_AGENT_PASS_SCORE = 7.5
+# DESIGNER_AGENT_ASPECT_RATIO = 16:9
 # Secret used to sign local-mode guest image URLs (defaults to JWT_SECRET_KEY).
 URL_SIGNING_SECRET =
 # DB connection pool tuning (optional; sensible defaults applied).

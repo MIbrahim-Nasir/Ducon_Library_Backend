@@ -78,6 +78,19 @@ sudo journalctl -u ducon-library -f
 sudo journalctl -u ducon-library -n 100 --no-pager
 ```
 
+### Local uvicorn — designer / Revit tunnel tests
+
+**Do not use `--reload` while testing long designer jobs.** Reload kills the
+process; in-memory designer jobs are cancelled (`Server restarted (reload);
+job interrupted.`) and lifespan may log `CancelledError` / `KeyboardInterrupt`
+noise from uvicorn. Prefer:
+
+```bash
+uvicorn app.main:app --port 8000
+```
+
+(no `--reload`) for Revit / tunnel / multi-minute designer runs.
+
 ---
 
 ## Add an admin

@@ -28,6 +28,7 @@ CHAT_AGENT_SYSTEM: str = ""
 LIVE_VOICE_AGENT_SYSTEM: str = ""
 
 # ── Designer job templates (user-message bodies with optional placeholders) ───
+DESIGNER_AGENT_SYSTEM: str = ""
 DESIGNER_ANALYZE_PLAN: str = ""
 DESIGNER_EVALUATE_GENERATION: str = ""
 DESIGNER_FINAL_SUMMARY: str = ""
@@ -44,6 +45,7 @@ _PROMPT_FILES: dict[str, str] = {
     "DESIGNER_PROMPT_WRITER_SYSTEM": "designer-prompt-writer.md",
     "CHAT_AGENT_SYSTEM": "chat-agent.md",
     "LIVE_VOICE_AGENT_SYSTEM": "live-voice-agent.md",
+    "DESIGNER_AGENT_SYSTEM": "designer-agent-system.md",
     "DESIGNER_ANALYZE_PLAN": "designer-analyze-plan.md",
     "DESIGNER_EVALUATE_GENERATION": "designer-evaluate-generation.md",
     "DESIGNER_FINAL_SUMMARY": "designer-final-summary.md",
@@ -104,6 +106,7 @@ def load_prompts(
     global DESIGNER_PROMPT_WRITER_SYSTEM
     global CHAT_AGENT_SYSTEM
     global LIVE_VOICE_AGENT_SYSTEM
+    global DESIGNER_AGENT_SYSTEM
     global DESIGNER_ANALYZE_PLAN
     global DESIGNER_EVALUATE_GENERATION
     global DESIGNER_FINAL_SUMMARY

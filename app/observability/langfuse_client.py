@@ -5,11 +5,13 @@ Aligned with Langfuse skill / best-practices (good names, generations with
 model+tokens, session_id / user_id / tags, nested observations, truncated I/O).
 
 When ``LANGFUSE_ENABLED`` is false / unset, or keys are missing, every helper
-is a no-op. Dual-write from ``app.admin.usage_recorder.record`` covers most
-agent paths without scattering instrumentation.
+is a no-op. Dual-write from ``app.admin.usage_recorder.record`` covers paths
+without an active ``observe_generation``; those dual-writes always set a
+structured input/output summary so the UI never shows null I/O.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -25,6 +27,7 @@ _suppress_dual_write: ContextVar[bool] = ContextVar("langfuse_suppress_dual_writ
 _client: Any = None
 _init_attempted: bool = False
 _MAX_PREVIEW = 2000
+DEFAULT_SERVICE_NAME = "ducon-library-backend"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -58,6 +61,22 @@ def _base_url() -> Optional[str]:
     )
 
 
+def _ensure_service_name() -> str:
+    """
+    OTEL Resource defaults to ``unknown_service`` unless ``OTEL_SERVICE_NAME``
+    is set. Prefer LANGFUSE_SERVICE_NAME, then OTEL_SERVICE_NAME, then default.
+    """
+    name = (
+        (os.getenv("LANGFUSE_SERVICE_NAME") or "").strip()
+        or (os.getenv("OTEL_SERVICE_NAME") or "").strip()
+        or DEFAULT_SERVICE_NAME
+    )
+    # Set before Langfuse builds its TracerProvider / Resource.
+    if not (os.getenv("OTEL_SERVICE_NAME") or "").strip():
+        os.environ["OTEL_SERVICE_NAME"] = name
+    return name
+
+
 def get_client() -> Any:
     """Lazy Langfuse client. Returns None when disabled or init fails.
 
@@ -72,6 +91,7 @@ def get_client() -> Any:
         return None
     _init_attempted = True
     try:
+        _ensure_service_name()
         from langfuse import Langfuse
 
         kwargs: dict[str, Any] = {
@@ -95,8 +115,13 @@ def _truncate(value: Any, limit: int = _MAX_PREVIEW) -> Any:
     if isinstance(value, str):
         return value if len(value) <= limit else value[:limit] + "…"
     if isinstance(value, (dict, list)):
-        text = str(value)
-        return text if len(text) <= limit else text[:limit] + "…"
+        try:
+            text = json.dumps(value, default=str, ensure_ascii=False)
+        except Exception:
+            text = str(value)
+        if len(text) <= limit:
+            return value
+        return text[:limit] + "…"
     return value
 
 
@@ -124,6 +149,91 @@ def preview_user_text(parts: Any) -> Optional[str]:
     if not texts:
         return None
     return _truncate("\n".join(texts))
+
+
+def preview_agent_messages(
+    messages: list[dict[str, Any]] | None,
+    *,
+    max_messages: int = 8,
+    text_limit: int = 400,
+) -> dict[str, Any]:
+    """Compact designer/chat agent transcript preview (no image bytes)."""
+    msgs = list(messages or [])
+    tail = msgs[-max_messages:] if len(msgs) > max_messages else msgs
+    preview: list[dict[str, Any]] = []
+    for msg in tail:
+        role = msg.get("role") or "unknown"
+        entry: dict[str, Any] = {"role": role}
+        text = msg.get("text")
+        if text:
+            entry["text"] = _truncate(str(text), text_limit)
+        tool_calls = msg.get("tool_calls") or []
+        if tool_calls:
+            entry["tool_calls"] = [
+                {
+                    "name": tc.get("name"),
+                    "args": _truncate(tc.get("args") or {}, 300),
+                }
+                for tc in tool_calls[:6]
+            ]
+        if role == "tool":
+            entry["name"] = msg.get("name")
+            entry["result"] = _truncate(msg.get("result"), 400)
+        images = msg.get("images") or []
+        if images:
+            entry["image_count"] = len(images)
+        content = msg.get("content")
+        if content is not None and "text" not in entry:
+            if isinstance(content, str):
+                entry["text"] = _truncate(content, text_limit)
+            elif isinstance(content, list):
+                texts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        t = (block.get("text") or "").strip()
+                        if t:
+                            texts.append(t)
+                    elif isinstance(block, str) and block.strip():
+                        texts.append(block.strip())
+                if texts:
+                    entry["text"] = _truncate("\n".join(texts), text_limit)
+                entry["content_blocks"] = len(content)
+        preview.append(entry)
+    return {
+        "message_count": len(msgs),
+        "messages": preview,
+        "truncated": len(msgs) > len(tail),
+    }
+
+
+def generation_output_summary(
+    *,
+    text: Optional[str] = None,
+    tool_calls: Optional[list[dict[str, Any]]] = None,
+    finish_reason: Any = None,
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Structured generation output for Langfuse (never leave blank on success)."""
+    out: dict[str, Any] = {}
+    if text is not None:
+        out["text"] = _truncate(str(text), 1500)
+    if tool_calls:
+        out["tool_calls"] = [
+            {
+                "name": tc.get("name"),
+                "id": tc.get("id"),
+                "args": _truncate(tc.get("args") or {}, 400),
+            }
+            for tc in tool_calls[:12]
+        ]
+        out["tool_call_count"] = len(tool_calls)
+    if finish_reason is not None:
+        out["finish_reason"] = str(finish_reason)
+    if extra:
+        out.update(extra)
+    if not out:
+        out["status"] = "ok"
+    return out
 
 
 class _NoOpObservation:
@@ -184,7 +294,7 @@ def start_trace(
     with cm as span:
         if truncated_input is not None:
             try:
-                client.set_current_trace_io(input=truncated_input)
+                span.update(input=truncated_input)
             except Exception:
                 pass
 
@@ -212,13 +322,12 @@ def start_trace(
 
 
 def update_trace_output(output: Any) -> None:
-    """Set root / current-trace output (assistant reply preview). Fail-open."""
+    """Set root / current observation output (assistant reply preview). Fail-open."""
     client = get_client()
     if client is None:
         return
     try:
         truncated = _truncate(output)
-        client.set_current_trace_io(output=truncated)
         try:
             client.update_current_span(output=truncated)
         except Exception:
@@ -234,11 +343,16 @@ def observe_generation(
     model: Optional[str] = None,
     metadata: Optional[dict[str, Any]] = None,
     input: Any = None,
+    output: Any = None,
     tags: Optional[list[str]] = None,
     suppress_dual_write: bool = True,
 ) -> Iterator[Any]:
     """
     Nested ``generation`` observation around an LLM call (model + tokens).
+
+    Always sets ``input`` when provided. Callers should ``.update(output=...)``
+    before exit; if ``output`` is passed here it is applied on successful exit
+    when the observation was not already updated with output.
 
     When ``suppress_dual_write`` is True (default), concurrent
     ``record_generation`` calls in this context are skipped.
@@ -251,13 +365,15 @@ def observe_generation(
     token = _suppress_dual_write.set(True) if suppress_dual_write else None
     t0 = time.perf_counter()
     meta = dict(metadata or {})
+    truncated_input = _truncate(input)
     try:
         try:
             cm = client.start_as_current_observation(
                 as_type="generation",
                 name=name,
                 model=model,
-                input=_truncate(input),
+                input=truncated_input,
+                output=_truncate(output) if output is not None else None,
                 metadata=meta or None,
             )
         except Exception:
@@ -285,6 +401,7 @@ def observe_generation(
                         generation.update(
                             level="ERROR",
                             status_message=str(exc)[:500],
+                            output=_truncate({"error": str(exc)[:500]}),
                             metadata={
                                 **meta,
                                 "latency_ms": int((time.perf_counter() - t0) * 1000),
@@ -313,6 +430,68 @@ def observe_generation(
             _suppress_dual_write.reset(token)
 
 
+@contextmanager
+def observe_span(
+    name: str,
+    *,
+    as_type: str = "span",
+    metadata: Optional[dict[str, Any]] = None,
+    input: Any = None,
+    tags: Optional[list[str]] = None,
+) -> Iterator[Any]:
+    """Nested span / tool / embedding observation. Fail-open."""
+    client = get_client()
+    if client is None:
+        yield _NoOpObservation()
+        return
+
+    meta = dict(metadata or {})
+    truncated_input = _truncate(input)
+    try:
+        cm = client.start_as_current_observation(
+            as_type=as_type,
+            name=name,
+            input=truncated_input,
+            metadata=meta or None,
+        )
+    except Exception:
+        logger.debug("Langfuse observe_span open failed", exc_info=True)
+        yield _NoOpObservation()
+        return
+
+    prop_cm = None
+    if tags:
+        try:
+            from langfuse import propagate_attributes
+
+            prop_cm = propagate_attributes(tags=list(tags))
+        except Exception:
+            prop_cm = None
+
+    if prop_cm is not None:
+        prop_cm.__enter__()
+    try:
+        with cm as span:
+            try:
+                yield span
+            except Exception as exc:
+                try:
+                    span.update(
+                        level="ERROR",
+                        status_message=str(exc)[:500],
+                        output=_truncate({"error": str(exc)[:500]}),
+                    )
+                except Exception:
+                    pass
+                raise
+    finally:
+        if prop_cm is not None:
+            try:
+                prop_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+
+
 def record_generation(
     *,
     name: Optional[str] = None,
@@ -329,11 +508,15 @@ def record_generation(
     error_message: Optional[str] = None,
     cost_usd: Optional[float] = None,
     tags: Optional[list[str]] = None,
+    input: Any = None,
+    output: Any = None,
 ) -> None:
     """
     Fire-and-forget generation (post-hoc from usage sinks).
 
     Nests under the current observation when one is active (e.g. chat-response).
+    Always sets input + output (structured summary when callers omit them) so
+    Langfuse never shows null/undefined I/O on success.
     Never raises. No-op when disabled or dual-write suppressed.
     """
     if _suppress_dual_write.get():
@@ -374,6 +557,30 @@ def record_generation(
         obs_name = name or f"{agent.replace('_', '-')}-generation"
         feature_tags = list(tags) if tags else [agent.replace("_", "-")]
 
+        # Never leave I/O blank — dual-write has no prompt text, so summarize.
+        obs_input = _truncate(input) if input is not None else {
+            "agent": agent,
+            "model": model or None,
+            "provider": provider,
+            "source": "usage_dual_write",
+        }
+        if output is not None:
+            obs_output = _truncate(output)
+        elif status != "success":
+            obs_output = {
+                "status": status,
+                "error": (str(error_message)[:500] if error_message else None),
+            }
+        else:
+            obs_output = {
+                "status": status,
+                "input_tokens": int(input_tokens or 0),
+                "output_tokens": int(output_tokens or 0),
+                "image_count": int(image_count or 0),
+            }
+            if latency_ms is not None:
+                obs_output["latency_ms"] = latency_ms
+
         prop_kwargs: dict[str, Any] = {"tags": feature_tags}
         uid = _user_str(user_id)
         if uid:
@@ -386,6 +593,8 @@ def record_generation(
                 name=obs_name,
                 as_type="generation",
                 model=model or None,
+                input=obs_input,
+                output=obs_output,
                 metadata=meta,
                 usage_details=usage_details or None,
                 cost_details=cost_details,

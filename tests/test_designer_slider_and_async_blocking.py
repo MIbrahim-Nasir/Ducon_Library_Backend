@@ -109,7 +109,7 @@ def test_designer_input_rejects_path_traversal_key(monkeypatch, tmp_path):
 
 # ─── Issue 1: designer final payload + event contract ──────────────────────
 
-DESIGNER_AGENT = Path(__file__).resolve().parent.parent / "app" / "designer_agent.py"
+DESIGNER_AGENT = Path(__file__).resolve().parent.parent / "app" / "designer" / "runner.py"
 
 
 def _designer_ast() -> ast.Module:
@@ -172,7 +172,7 @@ def test_designer_emits_input_image_event_with_label():
 def test_designer_input_image_endpoint_exists():
     """The auth-gated serving endpoint for the persisted input image must exist
     on the designer jobs router (used by aiService.getDesignerInputBlobUrl)."""
-    router_src = (DESIGNER_AGENT.parent / "routers" / "designer_jobs.py").read_text(encoding="utf-8")
+    router_src = (DESIGNER_AGENT.parent.parent / "routers" / "designer_jobs.py").read_text(encoding="utf-8")
     assert '"/{job_id}/input-image"' in router_src, (
         "GET /designer/jobs/{job_id}/input-image endpoint is missing — the "
         "frontend cannot fetch the user's original space photo for the slider."
@@ -185,6 +185,12 @@ def test_designer_input_image_endpoint_exists():
 # a lazy Image.open (header read only) by design — its callers force the decode
 # inside to_thread — so it is intentionally excluded to avoid false positives.
 _ASYNC_FILES = [
+    "app/designer/runner.py",
+    "app/designer/loop.py",
+    "app/designer/tools.py",
+    "app/designer/jobs.py",
+    "app/designer/catalog.py",
+    "app/designer/llm.py",
     "app/designer_agent.py",
     "app/tool_generate_image.py",
     "app/studio_directions_agent.py",

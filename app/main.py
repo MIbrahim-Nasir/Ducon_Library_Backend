@@ -144,9 +144,11 @@ async def lifespan(app: FastAPI):
                 await _task
             except asyncio.CancelledError:
                 pass
-        # Cancel in-flight generation jobs so their CancelledError handlers can
-        # persist a terminal status — otherwise a worker restart strands rows
-        # in status='running' and cross-worker SSE pollers loop forever.
+        # Cancel in-flight generation / designer jobs so CancelledError handlers
+        # persist a terminal status — otherwise a worker restart (or uvicorn
+        # --reload) strands rows in status='running' and poll clients hang.
+        # Designer jobs are in-memory; reload kills them — prefer running long
+        # jobs without --reload (see CheatSheet).
         try:
             from app.generation_jobs import JOBS as _GEN_JOBS
             in_flight = [j.task for j in _GEN_JOBS.values() if j.task and not j.task.done()]
@@ -157,6 +159,17 @@ async def lifespan(app: FastAPI):
                 await asyncio.wait(in_flight, timeout=10)
         except Exception:
             logger.exception("Shutdown: generation job drain failed")
+        try:
+            from app.designer_agent import drain_jobs_on_shutdown
+            n = await drain_jobs_on_shutdown(timeout=10)
+            if n:
+                logger.info(
+                    "Shutdown: cancelled %d in-flight designer job(s) "
+                    "(reload/restart; jobs marked cancelled in DB)",
+                    n,
+                )
+        except Exception:
+            logger.exception("Shutdown: designer job drain failed")
         logger.info("Shutdown: stopping background writers")
         from app.error_logger import get_error_logger
         await get_error_logger().stop()
@@ -182,6 +195,8 @@ app.include_router(quotation_router)
 app.include_router(chat_router)
 app.include_router(multi_image_gen_router)
 app.include_router(designer_jobs_router)
+from app.routers.internal_designer import router as internal_designer_router
+app.include_router(internal_designer_router)
 app.include_router(contact_router)
 app.include_router(meta_router)
 from app.routers.admin import router as admin_router
